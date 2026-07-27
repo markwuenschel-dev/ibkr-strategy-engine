@@ -1,0 +1,155 @@
+# PROTOCOL -- {{COLLAB_NAME}}
+
+Both seats read this file at the start of every session. It outranks anything either agent
+remembers, inferred, or was told in a previous session.
+
+| key           | value            |
+|---------------|------------------|
+| collab        | {{COLLAB_NAME}}  |
+| collab root   | {{COLLAB_ROOT}}  |
+| repo (clone)  | {{REPO_PATH}}    |
+| repo (origin) | {{REPO_URL}}     |
+| builder seat  | {{BUILDER}}      |
+| reviewer seat | {{REVIEWER}}     |
+| kit dir       | {{KIT_DIR}}      |
+| data root     | {{COLLAB_HOME}}  |
+| created       | {{CREATED}}      |
+
+## Seats
+
+- **builder** -- held by `{{BUILDER}}`. Drives the work, writes the code, owns the conversation
+  with the human. Does not self-certify: work in a trigger area (see below) does not ship until
+  the reviewer has answered.
+- **reviewer** -- held by `{{REVIEWER}}`. Reads the actual diff in `{{REPO_PATH}}` and refuses to
+  take the builder's claims at face value. Its independence is the product. Full contract in
+  `{{COLLAB_ROOT}}/REVIEWER-BRIEFING.md`.
+
+Address handoffs by **role**, never by product name: `--to reviewer`, `--to builder`, `--to user`.
+Product names are aliases (`claude` -> builder, `grok` -> reviewer) and are wrong the moment this
+project runs the pairing the other way round.
+
+## SACRED GUARDRAILS -- INVIOLABLE
+
+Ground rules for this project. Not preferences, not defaults, not negotiable by either agent. A
+change that breaks one of these is wrong even when the tests pass, even when it is faster, and
+even when it was asked for in passing -- stop and escalate to the human instead of proceeding.
+
+{{GUARDRAILS}}
+
+Breaking a guardrail is AUTOMATICALLY a review finding at severity high or above, and the reviewer
+does not need any other justification to reject the change. Only the human edits this section.
+
+## Handoff lifecycle
+
+    handoffs/pending/  ->  claimed/  ->  done/  ->  archive/
+
+- `pending/` -- written by the sender. This is the directory the other seat's watcher tails.
+- `claimed/` -- one seat now owns it. The move is a single filesystem rename, so exactly one
+  caller can win the race; the loser gets a conflict error rather than a silent double-claim.
+  **Claim before you start work.** An unclaimed handoff is one nobody has taken responsibility for.
+- `done/` -- finished, with an optional one-line note. `reply` closes the parent for you.
+- `archive/` -- swept out of the active view, partitioned by year/month.
+
+Movement is forward only (`pending` may go straight to `done`; nothing is ever reopened). To
+continue a closed exchange, create a new handoff with `--thread <parent-id>`.
+
+## Commands
+
+Inside a session pinned to this collab, `HANDOFF_ROOT={{COLLAB_ROOT}}` is set, so the correct form
+is `collab-handoff <cmd>` with no collab name. (`handoff {{COLLAB_NAME}} <cmd>` is the cross-collab
+form; use it only from a session that is not pinned here.)
+
+Request a review (builder -> reviewer):
+
+    collab-handoff create --to reviewer --priority high \
+      --title "Review: <what changed>" \
+      --tag <risk-area> \
+      --file {{COLLAB_ROOT}}/context/review-request.md
+
+See your queue, then take one:
+
+    collab-handoff list --pending --to reviewer
+    collab-handoff claim <id> --as reviewer
+    collab-handoff show <id>
+
+Answer with findings (this closes the parent unless you pass `--keep-open`):
+
+    collab-handoff reply <id> --title "Findings: <what changed>" \
+      --file {{COLLAB_ROOT}}/context/findings.md
+
+Close without a reply, when nothing needs to go back:
+
+    collab-handoff done <id> --note "<one line: outcome>" --as reviewer
+
+Housekeeping:
+
+    collab-handoff counts                  # one line per state
+    collab-handoff list --all              # every state
+    collab-handoff log -n 20               # recent lifecycle events
+    collab-handoff archive --all-done      # sweep finished handoffs
+    collab-handoff path --repo             # print {{REPO_PATH}}
+
+Priorities are `low | normal | high | urgent`. Bodies come from `--file <path>`, `--body "..."`,
+or `-` (stdin) -- pick one, never two.
+
+## Watchers
+
+Each seat runs its own watcher for the whole session, in the background:
+
+    # builder side
+    HANDOFF_ROOT={{COLLAB_ROOT}} python3 {{KIT_DIR}}/tools/watch-for-claude-handoffs.py
+
+    # reviewer side
+    HANDOFF_ROOT={{COLLAB_ROOT}} python3 {{KIT_DIR}}/tools/watch-for-grok-handoffs.py
+
+A review that waits for someone to remember to check a directory is a review that does not happen.
+
+## Adversarial regression hunt -- MANDATORY
+
+The hunt is **required**, not optional, whenever the diff touches any of:
+
+    money  /  safety  /  data-integrity  /  auth  /  concurrency
+
+Also required whenever the diff touches anything named in the guardrails above. It is
+risk-triggered -- do not spend a fleet of agents on a typo.
+
+Produce the diff first, then invoke:
+
+    git -C {{REPO_PATH}} diff <base>..<head> > {{COLLAB_ROOT}}/context/review.diff
+
+```js
+Workflow({ scriptPath: "{{KIT_DIR}}/tools/diff-regression-hunt.workflow.js",
+           args: { repo: "{{REPO_PATH}}",
+                   diffPath: "{{COLLAB_ROOT}}/context/review.diff",
+                   guardrails: [ /* this project's guardrails, verbatim, one string each */ ],
+                   areas: [ /* one entry per fix-area: { name, files, why } */ ] }})
+```
+
+Copy the guardrails from the section above **verbatim**, one string per rule -- a paraphrase is a
+different rule. Give one `areas` entry per coherent behavioural change (a single change spanning
+five files is ONE area; five unrelated changes inside one file are FIVE areas). Omit `areas` and
+the workflow derives them itself. It returns `{ confirmed, refuted }`: each breaker finding is
+handed to an independent verifier whose default verdict is *refuted*.
+
+**The hunt runs in parallel with the human-style reviewer, not instead of it.** Two independent
+lenses catch what one misses. Never cancel, skip, or downgrade the reviewer handoff because the
+hunt came back clean, and never treat a clean hunt as sign-off.
+
+## Review standard
+
+- The reviewer **reads the actual diff**. The builder's summary of the change is a hypothesis
+  about the change, and reviewing the summary reviews nothing.
+- Claims from the builder are not evidence. "I added a guard", "tests pass", "this is covered" --
+  each is checked in the repo or it does not count.
+- **A finding that cannot cite `file:line` plus a concrete trigger is not a finding.** Required
+  shape: the offending `file:line`; the code path as ordered `file:line` hops; the specific inputs
+  and starting state that reach it; expected vs actual behaviour.
+- Default verdict on an unverifiable claim is **reject**. That applies to the reviewer's own
+  findings too -- if the reviewer cannot walk the path itself, it does not go in the reply.
+- "LGTM" is not a review. A clean review states what was checked, how, and what was *not* checked.
+
+## Escalating to the human
+
+The builder seat owns the conversation with the human. If the bridge is running, drop a markdown
+file in `{{COLLAB_HOME}}/outbox/` and it is forwarded. Escalate rather than guess whenever a
+guardrail is in tension with the request.

@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+#
+# restart -- resume an existing collab.
+#
+#   restart [<name>] [options]
+#
+# Sessions die: a terminal closes, a laptop sleeps, an agent runs out of
+# context. Nothing is lost when that happens, because all state is on disk --
+# but you still need the bootstrap block, the watcher commands and the current
+# queue in front of you again. That is this script.
+#
+# It deliberately does NOT daemonize or supervise anything. Starting a watcher
+# is one line you can see and kill; a process manager hiding behind this command
+# would be state the kit claims not to keep.
+#
+# Portability: bash 3.2, no GNU coreutils, no `readlink -f`, no `realpath`.
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# --------------------------------------------------------------------------
+# self-location
+# --------------------------------------------------------------------------
+
+resolve_self() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [[ -L "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" != /* ]] && src="$dir/$src"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+
+BIN_DIR="$(resolve_self)"
+KIT_DIR="$(cd -P "$BIN_DIR/.." && pwd)"
+export KIT_DIR
+COLLAB_HOME="${COLLAB_HOME:-$KIT_DIR}"
+export COLLAB_HOME
+
+HANDOFF="$KIT_DIR/tools/handoff"
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  C_DIM=$'\033[2m'; C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'
+  C_BOLD=$'\033[1m'; C_OFF=$'\033[0m'
+else
+  C_DIM=""; C_RED=""; C_YELLOW=""; C_BOLD=""; C_OFF=""
+fi
+
+QUIET=0
+say()  { [[ "$QUIET" -eq 1 ]] || printf '%s\n' "$*" >&2; }
+step() { [[ "$QUIET" -eq 1 ]] || printf '%s==>%s %s\n' "$C_BOLD" "$C_OFF" "$*" >&2; }
+warn() { printf '%swarning:%s %s\n' "$C_YELLOW" "$C_OFF" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; exit "${2:-1}"; }
+hint() { printf '    %s%s%s\n' "$C_DIM" "$*" "$C_OFF" >&2; }
+
+usage() {
+  cat <<'EOF'
+restart -- resume an existing collab
+
+Usage:
+  restart [<name>] [options]
+
+With no <name>, uses $HANDOFF_ROOT if set, otherwise the only registered
+collab. If several are registered, it lists them and exits.
+
+Options:
+  --bootstrap-only   print just the KICKOFF.md block (nothing else)
+  --no-bootstrap     skip the KICKOFF.md block; show state only
+  --seat <seat>      print only that seat's block (builder|reviewer)
+  -q, --quiet        suppress headings
+  -h, --help         this message
+
+This prints; it does not start anything. Copy the watcher line into the
+session you want it running in.
+EOF
+}
+
+# --------------------------------------------------------------------------
+# arguments
+# --------------------------------------------------------------------------
+
+NAME=""
+BOOTSTRAP_ONLY=0
+NO_BOOTSTRAP=0
+SEAT=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)        usage; exit 0 ;;
+    -q|--quiet)       QUIET=1; shift ;;
+    --bootstrap-only) BOOTSTRAP_ONLY=1; shift ;;
+    --no-bootstrap)   NO_BOOTSTRAP=1; shift ;;
+    --seat)           [[ $# -ge 2 ]] || die "--seat needs a value" 2; SEAT="$2"; shift 2 ;;
+    --)               shift; break ;;
+    -*)               die "unknown option: $1" 2 ;;
+    *)
+      [[ -z "$NAME" ]] || die "unexpected argument: $1 (name is already '$NAME')" 2
+      NAME="$1"; shift ;;
+  esac
+done
+
+command -v python3 >/dev/null 2>&1 || die "python3 is required but not on PATH"
+[[ -f "$HANDOFF" ]] || die "kit looks incomplete: missing $HANDOFF"
+
+# --------------------------------------------------------------------------
+# resolve which collab
+# --------------------------------------------------------------------------
+
+COLLAB_ROOT=""
+
+if [[ -n "$NAME" ]]; then
+  COLLAB_ROOT="$("$HANDOFF" "$NAME" path)" || die "no collab named '$NAME'" 3
+elif [[ -n "${HANDOFF_ROOT:-}" ]]; then
+  COLLAB_ROOT="$HANDOFF_ROOT"
+  NAME="$(basename "$COLLAB_ROOT")"
+  say "using \$HANDOFF_ROOT: $COLLAB_ROOT"
+else
+  # Exactly one registered collab is unambiguous; more than one is not, and
+  # guessing would resume the wrong project's session.
+  REGISTERED="$("$HANDOFF" collabs --json | python3 -c '
+import json, sys
+try:
+    rows = json.load(sys.stdin)
+except ValueError:
+    rows = []
+print("\n".join(row["name"] for row in rows))
+')"
+  COUNT="$(printf '%s\n' "$REGISTERED" | grep -c . || true)"
+  if [[ "$COUNT" -eq 0 ]]; then
+    die "no collabs registered.
+    Create one:  newproject <name> --repo <git-url> --reviewer grok" 3
+  elif [[ "$COUNT" -eq 1 ]]; then
+    NAME="$REGISTERED"
+    COLLAB_ROOT="$("$HANDOFF" "$NAME" path)"
+  else
+    say "several collabs are registered; name one:"
+    printf '%s\n' "$REGISTERED" | sed 's/^/    restart /' >&2
+    exit 2
+  fi
+fi
+
+[[ -d "$COLLAB_ROOT/handoffs" ]] || die "no collab at $COLLAB_ROOT (missing handoffs/)" 3
+
+# --------------------------------------------------------------------------
+# bootstrap-only fast path
+# --------------------------------------------------------------------------
+
+print_bootstrap() {
+  if [[ ! -f "$COLLAB_ROOT/KICKOFF.md" ]]; then
+    warn "KICKOFF.md is missing; showing the minimum instead"
+    cat <<EOF
+
+BUILDER SESSION
+  export COLLAB_HOME="$COLLAB_HOME"
+  export HANDOFF_ROOT="$COLLAB_ROOT"
+  python3 $KIT_DIR/tools/watch-for-claude-handoffs.py
+
+REVIEWER SESSION
+  export COLLAB_HOME="$COLLAB_HOME"
+  export HANDOFF_ROOT="$COLLAB_ROOT"
+  python3 $KIT_DIR/tools/watch-for-grok-handoffs.py
+EOF
+    return 0
+  fi
+
+  if [[ -z "$SEAT" ]]; then
+    cat "$COLLAB_ROOT/KICKOFF.md"
+    return 0
+  fi
+
+  # Print only the requested seat's section: from its heading to the next
+  # top-level heading. awk keeps this portable (no GNU sed ranges).
+  awk -v seat="$SEAT" '
+    BEGIN { want = toupper(seat); printing = 0 }
+    /^#/ {
+      line = toupper($0)
+      if (index(line, want) > 0) { printing = 1 }
+      else if (printing && $0 ~ /^#{1,2} /) { printing = 0 }
+    }
+    printing { print }
+  ' "$COLLAB_ROOT/KICKOFF.md"
+}
+
+if [[ "$BOOTSTRAP_ONLY" -eq 1 ]]; then
+  print_bootstrap
+  exit 0
+fi
+
+# --------------------------------------------------------------------------
+# state
+# --------------------------------------------------------------------------
+
+step "Collab '$NAME'"
+say "    root:   $COLLAB_ROOT"
+[[ -d "$COLLAB_ROOT/repo" ]] && say "    repo:   $COLLAB_ROOT/repo"
+say ""
+
+step "Queue"
+"$HANDOFF" "$NAME" counts || true
+say ""
+
+PENDING="$("$HANDOFF" "$NAME" list --pending --ids 2>/dev/null | grep -c . || true)"
+if [[ "$PENDING" -gt 0 ]]; then
+  step "Pending"
+  "$HANDOFF" "$NAME" list --pending || true
+  say ""
+fi
+
+if [[ ! -f "$COLLAB_ROOT/PROTOCOL.md" ]]; then
+  warn "PROTOCOL.md is missing -- this collab was never scaffolded by newproject"
+  hint "re-render it: newproject $NAME --root \"$COLLAB_ROOT\" --no-clone --force"
+fi
+if grep -q "NOT YET WRITTEN" "$COLLAB_ROOT/PROTOCOL.md" 2>/dev/null; then
+  warn "PROTOCOL.md still has the guardrails TODO block"
+  hint "guardrails are what the reviewer enforces; write them before the next review"
+fi
+
+step "Watchers"
+say "  builder session:"
+say "    HANDOFF_ROOT=\"$COLLAB_ROOT\" python3 $KIT_DIR/tools/watch-for-claude-handoffs.py"
+say "  reviewer session:"
+say "    HANDOFF_ROOT=\"$COLLAB_ROOT\" python3 $KIT_DIR/tools/watch-for-grok-handoffs.py"
+say ""
+
+if [[ "$NO_BOOTSTRAP" -eq 0 ]]; then
+  step "Session bootstrap"
+  say ""
+  print_bootstrap
+  say ""
+fi
+
+say "${C_BOLD}Verify it yourself:${C_OFF}"
+say "  $HANDOFF $NAME list --all"
+say "  $HANDOFF status"

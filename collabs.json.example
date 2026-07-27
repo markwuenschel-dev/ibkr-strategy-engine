@@ -1,0 +1,12 @@
+{
+  "collabs": {
+    "demo": {
+      "created": "2026-01-01T00:00:00Z",
+      "repo": "git@github.com:you/your-repo.git",
+      "repo_path": "/absolute/path/to/COLLAB_HOME/demo/repo",
+      "reviewer": "grok",
+      "root": "/absolute/path/to/COLLAB_HOME/demo"
+    }
+  },
+  "version": 1
+}

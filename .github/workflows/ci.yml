@@ -1,0 +1,185 @@
+# collab-kit CI
+#
+# Two jobs, split by what they prove:
+#
+#   test  - the stdlib unittest suite, on every OS/Python combination the kit
+#           claims to support. The kit has no third-party Python dependencies,
+#           so there is deliberately NO install step here: if this job ever
+#           needs one, that is a regression against a hard project constraint.
+#   lint  - static checks only, Linux only, because they are platform-agnostic:
+#           bash -n + shellcheck over every shell script, compileall over the
+#           Python trees, and node --check over the workflow module.
+#
+# Actions are pinned by major version tag, never @master.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: nothing here writes to the repo.
+permissions:
+  contents: read
+
+# One run per ref; a new push supersedes an in-flight run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }} / py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ['3.9', '3.11', '3.13']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # No dependency install step by design -- the suite is stdlib-only.
+      #
+      # `shell: bash` makes the Windows runner use Git Bash, so one command line
+      # works on all three OSes. The interpreter is `python`, not `python3`:
+      # setup-python guarantees `python` on PATH everywhere, while `python3` is
+      # not reliably present on the Windows runner.
+      - name: Run unittest suite
+        shell: bash
+        run: python -m unittest discover -s tests -t . -v
+
+  lint:
+    name: lint (shell / python / js)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Build the shell-script list once and share it with the later steps.
+      # `shopt -s nullglob` makes a glob that matches nothing expand to nothing
+      # instead of to its own literal text, so an absent bin/ or tools/*.sh does
+      # not manufacture a bogus filename. Extension-less files under bin/ are
+      # included only when their shebang says bash/sh.
+      - name: Collect shell scripts
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=()
+          for f in *.sh bin/*.sh tools/*.sh; do
+            if [ -f "$f" ]; then
+              files+=("$f")
+            fi
+          done
+          for f in bin/*; do
+            if [ ! -f "$f" ]; then
+              continue
+            fi
+            case "$f" in
+              *.*) continue ;;
+            esac
+            if head -n 1 "$f" | grep -qE '^#!.*\b(bash|sh)\b'; then
+              files+=("$f")
+            fi
+          done
+          : > "$RUNNER_TEMP/shell-scripts.txt"
+          if [ "${#files[@]}" -gt 0 ]; then
+            printf '%s\n' "${files[@]}" | sort -u > "$RUNNER_TEMP/shell-scripts.txt"
+          fi
+          echo "Shell scripts found:"
+          cat "$RUNNER_TEMP/shell-scripts.txt"
+
+      - name: bash -n (syntax check)
+        shell: bash
+        run: |
+          if [ ! -s "$RUNNER_TEMP/shell-scripts.txt" ]; then
+            echo "No shell scripts found; nothing to syntax-check."
+            exit 0
+          fi
+          rc=0
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            echo "bash -n $f"
+            bash -n "$f" || rc=1
+          done < "$RUNNER_TEMP/shell-scripts.txt"
+          exit "$rc"
+
+      - name: shellcheck
+        continue-on-error: false
+        shell: bash
+        run: |
+          if [ ! -s "$RUNNER_TEMP/shell-scripts.txt" ]; then
+            echo "No shell scripts found; nothing to shellcheck."
+            exit 0
+          fi
+          # ubuntu-latest usually ships shellcheck already; only install if absent.
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y shellcheck
+          fi
+          shellcheck --version
+          mapfile -t files < "$RUNNER_TEMP/shell-scripts.txt"
+          shellcheck --severity=warning --shell=bash -- "${files[@]}"
+
+      # compileall exits 0 on a directory that does not exist, which would let
+      # this check silently no-op if a tree were ever renamed. Assert first.
+      - name: Byte-compile Python
+        shell: bash
+        run: |
+          for d in tools tests; do
+            if [ ! -d "$d" ]; then
+              echo "::error::expected directory '$d' is missing"
+              exit 1
+            fi
+          done
+          python -m compileall -q tools
+          python -m compileall -q tests
+
+      # `node --check` picks CJS vs ESM from the file extension and the nearest
+      # package.json, and diff-regression-hunt.workflow.js fits neither cleanly:
+      # it is a Workflow script, not a standalone Node module. It uses ESM
+      # `export` for its `meta` block AND top-level `return` to yield the
+      # workflow result, because the Workflow runtime evaluates the file body
+      # inside a function. `export` is illegal in CommonJS; top-level `return`
+      # is illegal in an ES module. So checking the file as-is -- as .js or as
+      # a .mjs copy -- fails on one or the other no matter what, and would make
+      # this job permanently red for a file that is correct for its runtime.
+      #
+      # Instead, reproduce the runtime's shape before parsing: strip the leading
+      # `export` keywords and wrap the body in an async function, then --check
+      # that as ESM. Every line of real code still goes through the parser, so
+      # an actual syntax error is still caught.
+      - name: node --check (Workflow script)
+        shell: bash
+        run: |
+          src=tools/diff-regression-hunt.workflow.js
+          if [ ! -f "$src" ]; then
+            echo "::error::$src not found"
+            exit 1
+          fi
+          wrapped="$RUNNER_TEMP/diff-regression-hunt.check.mjs"
+          {
+            echo 'export default async function __syntaxCheck__() {'
+            sed 's/^export default //; s/^export //' "$src"
+            echo '}'
+          } > "$wrapped"
+          node --check "$wrapped"
+          echo "OK: $src is syntactically valid"

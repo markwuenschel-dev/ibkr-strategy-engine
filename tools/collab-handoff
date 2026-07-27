@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+"""collab-handoff -- single-collab CLI, scoped by $HANDOFF_ROOT.
+
+    HANDOFF_ROOT=$COLLAB_HOME/<name> collab-handoff list
+    collab-handoff --root <path> create --to reviewer --title "..."
+
+Identical verbs to ``handoff``, minus the collab-name argument and the
+cross-project commands. This is the form to use from inside a session that is
+already pinned to one collab -- and the only form that works on a collab which
+was never registered.
+"""
+
+import os
+import sys
+
+
+def _bootstrap():
+    tools = os.path.dirname(os.path.realpath(__file__))
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+
+
+if __name__ == "__main__":
+    if sys.version_info < (3, 9):
+        sys.stderr.write(
+            "collab-kit needs Python 3.9 or newer (found %s)\n" % sys.version.split()[0]
+        )
+        raise SystemExit(1)
+    _bootstrap()
+    from collabkit.cli import main_root
+
+    raise SystemExit(main_root())
