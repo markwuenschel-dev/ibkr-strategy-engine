@@ -339,7 +339,16 @@ collab-kit/
   .github/workflows/ci.yml
   package.json  pnpm-lock.yaml      # dev toolchain only — zero dependencies
   .npmrc  .node-version
+
+engine/                             # IBKR paper-trading engine (separate package)
+  pyproject.toml  uv.lock           # its own deps: ib_async
+  src/engine/                       # config · safety · journal · broker · alerts · cli
+  tests/                            # pytest, sockets blocked
 ```
+
+The engine is deliberately a **separate package**: it has real dependencies, and collab-kit has
+none. See [`engine/README.md`](engine/README.md). It connects to paper endpoints only — live ports
+are refused at config load, and reaching one requires editing a constant in a reviewed diff.
 
 Your data (`$COLLAB_HOME` — defaults to the kit dir, override via env):
 
@@ -374,23 +383,36 @@ is exactly why `collabs.json`, `logs/`, `outbox/`, and `inbox/` are gitignored h
 - **At least one agent CLI** — Claude Code and/or Grok — authenticated the normal way
 - **Optional:** a Telegram bot (a @BotFather token) for the phone channel
 
-Still no third-party Python packages, and none are ever added — the runtime dependency list is
-"Python 3.14 and nothing else".
+**collab-kit itself has no third-party Python packages and never will** — to run the handoff loop,
+the watchers and the bridge, the dependency list really is "Python 3.14 and nothing else". CI keeps
+that claim honest by running the collab-kit suite with no install step at all: if that job ever
+needs one, the constraint has been broken.
+
+The [`engine/`](engine/README.md) package is separate and *does* have dependencies (`ib_async`),
+with its own `pyproject.toml`, lockfile, virtualenv and CI job. Nothing in `tools/` or `bin/`
+imports it, and you can ignore it entirely if you only want the agent-collaboration harness.
 
 The regression-hunt workflow is executed by your agent's `Workflow(...)` runtime, not by a
 standalone `node` you install.
 
-### Development-only: Node + pnpm
+### Development-only toolchain
 
-Contributors additionally need **Node 22+** and **pnpm 11+** to run the repo's checks. This is
-tooling, not a runtime dependency: nothing in `tools/`, `bin/` or `install.sh` shells out to Node,
-and the package has **zero dependencies** — pnpm is here to pin the toolchain and give the checks
-one entry point.
+Contributors need **Node 22+** and **pnpm 11+** for the repo checks, plus **uv** if they touch the
+engine. None of this is a runtime dependency: nothing in `tools/`, `bin/` or `install.sh` shells out
+to Node, and the npm package itself has zero dependencies — pnpm is there to pin the toolchain and
+give the checks one entry point.
 
 ```bash
 corepack enable                # or: npm i -g pnpm
 pnpm install --frozen-lockfile
-pnpm check                     # workflow syntax + full Python suite
+pnpm check                     # workflow syntax + shell + collab-kit suite + engine suite
+```
+
+`pnpm check` runs the engine suite last and will create `engine/.venv` on first use. To skip it and
+check only collab-kit:
+
+```bash
+pnpm run check:workflow && pnpm run check:shell && pnpm run check:python && pnpm test
 ```
 
 Explicitly:

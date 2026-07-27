@@ -43,3 +43,7 @@
 /.npmrc          text eol=lf
 /.node-version   text eol=lf
 /pnpm-lock.yaml  text eol=lf -diff
+
+# Engine package.
+*.toml    text eol=lf
+/engine/uv.lock  text eol=lf -diff

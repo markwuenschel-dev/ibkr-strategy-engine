@@ -62,7 +62,7 @@ def _bootstrap() -> None:
 
 _bootstrap()
 
-from collabkit import console, frontmatter, slug  # noqa: E402
+from collabkit import console, dotenv, frontmatter, slug  # noqa: E402
 from collabkit.atomic import atomic_write_json, atomic_write_text, ensure_dir, read_json  # noqa: E402
 from collabkit.errors import EXIT_ERROR, EXIT_OK, EXIT_USAGE, LockTimeout  # noqa: E402
 from collabkit.locking import SingletonLock  # noqa: E402
@@ -663,10 +663,19 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
+    # Before any os.environ read: a git-ignored .env is where this repo's
+    # secrets live. A real environment variable still wins over it.
+    env_file = dotenv.load()
+    for problem in env_file.problems:
+        console.warn(f".env: {problem}")
+    if env_file.loaded:
+        console.info(f"loaded {len(env_file.loaded)} key(s) from {env_file.path}")
+
     token = os.environ.get(ENV_TOKEN, "").strip()
     if not token:
         console.error(f"{ENV_TOKEN} is not set")
-        console.hint("create a bot with @BotFather, then: export TELEGRAM_BOT_TOKEN=<token>")
+        console.hint(f"put {ENV_TOKEN}=<token> in {dotenv.FILENAME} at the project root,")
+        console.hint("or export it in the shell. Create the bot with @BotFather.")
         console.hint("the phone bridge is optional -- the handoff loop works without it")
         return EXIT_USAGE
 

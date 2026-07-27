@@ -15,6 +15,7 @@
     "check:python": "python3 -m compileall -q tools tests",
     "check:shell": "bash -n install.sh && bash -n bin/newproject && bash -n bin/restart",
     "test": "python3 -m unittest discover -s tests -t .",
-    "check": "pnpm run check:workflow && pnpm run check:shell && pnpm run check:python && pnpm run test"
+    "check": "pnpm run check:workflow && pnpm run check:shell && pnpm run check:python && pnpm run test && pnpm run check:engine",
+    "check:engine": "cd engine && uv run --extra dev pytest"
   }
 }

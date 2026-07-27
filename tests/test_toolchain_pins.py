@@ -93,7 +93,7 @@ class PythonVersionPinTests(unittest.TestCase):
         stale = re.compile(r"Python 3\.9|>= 3\.9|\(3, 9\)|\(3,9\)|'3\.11'|'3\.13'")
         offenders = []
         for path in REPO_ROOT.rglob("*"):
-            if not path.is_file() or ".git" in path.parts or "node_modules" in path.parts:
+            if not path.is_file() or _is_out_of_scope(path):
                 continue
             if path.suffix in {".pyc"} or path.name == "test_toolchain_pins.py":
                 continue
@@ -104,6 +104,63 @@ class PythonVersionPinTests(unittest.TestCase):
             if stale.search(text):
                 offenders.append(str(path.relative_to(REPO_ROOT)))
         self.assertEqual(offenders, [], f"stale Python version references remain: {offenders}")
+
+
+# Trees this test does not govern.
+#
+# Third-party code is obvious -- a virtualenv full of packaging/ and numpy/ will
+# always mention old Pythons, and scanning 58MB of site-packages to discover that
+# is pure noise.
+#
+# `engine/` is the interesting one: it is a *separate package* with its own
+# `requires-python`, and its pyproject legitimately discusses ib_async's and
+# ibapi's support matrices -- statements about other people's packages, not about
+# what this project runs on. Scoping this test to collab-kit and asserting the
+# engine's own pin separately (see EnginePackagePinTests) keeps both honest,
+# rather than contorting a factual comment to satisfy a regex.
+#
+# `.claude/` is agent session state -- handoff notes, transcripts -- excluded
+# from git via .git/info/exclude and never shipped. It records history, and
+# history mentions old versions: a note reading "ibapi's classifiers stop at
+# Python 3.9" is the same category of third-party fact as the engine pyproject
+# above. Governing it would make an unrelated local artifact able to fail the
+# suite, which is exactly the false positive this comment block exists to avoid.
+_VENDORED = {".venv", "venv", "site-packages", "node_modules", ".git", "__pycache__", ".uv"}
+_OTHER_PACKAGES = {"engine"}
+_AGENT_STATE = {".claude"}
+
+
+def _is_out_of_scope(path: Path) -> bool:
+    parts = set(path.parts)
+    return bool(parts & (_VENDORED | _OTHER_PACKAGES | _AGENT_STATE))
+
+
+class EnginePackagePinTests(unittest.TestCase):
+    """The engine is a separate package; assert its pin rather than ignoring it."""
+
+    PYPROJECT = REPO_ROOT / "engine" / "pyproject.toml"
+
+    def test_the_engine_requires_the_same_python_as_the_kit(self):
+        if not self.PYPROJECT.is_file():
+            self.skipTest("engine package not present")
+        text = read(self.PYPROJECT)
+        self.assertIn(
+            f'requires-python = ">={REQUIRED_PYTHON_TEXT}"',
+            text,
+            "the engine must require the same Python the rest of the repo pins",
+        )
+
+    def test_the_engine_keeps_its_dependencies_out_of_the_kit(self):
+        # collab-kit's "no third-party packages" constraint is only meaningful
+        # if the dependency-bearing package stays on its own side of the fence.
+        if not self.PYPROJECT.is_file():
+            self.skipTest("engine package not present")
+        for name in ("pyproject.toml", "requirements.txt", "setup.py"):
+            with self.subTest(file=name):
+                self.assertFalse(
+                    (REPO_ROOT / name).exists(),
+                    f"{name} at the repo root would put dependencies above the stdlib-only kit",
+                )
 
 
 class NodeToolchainPinTests(unittest.TestCase):

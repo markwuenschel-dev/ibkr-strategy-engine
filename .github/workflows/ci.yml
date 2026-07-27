@@ -10,6 +10,9 @@
 #           bash -n + shellcheck over every shell script, compileall over the
 #           Python trees, and scripts/check-workflow.mjs (via pnpm) over the
 #           Workflow scripts.
+#   engine- the IBKR engine's own suite. Separate from `test` on purpose: the
+#           engine HAS dependencies, and mixing it into that job would destroy
+#           the assertion above that collab-kit needs none.
 #
 # Actions are pinned by major version tag, never @master.
 
@@ -176,3 +179,45 @@ jobs:
       # error, and this job would report green forever while proving nothing.
       - name: Check Workflow scripts (pnpm)
         run: pnpm run check:workflow
+
+  # The engine is a separate package with real dependencies (ib_async). It gets
+  # its own job so the `test` job above can keep proving, by having no install
+  # step at all, that collab-kit runs on a bare Python.
+  #
+  # Linux only: the engine suite opens no sockets and touches no OS-specific
+  # path, so a three-OS matrix would buy nothing. The cross-platform surface
+  # that matters -- collab-kit's file locking and atomic renames -- is already
+  # covered by the `test` job.
+  engine:
+    name: engine (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: engine/uv.lock
+
+      # --frozen refuses to update the lockfile, so a dependency that drifted
+      # from uv.lock fails here rather than silently resolving to something new.
+      - name: Install engine
+        working-directory: engine
+        run: uv sync --extra dev --frozen
+
+      - name: Run engine suite
+        working-directory: engine
+        run: uv run --extra dev --frozen pytest -q
+
+      # The suite blocks sockets for its own process, but that guard lives in
+      # the code under test's repo. Assert the obvious external property too:
+      # nothing here should have contacted a broker.
+      - name: Assert no TWS was reachable
+        run: |
+          if timeout 2 bash -c 'cat < /dev/null > /dev/tcp/127.0.0.1/7497' 2>/dev/null; then
+            echo "::error::something is listening on the TWS paper port in CI"
+            exit 1
+          fi
+          echo "ok: nothing listening on 7497"
