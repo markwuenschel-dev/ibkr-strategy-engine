@@ -1,0 +1,36 @@
+[project]
+name = "ibkr-engine"
+version = "0.1.0"
+description = "IBKR paper-trading engine: connection, safety interlocks, and order execution."
+readme = "README.md"
+requires-python = ">=3.14"
+license = { text = "UNLICENSED" }
+
+# ib_async is the maintained successor to ib_insync (archived upstream). The
+# PyPI `ibapi` package is stale -- 9.81.1, classifiers stop at Python 3.9 -- so
+# it is not a candidate. ib_async 2.1.0 declares requires-python >=3.10 and
+# classifies 3.14, which is why the repo's 3.14-only pin does not block it.
+dependencies = [
+    "ib_async>=2.1.0,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[project.scripts]
+engine = "engine.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/engine"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# No network, ever. Engine tests drive a fake IB object; nothing here may open a
+# socket to TWS. See engine/tests/conftest.py for the guard that enforces it.
+addopts = "-q --strict-markers"

@@ -26,6 +26,20 @@ inbox/
 *.collab-kit.bak
 
 # ---------------------------------------------------------------------------
+# Secrets
+#
+# This repository is public. No credential may ever enter the tree -- tokens
+# and account ids live in the shell environment only. Nothing in this repo
+# loads a dotenv file, so a .env here is inert as well as unsafe; these
+# patterns exist so an accidental one cannot be committed.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ---------------------------------------------------------------------------
 # Python
 # ---------------------------------------------------------------------------
 __pycache__/
@@ -57,3 +71,11 @@ node_modules/
 .pnpm-store/
 .pnpm-debug.log*
 npm-debug.log*
+
+# ---- engine package (uv) ----
+# The engine has dependencies; collab-kit still has none. Its virtualenv and
+# caches never enter the repo -- uv.lock is what makes installs reproducible.
+engine/.venv/
+.venv/
+.uv/
+.uv-cache/

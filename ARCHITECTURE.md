@@ -134,6 +134,11 @@ collab-kit/                # the kit (clone anywhere; this is the code)
   package.json · pnpm-lock.yaml · .npmrc · .node-version   # dev toolchain only,
                             # zero dependencies; nothing at runtime shells out to Node
 
+engine/                    # the IBKR paper-trading engine -- a SEPARATE package
+  pyproject.toml · uv.lock  # its own dependencies (ib_async); never the kit's
+  src/engine/  config · safety · journal · broker · alerts · cli
+  tests/                    # pytest; sockets blocked for the whole session
+
 $COLLAB_HOME/               # your data (defaults to the kit dir; override via env)
   collabs.json              # registry of your collabs
   <name>/                   # one isolated collab: handoffs/ · context/ · PROTOCOL.md · …
@@ -152,3 +157,10 @@ Bash, Python 3.14, Git, and at least one agent CLI (Claude Code and/or Grok), au
 way. Optionally a Telegram bot for the phone channel. No third-party Python packages. The kit sets
 up the *collaboration system* — it does not provide the agent runtimes, model API keys, or any
 model proxy.
+
+The `engine/` package is the exception that proves the rule: it needs `ib_async` to speak to a
+broker, so it lives in its own package with its own `pyproject.toml`, its own lockfile and its own
+CI job. `tools/collabkit/` remains stdlib-only, and CI's `test` job still runs with **no install
+step at all** — which is what keeps that claim honest rather than aspirational. The dependency
+points one way: the engine imports collab-kit for alerting and locking; collab-kit knows nothing
+about the engine.
