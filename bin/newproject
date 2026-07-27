@@ -1,0 +1,386 @@
+#!/usr/bin/env bash
+#
+# newproject -- scaffold, clone and register an isolated collab.
+#
+#   newproject <name> --repo <git-url> --reviewer claude|grok
+#
+# Does the four things ARCHITECTURE.md asks of it: scaffolds + registers an
+# isolated collab, clones the target repo, renders the per-project templates
+# with guardrails written fresh, and prints the session bootstrap block.
+#
+# Division of labour: this script owns argument parsing, the TTY guardrails
+# prompt, and `git clone`. Name validation, template rendering and the registry
+# write go through tools/collabkit/scaffold.py, so they run the same tested code
+# as the rest of the kit rather than a second shell-shaped implementation.
+#
+# Portability: bash 3.2 (macOS /bin/bash), no GNU coreutils, no `readlink -f`,
+# no `realpath`, no `sed -i`. Works under Git Bash on Windows.
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# --------------------------------------------------------------------------
+# self-location
+# --------------------------------------------------------------------------
+
+# Resolve this script's real path through any chain of symlinks, from any cwd.
+# `readlink -f` is GNU-only and `realpath` is not guaranteed, so walk it.
+resolve_self() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [[ -L "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    # A relative link target is relative to the link's directory, not to cwd.
+    [[ "$src" != /* ]] && src="$dir/$src"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+
+BIN_DIR="$(resolve_self)"
+KIT_DIR="$(cd -P "$BIN_DIR/.." && pwd)"
+export KIT_DIR
+COLLAB_HOME="${COLLAB_HOME:-$KIT_DIR}"
+export COLLAB_HOME
+
+SCAFFOLD="$KIT_DIR/tools/collabkit/scaffold.py"
+HANDOFF="$KIT_DIR/tools/handoff"
+
+# --------------------------------------------------------------------------
+# output
+# --------------------------------------------------------------------------
+
+QUIET=0
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  C_DIM=$'\033[2m'; C_RED=$'\033[31m'; C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'; C_BOLD=$'\033[1m'; C_OFF=$'\033[0m'
+else
+  C_DIM=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BOLD=""; C_OFF=""
+fi
+
+say()  { [[ "$QUIET" -eq 1 ]] || printf '%s\n' "$*" >&2; }
+step() { [[ "$QUIET" -eq 1 ]] || printf '%s==>%s %s\n' "$C_BOLD" "$C_OFF" "$*" >&2; }
+ok()   { [[ "$QUIET" -eq 1 ]] || printf '    %sok%s   %s\n' "$C_GREEN" "$C_OFF" "$*" >&2; }
+warn() { printf '%swarning:%s %s\n' "$C_YELLOW" "$C_OFF" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; exit "${2:-1}"; }
+hint() { printf '    %s%s%s\n' "$C_DIM" "$*" "$C_OFF" >&2; }
+
+usage() {
+  cat <<'EOF'
+newproject -- scaffold + register an isolated collab
+
+Usage:
+  newproject <name> --repo <git-url> [--reviewer claude|grok] [options]
+
+Required:
+  <name>                    collab name: lowercase letters, digits, hyphens
+
+Options:
+  --repo <git-url>          repository to clone (omit with --no-clone)
+  --branch <name>           branch to clone (default: the remote's default)
+  --reviewer <agent>        who takes the reviewer seat  (default: grok)
+  --builder <agent>         who takes the builder seat   (default: claude)
+  --root <path>             collab directory (default: $COLLAB_HOME/<name>)
+
+  --guardrail "<text>"      one guardrail; repeat for more
+  --guardrails-file <path>  read guardrails from a markdown file
+  --defer-guardrails        scaffold with a TODO block instead (discouraged)
+  --idea "<text>"           one-line statement of what this project is
+  --idea-file <path>        read it from a file
+
+  --no-clone                do not clone anything
+  --force                   overwrite already-rendered templates
+  --dry-run                 print what would happen; change nothing
+  -q, --quiet               only warnings and errors
+  -h, --help                this message
+
+Guardrails are the invariants that must never break in THIS codebase. They are
+written fresh per project and never inherited. With no --guardrail/--guardrails-
+file and a terminal attached, you will be prompted for them.
+
+Examples:
+  newproject payments --repo git@github.com:me/payments.git --reviewer grok
+  newproject spike --no-clone --defer-guardrails
+EOF
+}
+
+# --------------------------------------------------------------------------
+# arguments
+# --------------------------------------------------------------------------
+
+NAME=""
+REPO_URL=""
+BRANCH=""
+REVIEWER="grok"
+BUILDER="claude"
+ROOT=""
+IDEA=""
+IDEA_FILE=""
+GUARDRAILS_FILE=""
+DEFER_GUARDRAILS=0
+NO_CLONE=0
+FORCE=0
+DRY_RUN=0
+GUARDRAILS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)          usage; exit 0 ;;
+    -q|--quiet)         QUIET=1; shift ;;
+    --repo)             [[ $# -ge 2 ]] || die "--repo needs a value" 2; REPO_URL="$2"; shift 2 ;;
+    --branch)           [[ $# -ge 2 ]] || die "--branch needs a value" 2; BRANCH="$2"; shift 2 ;;
+    --reviewer)         [[ $# -ge 2 ]] || die "--reviewer needs a value" 2; REVIEWER="$2"; shift 2 ;;
+    --builder)          [[ $# -ge 2 ]] || die "--builder needs a value" 2; BUILDER="$2"; shift 2 ;;
+    --root)             [[ $# -ge 2 ]] || die "--root needs a value" 2; ROOT="$2"; shift 2 ;;
+    --idea)             [[ $# -ge 2 ]] || die "--idea needs a value" 2; IDEA="$2"; shift 2 ;;
+    --idea-file)        [[ $# -ge 2 ]] || die "--idea-file needs a value" 2; IDEA_FILE="$2"; shift 2 ;;
+    --guardrail)        [[ $# -ge 2 ]] || die "--guardrail needs a value" 2; GUARDRAILS+=("$2"); shift 2 ;;
+    --guardrails-file)  [[ $# -ge 2 ]] || die "--guardrails-file needs a value" 2; GUARDRAILS_FILE="$2"; shift 2 ;;
+    --defer-guardrails) DEFER_GUARDRAILS=1; shift ;;
+    --no-clone)         NO_CLONE=1; shift ;;
+    --force)            FORCE=1; shift ;;
+    --dry-run)          DRY_RUN=1; shift ;;
+    --)                 shift; break ;;
+    -*)                 die "unknown option: $1" 2 ;;
+    *)
+      [[ -z "$NAME" ]] || die "unexpected argument: $1 (name is already '$NAME')" 2
+      NAME="$1"; shift ;;
+  esac
+done
+
+[[ -n "$NAME" ]] || { usage >&2; die "a collab name is required" 2; }
+
+# --------------------------------------------------------------------------
+# preflight
+# --------------------------------------------------------------------------
+
+step "Preflight"
+
+command -v python3 >/dev/null 2>&1 || die "python3 is required but not on PATH"
+python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' \
+  || die "python3 is older than 3.9 (found $(python3 -V 2>&1))"
+ok "python3 $(python3 -V 2>&1 | awk '{print $2}')"
+
+[[ -f "$SCAFFOLD" ]] || die "kit looks incomplete: missing $SCAFFOLD"
+[[ -d "$KIT_DIR/tools/collab-kit" ]] || die "kit looks incomplete: missing $KIT_DIR/tools/collab-kit (templates)"
+
+if [[ "$NO_CLONE" -eq 0 && -n "$REPO_URL" ]]; then
+  command -v git >/dev/null 2>&1 || die "git is required to clone $REPO_URL"
+  ok "git $(git --version | awk '{print $3}')"
+fi
+
+# Validate the name through the same code the rest of the kit uses, so the
+# rules can never drift between this script and the Python side.
+python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+from collabkit.slug import validate_name
+from collabkit.errors import ValidationError
+try:
+    validate_name(sys.argv[2])
+except ValidationError as exc:
+    sys.stderr.write(str(exc) + "\n")
+    raise SystemExit(1)
+' "$KIT_DIR/tools" "$NAME" || die "invalid collab name: $NAME" 2
+ok "name '$NAME' is valid"
+
+if [[ "$NO_CLONE" -eq 1 && -n "$REPO_URL" ]]; then
+  warn "--no-clone given; --repo $REPO_URL will be recorded but not cloned"
+fi
+if [[ "$NO_CLONE" -eq 0 && -z "$REPO_URL" ]]; then
+  warn "no --repo given; nothing will be cloned (pass --no-clone to silence this)"
+  NO_CLONE=1
+fi
+
+if [[ -n "$ROOT" ]]; then
+  COLLAB_ROOT="$ROOT"
+else
+  COLLAB_ROOT="$COLLAB_HOME/$NAME"
+fi
+REPO_PATH="$COLLAB_ROOT/repo"
+
+say ""
+say "    kit:         $KIT_DIR"
+say "    collab-home: $COLLAB_HOME"
+say "    collab root: $COLLAB_ROOT"
+say "    seats:       builder=$BUILDER  reviewer=$REVIEWER"
+say ""
+
+# --------------------------------------------------------------------------
+# guardrails -- written fresh, never inherited
+# --------------------------------------------------------------------------
+
+GUARDRAILS_TMP=""
+cleanup() {
+  [[ -n "$GUARDRAILS_TMP" && -f "$GUARDRAILS_TMP" ]] && rm -f "$GUARDRAILS_TMP"
+  return 0
+}
+trap cleanup EXIT
+
+collect_guardrails() {
+  step "Guardrails"
+
+  if [[ -n "$GUARDRAILS_FILE" ]]; then
+    [[ -f "$GUARDRAILS_FILE" ]] || die "guardrails file not found: $GUARDRAILS_FILE"
+    GUARDRAILS_TMP="$GUARDRAILS_FILE"
+    ok "from $GUARDRAILS_FILE"
+    return 0
+  fi
+
+  if [[ ${#GUARDRAILS[@]} -gt 0 ]]; then
+    GUARDRAILS_TMP="$(mktemp "${TMPDIR:-/tmp}/collab-guardrails.XXXXXX")"
+    local rule
+    for rule in ${GUARDRAILS[@]+"${GUARDRAILS[@]}"}; do
+      printf -- '- %s\n' "$rule" >>"$GUARDRAILS_TMP"
+    done
+    ok "${#GUARDRAILS[@]} guardrail(s) from --guardrail"
+    return 0
+  fi
+
+  if [[ "$DEFER_GUARDRAILS" -eq 1 ]]; then
+    warn "scaffolding without guardrails; PROTOCOL.md will carry a TODO block"
+    hint "write them before the first review -- they are what the reviewer enforces"
+    return 0
+  fi
+
+  # No flags and no terminal: refusing beats silently producing a project whose
+  # PROTOCOL.md says "not yet written" and which everyone then treats as done.
+  if [[ ! -t 0 ]]; then
+    die "no guardrails given and no terminal to prompt on.
+    Pass --guardrail \"...\" (repeatable), --guardrails-file <path>,
+    or --defer-guardrails to accept a TODO block." 2
+  fi
+
+  say ""
+  say "  ${C_BOLD}Guardrails for '$NAME'${C_OFF} -- the invariants that must never break here."
+  say "  These are written fresh for this project and are never inherited."
+  say "  One per line. Empty line when done."
+  say ""
+  say "  ${C_DIM}examples: 'never widen a DB transaction boundary';${C_OFF}"
+  say "  ${C_DIM}          'money amounts stay integer minor units, never float'${C_OFF}"
+  say ""
+
+  GUARDRAILS_TMP="$(mktemp "${TMPDIR:-/tmp}/collab-guardrails.XXXXXX")"
+  local line count=0
+  while true; do
+    printf '  %d> ' "$((count + 1))" >&2
+    if ! IFS= read -r line; then break; fi
+    [[ -z "$line" ]] && break
+    printf -- '- %s\n' "$line" >>"$GUARDRAILS_TMP"
+    count=$((count + 1))
+  done
+
+  if [[ "$count" -eq 0 ]]; then
+    rm -f "$GUARDRAILS_TMP"; GUARDRAILS_TMP=""
+    warn "no guardrails entered; PROTOCOL.md will carry a TODO block"
+  else
+    ok "$count guardrail(s) recorded"
+  fi
+}
+
+collect_guardrails
+
+# --------------------------------------------------------------------------
+# clone
+# --------------------------------------------------------------------------
+
+CREATED_ROOT=0
+
+clone_repo() {
+  [[ "$NO_CLONE" -eq 1 ]] && return 0
+
+  step "Cloning $REPO_URL"
+
+  if [[ -e "$REPO_PATH" ]]; then
+    if [[ -d "$REPO_PATH/.git" ]]; then
+      ok "already cloned at $REPO_PATH (left untouched)"
+      return 0
+    fi
+    if [[ -n "$(ls -A "$REPO_PATH" 2>/dev/null || true)" ]]; then
+      die "$REPO_PATH exists and is not a git clone; move it aside first"
+    fi
+  fi
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    say "DRY-RUN git clone ${BRANCH:+--branch $BRANCH }$REPO_URL $REPO_PATH"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$REPO_PATH")"
+  local args
+  args=(clone)
+  [[ -n "$BRANCH" ]] && args+=(--branch "$BRANCH")
+  args+=("$REPO_URL" "$REPO_PATH")
+
+  # A failed clone must not leave a registered collab pointing at nothing.
+  if ! git "${args[@]}"; then
+    rm -rf "$REPO_PATH"
+    [[ "$CREATED_ROOT" -eq 1 ]] && rm -rf "$COLLAB_ROOT"
+    die "git clone failed; nothing was registered"
+  fi
+  ok "cloned into $REPO_PATH"
+}
+
+[[ -d "$COLLAB_ROOT" ]] || CREATED_ROOT=1
+clone_repo
+
+# --------------------------------------------------------------------------
+# scaffold + render + register
+# --------------------------------------------------------------------------
+
+step "Scaffolding"
+
+SCAFFOLD_ARGS=(
+  --name "$NAME"
+  --root "$COLLAB_ROOT"
+  --repo-url "$REPO_URL"
+  --repo-path "$REPO_PATH"
+  --reviewer "$REVIEWER"
+  --builder "$BUILDER"
+)
+[[ -n "$GUARDRAILS_TMP" ]] && SCAFFOLD_ARGS+=(--guardrails-file "$GUARDRAILS_TMP")
+[[ -n "$IDEA" ]]           && SCAFFOLD_ARGS+=(--idea "$IDEA")
+[[ -n "$IDEA_FILE" ]]      && SCAFFOLD_ARGS+=(--idea-file "$IDEA_FILE")
+[[ "$FORCE" -eq 1 ]]       && SCAFFOLD_ARGS+=(--force)
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  say "DRY-RUN python3 $SCAFFOLD ${SCAFFOLD_ARGS[*]}"
+  say ""
+  say "This was a --dry-run: nothing on disk was changed."
+  exit 0
+fi
+
+python3 "$SCAFFOLD" "${SCAFFOLD_ARGS[@]}" || die "scaffolding failed"
+
+# --------------------------------------------------------------------------
+# bootstrap block
+# --------------------------------------------------------------------------
+
+say ""
+step "Session bootstrap"
+say ""
+
+if [[ -f "$COLLAB_ROOT/KICKOFF.md" ]]; then
+  cat "$COLLAB_ROOT/KICKOFF.md"
+else
+  warn "KICKOFF.md was not rendered; showing the minimum instead"
+  cat <<EOF
+
+BUILDER SESSION
+  export COLLAB_HOME="$COLLAB_HOME"
+  export HANDOFF_ROOT="$COLLAB_ROOT"
+  read $COLLAB_ROOT/PROTOCOL.md
+  python3 $KIT_DIR/tools/watch-for-claude-handoffs.py
+
+REVIEWER SESSION
+  export COLLAB_HOME="$COLLAB_HOME"
+  export HANDOFF_ROOT="$COLLAB_ROOT"
+  read $COLLAB_ROOT/REVIEWER-BRIEFING.md
+  python3 $KIT_DIR/tools/watch-for-grok-handoffs.py
+EOF
+fi
+
+say ""
+say "${C_BOLD}Verify it yourself:${C_OFF}"
+say "  $HANDOFF status"
+say "  $HANDOFF $NAME counts"
+say ""

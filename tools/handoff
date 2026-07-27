@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+"""handoff -- the registry-aware collab-kit CLI.
+
+    handoff <collab> <command> [options]     operate on one collab
+    handoff status                           cross-project overview
+    handoff new <name>                       scaffold + register a collab
+
+Installed as a symlink (or shim) in ~/bin by install.sh, so this file must
+locate its own package through whatever indirection it was invoked by. See
+_bootstrap() below.
+"""
+
+import os
+import sys
+
+
+def _bootstrap():
+    """Put the real tools/ directory on sys.path.
+
+    ``__file__`` is the symlink when invoked through ~/bin, so realpath() is
+    what finds the actual kit. Prepending (not appending) matters: a stray
+    ``collabkit`` earlier on the path would otherwise shadow the real one and
+    fail in a way that is very hard to read.
+    """
+    tools = os.path.dirname(os.path.realpath(__file__))
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+
+
+if __name__ == "__main__":
+    if sys.version_info < (3, 9):
+        sys.stderr.write(
+            "collab-kit needs Python 3.9 or newer (found %s)\n" % sys.version.split()[0]
+        )
+        raise SystemExit(1)
+    _bootstrap()
+    from collabkit.cli import main
+
+    raise SystemExit(main())
