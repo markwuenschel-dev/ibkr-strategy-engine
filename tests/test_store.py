@@ -13,6 +13,9 @@ import sys
 import threading
 
 from collabkit import frontmatter, ids
+from unittest import mock
+from collabkit import store as store_module
+from collabkit.model import Handoff
 from collabkit.errors import CollabKitError, ConflictError, NotFoundError, ValidationError
 from collabkit.paths import STATES
 from collabkit.watch import WatchTarget, Watcher
@@ -461,3 +464,42 @@ class TransitionAgainstOpenReadersTests(IsolatedHomeTestCase):
                 sys.platform.startswith("win"),
                 "Windows should not have been able to rename a file held open",
             )
+
+
+class FindDuringATransitionTests(IsolatedHomeTestCase):
+    """find() must never leak a raw OSError when a file moves under it.
+
+    ``candidate.is_file()`` followed by ``Handoff.load(candidate)`` is a
+    time-of-check/time-of-use window. Under a contested claim the winner's
+    rename lands inside it, so the read hits a path that no longer exists. A
+    bare ``FileNotFoundError`` there reaches the CLI as "unexpected failure"
+    (exit 1) instead of a conflict (exit 4) -- i.e. the losing agent is told
+    something broke rather than that it lost.
+
+    Windows timing hid this; CI caught it on macOS.
+    """
+
+    class _VanishingHandoff(Handoff):
+        """Stands in for a file that is renamed between the stat and the read."""
+
+        @classmethod
+        def load(cls, path, *, status=None):
+            raise FileNotFoundError(2, "No such file or directory", str(path))
+
+    def test_a_handoff_moving_under_us_raises_a_typed_conflict(self):
+        store = self.make_store("demo")
+        handoff = store.create(to="reviewer", sender="builder", title="racing")
+
+        with mock.patch.object(store_module, "Handoff", self._VanishingHandoff):
+            with self.assertRaises(CollabKitError) as caught:
+                store.find(handoff.id)
+
+        # Specifically a conflict: it existed a moment ago, so "not found" would
+        # misreport a lost race as a missing handoff.
+        self.assertIsInstance(caught.exception, ConflictError)
+
+    def test_a_genuinely_absent_handoff_is_still_not_found(self):
+        # The guard above must not turn every miss into a conflict.
+        store = self.make_store("demo")
+        with self.assertRaises(NotFoundError):
+            store.find("20260101T000000Z-aaaaaa-nope")

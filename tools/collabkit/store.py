@@ -235,6 +235,14 @@ class HandoffStore:
             raise ValidationError("a handoff id is required")
 
         # Exact hit first: a full id must never be treated as a prefix.
+        #
+        # `is_file()` then `load()` is a time-of-check/time-of-use window, and
+        # under a contested claim it is a window that gets hit: the winner's
+        # rename lands between the two, and the read fails on a path that no
+        # longer exists. Letting that escape hands a losing agent a bare
+        # FileNotFoundError (CLI exit 1, "unexpected failure") instead of a
+        # clean conflict. Caught on macOS by CI; Windows timing hid it.
+        vanished_from: str | None = None
         for state in states:
             path = self.paths.state_dir(state)
             candidate = path / f"{needle}.md"
@@ -242,7 +250,14 @@ class HandoffStore:
                 year, month = ids.archive_partition(needle)
                 candidate = path / year / month / f"{needle}.md"
             if candidate.is_file():
-                return Handoff.load(candidate, status=state)
+                try:
+                    return Handoff.load(candidate, status=state)
+                except (OSError, ValidationError):
+                    # Mid-transition. States are searched in lifecycle order, so
+                    # the destination directory is still ahead of us -- keep
+                    # looking rather than guessing.
+                    vanished_from = state
+                    continue
 
         matches = [
             handoff
@@ -251,6 +266,14 @@ class HandoffStore:
             if handoff.id.startswith(needle)
         ]
         if not matches:
+            if vanished_from is not None:
+                # It existed a moment ago and is now in neither its old nor its
+                # new directory: someone is renaming it right now. That is a
+                # lost race, not a missing handoff, and the exit code must say so.
+                raise ConflictError(
+                    f"{needle} is being moved out of {vanished_from}/ by someone else",
+                    hint="re-run 'list' to see its current state",
+                )
             raise NotFoundError(
                 f"no handoff matching {needle!r} in {self.paths.root}",
                 hint="run 'handoff <name> list --all' to see what exists",
