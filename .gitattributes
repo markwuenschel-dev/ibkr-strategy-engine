@@ -1,0 +1,38 @@
+# Normalize every text file to LF in the repository AND check it out as LF on
+# every platform.
+#
+# This is not cosmetic. This kit's entry points are bash scripts and shebang'd
+# Python (`install.sh`, `bin/newproject`, `bin/restart`, `tools/handoff`, ...),
+# and it is developed on Windows where `core.autocrlf=true` is the default. A
+# CRLF checkout makes every one of them fail on Linux and macOS with
+#     /usr/bin/env: 'bash\r': No such file or directory
+# which is a confusing way to discover a line-ending problem. Pinning eol=lf
+# here overrides whatever autocrlf the cloner has configured.
+* text=auto eol=lf
+
+# The extension-less executables, named explicitly so the intent survives
+# someone later narrowing the glob above.
+/bin/newproject        text eol=lf
+/bin/restart           text eol=lf
+/tools/handoff         text eol=lf
+/tools/collab-handoff  text eol=lf
+/install.sh            text eol=lf
+
+# Markdown templates are rendered into per-project files and diffed by humans.
+*.md      text eol=lf
+*.tmpl    text eol=lf
+*.py      text eol=lf
+*.js      text eol=lf
+*.json    text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+
+# Binaries must never be line-ending converted.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.zip  binary
+*.gz   binary

@@ -1,0 +1,53 @@
+# ---------------------------------------------------------------------------
+# collab-kit runtime state
+#
+# $COLLAB_HOME defaults to the kit directory (this repo), so a working install
+# writes its live state right here. None of it belongs in a commit.
+# NOTE: git does not support trailing comments in .gitignore -- every comment
+# below is on its own line on purpose.
+# ---------------------------------------------------------------------------
+
+# your private registry of collabs (collabs.json.example stays tracked)
+collabs.json
+!collabs.json.example
+
+# watcher state, bridge state, locks
+logs/
+
+# agents -> you (Telegram bridge queue)
+outbox/
+
+# you -> agents (from-user-*.md drops)
+inbox/
+
+# machine-local overrides and install.sh backups
+*.local
+.collab-kit.bak
+*.collab-kit.bak
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.venv/
+venv/
+
+# ---------------------------------------------------------------------------
+# Editors / IDEs
+# ---------------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*~
+
+# ---------------------------------------------------------------------------
+# OS junk
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
