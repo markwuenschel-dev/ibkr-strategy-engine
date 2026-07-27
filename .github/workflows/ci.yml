@@ -8,7 +8,8 @@
 #           needs one, that is a regression against a hard project constraint.
 #   lint  - static checks only, Linux only, because they are platform-agnostic:
 #           bash -n + shellcheck over every shell script, compileall over the
-#           Python trees, and node --check over the workflow module.
+#           Python trees, and scripts/check-workflow.mjs (via pnpm) over the
+#           Workflow scripts.
 #
 # Actions are pinned by major version tag, never @master.
 
@@ -37,7 +38,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ['3.9', '3.11', '3.13']
+        python-version: ['3.14']
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -67,12 +68,26 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.14'
 
+      # pnpm first, then setup-node: `cache: pnpm` needs the pnpm binary to
+      # already exist so it can resolve the store path. The version is not
+      # written here -- pnpm/action-setup reads it from package.json's
+      # `packageManager` field, so the toolchain is pinned in exactly one place.
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      # .node-version is the exact version CI and contributors run (and is
+      # understood by nvm/fnm/volta too); package.json `engines.node` states the
+      # floor the code actually supports. Deliberately not the same statement.
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version-file: .node-version
+          cache: pnpm
+
+      - name: Install JS toolchain
+        run: pnpm install --frozen-lockfile
 
       # Build the shell-script list once and share it with the later steps.
       # `shopt -s nullglob` makes a glob that matches nothing expand to nothing
@@ -153,33 +168,11 @@ jobs:
           python -m compileall -q tools
           python -m compileall -q tests
 
-      # `node --check` picks CJS vs ESM from the file extension and the nearest
-      # package.json, and diff-regression-hunt.workflow.js fits neither cleanly:
-      # it is a Workflow script, not a standalone Node module. It uses ESM
-      # `export` for its `meta` block AND top-level `return` to yield the
-      # workflow result, because the Workflow runtime evaluates the file body
-      # inside a function. `export` is illegal in CommonJS; top-level `return`
-      # is illegal in an ES module. So checking the file as-is -- as .js or as
-      # a .mjs copy -- fails on one or the other no matter what, and would make
-      # this job permanently red for a file that is correct for its runtime.
-      #
-      # Instead, reproduce the runtime's shape before parsing: strip the leading
-      # `export` keywords and wrap the body in an async function, then --check
-      # that as ESM. Every line of real code still goes through the parser, so
-      # an actual syntax error is still caught.
-      - name: node --check (Workflow script)
-        shell: bash
-        run: |
-          src=tools/diff-regression-hunt.workflow.js
-          if [ ! -f "$src" ]; then
-            echo "::error::$src not found"
-            exit 1
-          fi
-          wrapped="$RUNNER_TEMP/diff-regression-hunt.check.mjs"
-          {
-            echo 'export default async function __syntaxCheck__() {'
-            sed 's/^export default //; s/^export //' "$src"
-            echo '}'
-          } > "$wrapped"
-          node --check "$wrapped"
-          echo "OK: $src is syntactically valid"
+      # The recipe that makes this meaningful now lives in
+      # scripts/check-workflow.mjs, so CI and a contributor's machine run the
+      # identical script instead of two copies of it that drift apart. It also
+      # asserts the check REJECTS deliberately broken code -- without that, a
+      # top-level `export` makes `node --check` exit 0 on a file with a syntax
+      # error, and this job would report green forever while proving nothing.
+      - name: Check Workflow scripts (pnpm)
+        run: pnpm run check:workflow

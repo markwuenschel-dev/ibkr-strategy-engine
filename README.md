@@ -335,7 +335,10 @@ collab-kit/
     collab-kit/                     # per-project markdown TEMPLATES
   skills/collab/SKILL.md            # Claude Code `/collab` skill
   tests/                            # python stdlib unittest suite
+  scripts/check-workflow.mjs        # Workflow syntax gate (pnpm run check:workflow)
   .github/workflows/ci.yml
+  package.json  pnpm-lock.yaml      # dev toolchain only — zero dependencies
+  .npmrc  .node-version
 ```
 
 Your data (`$COLLAB_HOME` — defaults to the kit dir, override via env):
@@ -365,13 +368,30 @@ is exactly why `collabs.json`, `logs/`, `outbox/`, and `inbox/` are gitignored h
 ## Requirements
 
 - **Bash**
-- **Python 3.9+**
+- **Python 3.14** — pinned exactly, not a floor. Older interpreters are refused at startup by
+  `handoff`, `collab-handoff`, `newproject` and `install.sh`.
 - **Git**
 - **At least one agent CLI** — Claude Code and/or Grok — authenticated the normal way
 - **Optional:** a Telegram bot (a @BotFather token) for the phone channel
 
+Still no third-party Python packages, and none are ever added — the runtime dependency list is
+"Python 3.14 and nothing else".
+
 The regression-hunt workflow is executed by your agent's `Workflow(...)` runtime, not by a
 standalone `node` you install.
+
+### Development-only: Node + pnpm
+
+Contributors additionally need **Node 22+** and **pnpm 11+** to run the repo's checks. This is
+tooling, not a runtime dependency: nothing in `tools/`, `bin/` or `install.sh` shells out to Node,
+and the package has **zero dependencies** — pnpm is here to pin the toolchain and give the checks
+one entry point.
+
+```bash
+corepack enable                # or: npm i -g pnpm
+pnpm install --frozen-lockfile
+pnpm check                     # workflow syntax + full Python suite
+```
 
 Explicitly:
 
@@ -429,9 +449,11 @@ either way. To syntax-check it, reproduce that shape first:
 node --check /tmp/check.mjs
 ```
 
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) does exactly that. It also runs the test
-command above across Linux/macOS/Windows on Python 3.9, 3.11, and 3.13 (no install step — the suite
-is stdlib-only), plus a lint job covering `bash -n`, `shellcheck`, and `compileall`.
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) does exactly that, via `pnpm run
+check:workflow`, so CI and your machine run the identical script rather than two copies of the
+recipe that can drift. It also runs the test command above across Linux/macOS/Windows on Python
+3.14 (no install step — the suite is stdlib-only), plus a lint job covering `bash -n`,
+`shellcheck`, and `compileall`.
 
 ---
 

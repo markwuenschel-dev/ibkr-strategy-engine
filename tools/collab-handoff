@@ -21,9 +21,9 @@ def _bootstrap():
 
 
 if __name__ == "__main__":
-    if sys.version_info < (3, 9):
+    if sys.version_info < (3, 14):
         sys.stderr.write(
-            "collab-kit needs Python 3.9 or newer (found %s)\n" % sys.version.split()[0]
+            "collab-kit needs Python 3.14 or newer (found %s)\n" % sys.version.split()[0]
         )
         raise SystemExit(1)
     _bootstrap()

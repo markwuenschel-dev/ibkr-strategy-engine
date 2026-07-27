@@ -1,0 +1,20 @@
+{
+  "name": "collab-kit",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "File-based orchestration for a builder + independent-reviewer agent loop, with a human in the loop over Telegram.",
+  "license": "UNLICENSED",
+  "packageManager": "pnpm@11.10.0",
+  "engines": {
+    "node": ">=22",
+    "pnpm": ">=11"
+  },
+  "scripts": {
+    "check:workflow": "node scripts/check-workflow.mjs",
+    "check:python": "python3 -m compileall -q tools tests",
+    "check:shell": "bash -n install.sh && bash -n bin/newproject && bash -n bin/restart",
+    "test": "python3 -m unittest discover -s tests -t .",
+    "check": "pnpm run check:workflow && pnpm run check:shell && pnpm run check:python && pnpm run test"
+  }
+}

@@ -127,8 +127,12 @@ collab-kit/                # the kit (clone anywhere; this is the code)
                           # locking · atomic · paths · seats · watch · render · cli
   skills/collab/SKILL.md    # the Claude Code /collab front door
   tests/                    # stdlib unittest suite; python3 -m unittest discover -s tests -t .
-  .github/workflows/ci.yml  # test matrix (3 OSes) + shell/python/node lint
+  scripts/                  # check-workflow.mjs — the Workflow syntax gate, run by
+                            # CI and humans alike via `pnpm run check:workflow`
+  .github/workflows/ci.yml  # test matrix (3 OSes x Python 3.14) + shell/python/js lint
   install.sh · collabs.json.example · README.md
+  package.json · pnpm-lock.yaml · .npmrc · .node-version   # dev toolchain only,
+                            # zero dependencies; nothing at runtime shells out to Node
 
 $COLLAB_HOME/               # your data (defaults to the kit dir; override via env)
   collabs.json              # registry of your collabs
@@ -144,7 +148,7 @@ agent output like untrusted code, and make verification a first-class, parallel,
 
 ## Requirements
 
-Bash, Python 3, Git, and at least one agent CLI (Claude Code and/or Grok), authenticated the normal
+Bash, Python 3.14, Git, and at least one agent CLI (Claude Code and/or Grok), authenticated the normal
 way. Optionally a Telegram bot for the phone channel. No third-party Python packages. The kit sets
 up the *collaboration system* — it does not provide the agent runtimes, model API keys, or any
 model proxy.

@@ -327,15 +327,15 @@ preflight() {
     missing=()
 
     if command -v python3 >/dev/null 2>&1; then
-        if python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,9) else 1)'; then
+        if python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,14) else 1)'; then
             pyver=$(python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null) || pyver='?'
             ok "python3 $pyver"
         else
             pyver=$(python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null) || pyver='unknown'
-            missing+=("python3 is $pyver, but collab-kit needs >= 3.9 -- install a newer Python 3 and make sure it is first on PATH")
+            missing+=("python3 is $pyver, but collab-kit needs >= 3.14 -- install a newer Python 3 and make sure it is first on PATH")
         fi
     else
-        missing+=('python3 not found on PATH -- install Python 3.9+ (macOS: brew install python3 | Debian/Ubuntu: sudo apt install python3 | Windows: winget install Python.Python.3)')
+        missing+=('python3 not found on PATH -- install Python 3.14+ (macOS: brew install python3 | Debian/Ubuntu: sudo apt install python3 | Windows: winget install Python.Python.3)')
     fi
 
     if command -v git >/dev/null 2>&1; then
