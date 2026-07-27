@@ -45,9 +45,10 @@ class ParseTests(unittest.TestCase):
         values, _ = dotenv.parse("A=\"quoted\"\nB='single'\n")
         self.assertEqual(values, {"A": "quoted", "B": "single"})
 
-    def test_double_quotes_decode_escapes_and_single_quotes_do_not(self) -> None:
+    def test_quoted_contents_stay_literal(self) -> None:
+        """No escape decoding: a backslash in a token survives as a backslash."""
         values, _ = dotenv.parse('A="one\\ntwo"\nB=\'one\\ntwo\'\n')
-        self.assertEqual(values["A"], "one\ntwo")
+        self.assertEqual(values["A"], "one\\ntwo")
         self.assertEqual(values["B"], "one\\ntwo")
 
     def test_quoting_preserves_surrounding_spaces(self) -> None:

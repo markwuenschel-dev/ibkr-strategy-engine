@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import os
 import re
-import stat
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -49,8 +48,6 @@ ENV_FILE = "COLLAB_ENV_FILE"
 # platform is a trap, so the strict rule applies everywhere.
 _KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", '"': '"', "'": "'"}
-
 
 @dataclass(frozen=True)
 class DotenvResult:
@@ -60,7 +57,6 @@ class DotenvResult:
     loaded: tuple[str, ...] = ()
     skipped: tuple[str, ...] = ()
     problems: tuple[str, ...] = ()
-    insecure: bool = False
 
     @property
     def found(self) -> bool:
@@ -75,8 +71,6 @@ class DotenvResult:
             parts.append(f"{len(self.skipped)} already in the environment")
         if self.problems:
             parts.append(f"{len(self.problems)} unparsable line(s)")
-        if self.insecure:
-            parts.append("READABLE BY OTHER USERS")
         return ", ".join(parts)
 
 
@@ -140,43 +134,16 @@ def parse(text: str) -> tuple[dict[str, str], list[str]]:
 
 
 def _unquote(value: str) -> str:
-    """Strip matching surrounding quotes; decode escapes only inside them."""
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-        inner = value[1:-1]
-        return _unescape(inner) if value[0] == '"' else inner
-    return value
+    """Strip one layer of matching surrounding quotes. Contents stay literal.
 
-
-def _unescape(value: str) -> str:
-    out: list[str] = []
-    index = 0
-    while index < len(value):
-        char = value[index]
-        if char == "\\" and index + 1 < len(value):
-            following = value[index + 1]
-            if following in _ESCAPES:
-                out.append(_ESCAPES[following])
-                index += 2
-                continue
-        out.append(char)
-        index += 1
-    return "".join(out)
-
-
-def _is_world_readable(path: Path) -> bool:
-    """True when a POSIX mode grants group or other read. Always False on Windows.
-
-    Windows uses ACLs that ``st_mode`` does not describe, so a mode check there
-    would report confident nonsense. Returning False is the honest answer: this
-    module did not check, and it says so by not claiming a problem.
+    Quoting exists here to protect leading and trailing whitespace, nothing
+    more -- there is no escape decoding, so a backslash in a token survives as
+    a backslash. Secrets are opaque strings; inventing a decoding layer for
+    them only creates ways to corrupt one.
     """
-    if os.name != "posix":
-        return False
-    try:
-        mode = path.stat().st_mode
-    except OSError:  # pragma: no cover - raced deletion
-        return False
-    return bool(mode & (stat.S_IRGRP | stat.S_IROTH))
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
 
 
 def load(
@@ -226,7 +193,6 @@ def load(
                 loaded=tuple(loaded),
                 skipped=tuple(skipped),
                 problems=tuple(problems),
-                insecure=_is_world_readable(resolved),
             )
 
     if not explicit:

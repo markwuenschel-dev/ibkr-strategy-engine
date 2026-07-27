@@ -668,8 +668,6 @@ def main(argv: list[str] | None = None) -> int:
     env_file = dotenv.load()
     for problem in env_file.problems:
         console.warn(f".env: {problem}")
-    if env_file.insecure:
-        console.warn(f"{env_file.path} is readable by other users -- chmod 600 it")
     if env_file.loaded:
         console.info(f"loaded {len(env_file.loaded)} key(s) from {env_file.path}")
 
