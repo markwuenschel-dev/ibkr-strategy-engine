@@ -36,3 +36,10 @@
 *.pdf  binary
 *.zip  binary
 *.gz   binary
+
+# JS tooling added alongside the Python kit.
+*.mjs            text eol=lf
+*.cjs            text eol=lf
+/.npmrc          text eol=lf
+/.node-version   text eol=lf
+/pnpm-lock.yaml  text eol=lf -diff

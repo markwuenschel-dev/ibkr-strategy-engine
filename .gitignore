@@ -51,3 +51,9 @@ venv/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ---- Node / pnpm (dev tooling only; the package has zero dependencies) ----
+node_modules/
+.pnpm-store/
+.pnpm-debug.log*
+npm-debug.log*

@@ -743,7 +743,7 @@ def _g_doctor(argv: list[str]) -> int:
     def check(label: str, ok_: bool, detail: str = "", *, fatal: bool = True) -> None:
         checks.append({"check": label, "ok": bool(ok_), "detail": detail, "fatal": fatal})
 
-    check("python", sys.version_info >= (3, 9), f"{sys.version.split()[0]}")
+    check("python", sys.version_info >= (3, 14), f"{sys.version.split()[0]}")
     check("kit dir", kit_dir().is_dir(), str(kit_dir()))
     check("collab home", home.root.is_dir(), str(home.root))
     check(
