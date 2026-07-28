@@ -79,3 +79,12 @@ engine/.venv/
 .venv/
 .uv/
 .uv-cache/
+
+# The engine's state dir -- IBKR_STATE_DIR, default ./.engine -- holding the
+# order journal, the HALT kill switch and the single-instance lock. Runtime
+# state, never source: the journal is the durable record of what one machine
+# actually sent to a broker, it is never replayed elsewhere, and it names the
+# account it was sent to. Both spellings, because the default is relative to
+# the working directory and the engine is run from the repo root and engine/.
+engine/.engine/
+.engine/

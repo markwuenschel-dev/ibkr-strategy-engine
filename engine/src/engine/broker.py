@@ -52,6 +52,23 @@ MARKET_DATA_LABELS = {
     MARKET_DATA_DELAYED_FROZEN: "delayed-frozen",
 }
 
+# Enough of ``OrderState`` to tell one from whatever else a failed request
+# resolved to. Structural rather than an isinstance check, so the test fake does
+# not have to be an ib_async type to exercise the same path.
+_ORDER_STATE_FIELDS = (
+    "initMarginChange",
+    "maintMarginChange",
+    "commission",
+    "equityWithLoanChange",
+)
+
+# IBKR sends DBL_MAX for "this field does not apply", e.g. minCommission and
+# maxCommission on a plain stock order. It is a finite float, so the NaN/inf
+# screen below does not catch it, and left alone it would be read as a real
+# number -- a commission of 1.8e308, or worse a margin impact that happens to
+# clear a cap comparison somewhere.
+IB_UNSET = 1.7976931348623157e308
+
 
 @dataclass
 class Quote:
@@ -313,10 +330,23 @@ class Broker:
         contract = self._stock(intent.symbol)
         order = self._build_order(intent)
         state = self.ib.whatIfOrder(contract, order)
-        if state is None:
+        if state is None or not any(
+            hasattr(state, name) for name in _ORDER_STATE_FIELDS
+        ):
+            # Not merely absent -- the wrong *shape*. ib_async ends a failed
+            # request by resolving it with its empty result container, so a
+            # rejected whatIf arrives as `[]`, not as None and not as an
+            # OrderState. Reading fields off that silently yields "margin not
+            # reported", which gate_margin refuses -- correct, but it blames the
+            # cap for what was actually a broker error. Say which it was.
             raise EngineError(
-                f"the broker returned no order state for {intent.describe()}",
-                hint="cannot price the order, so it will not be placed",
+                f"the broker returned no order state for {intent.describe()} "
+                f"(got {type(state).__name__} {state!r})",
+                hint=(
+                    "the whatIf request was rejected by TWS -- check the error "
+                    "line above it for the IBKR code. Cannot price the order, "
+                    "so it will not be placed."
+                ),
             )
         return Preview(
             intent=intent,
@@ -392,6 +422,16 @@ class Broker:
         # Pin the account on the order itself. If this session ever manages more
         # than one, the order still cannot land anywhere but the configured one.
         order.account = self.config.account_id
+        # Set the time-in-force explicitly, even though DAY is what an unset TIF
+        # resolves to anyway. Left blank, TWS applies its order preset and
+        # announces it with error 10349 "Order TIF was set to DAY based on order
+        # preset." ib_async does not list 10349 as a warning
+        # (ib_async/wrapper.py:1609), so it ends the in-flight request and
+        # whatIfOrder resolves to the empty container `[]` instead of an
+        # OrderState -- margin comes back unknown and gate_margin refuses a
+        # perfectly ordinary order. Naming the value leaves the preset nothing to
+        # override, and no 10349 is emitted. Verified against TWS 2026-07-28.
+        order.tif = "DAY"
         return order
 
     def _settle(self, seconds: float) -> None:
@@ -423,6 +463,8 @@ def _as_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     if math.isnan(number) or math.isinf(number):
+        return None
+    if abs(number) >= IB_UNSET:
         return None
     return number
 

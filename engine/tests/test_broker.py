@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from engine.broker import MARKET_DATA_DELAYED, Broker, _as_float
+from engine.broker import IB_UNSET, MARKET_DATA_DELAYED, Broker, _as_float
 from engine.config import EngineConfig
-from engine.errors import ConnectionError_
+from engine.errors import ConnectionError_, EngineError
 from engine.journal import OrderJournal
 from engine.safety import BUY, SELL, OrderIntent
 from fakes import FakeContract, FakeIB, FakeOrderState, FakePosition, FakeTicker, FakeTrade
@@ -136,6 +136,34 @@ class TestPreview:
         broker.connect()
         assert broker.preview(OrderIntent("SPY", 1, BUY)).margin_impact == 250.0
 
+    def test_a_rejected_whatif_is_a_broker_error_not_a_silent_unknown(
+        self, config: EngineConfig, journal: OrderJournal
+    ) -> None:
+        # ib_async ends a rejected request by resolving it with its empty result
+        # container, so the caller gets `[]` where an OrderState was promised.
+        # Read field-by-field that degrades into "margin not reported", which
+        # gate_margin refuses -- the right outcome reported as the wrong cause.
+        broker = make(config, journal, order_state=[])
+        broker.connect()
+        with pytest.raises(EngineError) as caught:
+            broker.preview(OrderIntent("SPY", 1, BUY))
+        assert "no order state" in str(caught.value)
+
+    def test_an_unset_ibkr_field_is_not_read_as_a_number(
+        self, config: EngineConfig, journal: OrderJournal
+    ) -> None:
+        # IBKR sends DBL_MAX for a field that does not apply. It is finite, so
+        # only an explicit screen keeps it out of the margin cap comparison.
+        broker = make(
+            config,
+            journal,
+            order_state=FakeOrderState(
+                initMarginChange=IB_UNSET, maintMarginChange=IB_UNSET
+            ),
+        )
+        broker.connect()
+        assert broker.preview(OrderIntent("SPY", 1, BUY)).margin_impact is None
+
 
 class TestPlace:
     def test_the_order_carries_the_configured_account(
@@ -175,9 +203,33 @@ class TestPlace:
         _contract, order = broker.ib.placed[0]
         assert order.action == "SELL"
 
+    def test_the_order_names_its_time_in_force(
+        self, config: EngineConfig, journal: OrderJournal
+    ) -> None:
+        # An unset TIF lets a TWS order preset supply one and announce it with
+        # error 10349, which ib_async classifies as fatal and which kills an
+        # in-flight whatIf. Naming DAY leaves the preset nothing to override.
+        broker = make(config, journal)
+        broker.connect()
+        broker.place(OrderIntent("SPY", 1, BUY))
+        _contract, order = broker.ib.placed[0]
+        assert order.tif == "DAY"
+
 
 class TestFloatCoercion:
-    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), None, "abc"])
+    @pytest.mark.parametrize(
+        "value",
+        [
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            None,
+            "abc",
+            IB_UNSET,
+            -IB_UNSET,
+            str(IB_UNSET),
+        ],
+    )
     def test_unusable_values_become_none(self, value: object) -> None:
         assert _as_float(value) is None
 
