@@ -85,14 +85,16 @@ class FakeIB:
         accounts: list[str] | None = None,
         ticker: FakeTicker | None = None,
         positions: list[FakePosition] | None = None,
-        order_state: FakeOrderState | None = None,
+        order_state: Any = None,
         trade: FakeTrade | None = None,
         connect_error: Exception | None = None,
     ) -> None:
         self._accounts = accounts if accounts is not None else ["DU1234567"]
         self._ticker = ticker or FakeTicker(bid=99.0, ask=101.0, last=100.0, close=99.5)
         self._positions = positions or []
-        self._order_state = order_state or FakeOrderState()
+        # Not `order_state or FakeOrderState()`: a test needs to inject the
+        # falsy empty list that ib_async hands back for a rejected whatIf.
+        self._order_state = FakeOrderState() if order_state is None else order_state
         self._trade = trade or FakeTrade()
         self._connect_error = connect_error
 
@@ -145,7 +147,7 @@ class FakeIB:
 
     # -- orders ----------------------------------------------------------
 
-    def whatIfOrder(self, contract: Any, order: Any) -> FakeOrderState:  # noqa: N802
+    def whatIfOrder(self, contract: Any, order: Any) -> Any:  # noqa: N802
         self.what_ifs.append((contract, order))
         return self._order_state
 
