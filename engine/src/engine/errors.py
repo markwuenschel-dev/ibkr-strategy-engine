@@ -60,6 +60,20 @@ class HaltedError(RefusedError):
     exit_code = EXIT_HALTED
 
 
+class InvalidStrategyError(RefusedError):
+    """An option strategy violates a structural invariant and was not built.
+
+    A distinct type from RefusedError for the same reason UnsafeConfigError is
+    distinct from ConfigError: "this credit is too small" and "this structure
+    contains an uncovered short call" are not the same category of event, and a
+    broad ``except RefusedError`` that logs and moves to the next candidate must
+    not be able to swallow the second one quietly.
+
+    Raised at construction time, so an invalid structure cannot exist as an
+    object waiting to be passed to a gate that happens not to check it.
+    """
+
+
 class ConnectionError_(EngineError):
     """Could not reach TWS / IB Gateway, or the connection was rejected.
 
