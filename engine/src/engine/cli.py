@@ -6,6 +6,8 @@
     engine preview --symbol SPY --qty 1            M3: margin preview, places nothing
     engine trade   --symbol SPY --qty 1 --arm      M4: one order
 
+    engine probe-options-data                      capability probe; transmits nothing
+
     engine halt "reason"                           engage the kill switch
     engine resume                                  release it
     engine journal -n 20                           read the durable record
@@ -32,7 +34,7 @@ from ._collabkit import load_dotenv
 from .alerts import Alerter
 from .broker import Broker
 from .config import PAPER_PORTS, EngineConfig
-from .errors import EXIT_OK, EXIT_USAGE, EngineError, RefusedError
+from .errors import EXIT_ERROR, EXIT_OK, EXIT_USAGE, EngineError, RefusedError
 from .journal import OrderJournal
 from .safety import BUY, SIDES, OrderIntent, SafetyGate
 
@@ -91,6 +93,25 @@ def build_parser() -> argparse.ArgumentParser:
                 action="store_true",
                 help="actually transmit. Without this, the order is only described.",
             )
+
+    probe = subs.add_parser(
+        "probe-options-data",
+        help="non-transmitting capability probe: do option greeks arrive?",
+    )
+    probe.add_argument("--symbol", default="SPY")
+    probe.add_argument(
+        "--market-data-type",
+        type=int,
+        default=3,
+        choices=[1, 2, 3, 4],
+        help="1 live, 2 frozen, 3 delayed (default), 4 delayed-frozen. "
+        "Requested once and never changed, so run each type in its own process.",
+    )
+    probe.add_argument("--dte", type=int, default=45, help="target days to expiry")
+    probe.add_argument("--strikes", type=int, default=4, help="contracts to subscribe")
+    probe.add_argument(
+        "--settle", type=float, default=12.0, help="seconds to wait for ticks"
+    )
 
     halt = subs.add_parser("halt", help="engage the kill switch")
     halt.add_argument("reason", nargs="?", default="halted from the CLI")
@@ -196,6 +217,45 @@ def cmd_quote(args: argparse.Namespace) -> int:
                 "subscriptions; outside trading hours even delayed data can be empty."
             )
             return 1
+    return EXIT_OK
+
+
+def cmd_probe_options_data(args: argparse.Namespace, broker_factory: Any = Broker) -> int:
+    """Subscribe, observe, report, cancel. Places nothing, ever.
+
+    Exits 0 whichever capability state is found -- an answer of "delayed greeks
+    are unavailable" is a successful probe, not a failure. Only a probe that
+    could not reach a conclusion exits non-zero.
+    """
+    from .options.probe import ProbeOutcome, run_market_data_probe
+
+    config = config_from(args)
+    journal = OrderJournal(config.journal_path)
+    journal.preflight()
+
+    gate = SafetyGate(config, journal)
+    # The kill switch covers reads too. If someone has halted the engine, the
+    # answer is that nothing talks to the broker -- not "nothing places orders".
+    gate.assert_not_halted()
+
+    with broker_factory(config, journal) as broker:
+        report = run_market_data_probe(
+            broker,
+            symbol=args.symbol.strip().upper(),
+            market_data_type=args.market_data_type,
+            target_dte=args.dte,
+            strike_count=args.strikes,
+            settle_seconds=args.settle,
+            account=config.account_id,
+        )
+
+    out(report.describe())
+    journal.record(**report.to_record())
+    out("")
+    note("probe complete; no order was transmitted and none can be from this path")
+
+    if report.outcome is ProbeOutcome.PROBE_ERROR:
+        return EXIT_ERROR
     return EXIT_OK
 
 
@@ -427,6 +487,7 @@ COMMANDS = {
     "halt": cmd_halt,
     "resume": cmd_resume,
     "journal": cmd_journal,
+    "probe-options-data": cmd_probe_options_data,
 }
 
 
