@@ -354,6 +354,25 @@ def _f(value: Any) -> float | None:
     return number
 
 
+def _price(value: Any) -> float | None:
+    """A price, screening IBKR's ``-1.0`` "no quote" marker.
+
+    Observed live on 2026-07-29: delayed SPY option subscriptions returned
+    ``bid=-1.0 ask=-1.0`` alongside perfectly good model greeks. A negative
+    option price is not a price, and letting -1.0 through would make a spread
+    look tradeable at a negative mid.
+
+    Only for prices. A delta of -1.0 is a legitimate deep-in-the-money put, so
+    greeks keep their own normalization.
+    """
+    number = _f(value)
+    if number is None:
+        return None
+    if number < 0:
+        return None
+    return number
+
+
 def run_market_data_probe(
     broker: Any,
     *,
@@ -493,10 +512,10 @@ def run_market_data_probe(
             ticker = tickers.get(obs.con_id)
             if ticker is None:
                 return
-            obs.bid = _f(getattr(ticker, "bid", None))
-            obs.ask = _f(getattr(ticker, "ask", None))
-            obs.last = _f(getattr(ticker, "last", None))
-            obs.close = _f(getattr(ticker, "close", None))
+            obs.bid = _price(getattr(ticker, "bid", None))
+            obs.ask = _price(getattr(ticker, "ask", None))
+            obs.last = _price(getattr(ticker, "last", None))
+            obs.close = _price(getattr(ticker, "close", None))
             computation = recorder.latest_greeks.get(obs.con_id)
             if computation is None:
                 computation = getattr(ticker, "modelGreeks", None)
@@ -508,7 +527,7 @@ def run_market_data_probe(
                 )
 
         harvest(under_obs)
-        under_obs.bid = under_obs.bid if under_obs.bid is not None else _f(
+        under_obs.bid = under_obs.bid if under_obs.bid is not None else _price(
             getattr(under_ticker, "bid", None)
         )
         for obs in report.options:

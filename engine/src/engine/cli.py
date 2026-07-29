@@ -7,6 +7,7 @@
     engine trade   --symbol SPY --qty 1 --arm      M4: one order
 
     engine probe-options-data                      capability probe; transmits nothing
+    engine options-scan --symbol SPY               IV Rank + chain + real what-if; transmits nothing
 
     engine halt "reason"                           engage the kill switch
     engine resume                                  release it
@@ -112,6 +113,15 @@ def build_parser() -> argparse.ArgumentParser:
     probe.add_argument(
         "--settle", type=float, default=12.0, help="seconds to wait for ticks"
     )
+
+    scan = subs.add_parser(
+        "options-scan",
+        help="shadow scan: IV Rank, expiry, chain and a real broker what-if. Transmits nothing.",
+    )
+    scan.add_argument("--symbol", default="SPY")
+    scan.add_argument("--dte", type=int, default=45, help="target days to expiry")
+    scan.add_argument("--min-iv-rank", type=float, default=50.0)
+    scan.add_argument("--width-steps", type=int, default=5, help="strikes between the wings")
 
     halt = subs.add_parser("halt", help="engage the kill switch")
     halt.add_argument("reason", nargs="?", default="halted from the CLI")
@@ -256,6 +266,40 @@ def cmd_probe_options_data(args: argparse.Namespace, broker_factory: Any = Broke
 
     if report.outcome is ProbeOutcome.PROBE_ERROR:
         return EXIT_ERROR
+    return EXIT_OK
+
+
+def cmd_options_scan(args: argparse.Namespace, broker_factory: Any = Broker) -> int:
+    """Run every options step that works without a market-data subscription.
+
+    Places nothing. Exits 0 whether or not a tradeable candidate was found --
+    "IV Rank is 26, no trade" is a successful scan.
+    """
+    from decimal import Decimal
+
+    from .options.scan import run_scan
+
+    config = config_from(args)
+    journal = OrderJournal(config.journal_path)
+    journal.preflight()
+
+    gate = SafetyGate(config, journal)
+    gate.assert_not_halted()
+
+    with broker_factory(config, journal) as broker:
+        report = run_scan(
+            broker,
+            symbol=args.symbol.strip().upper(),
+            target_dte=args.dte,
+            minimum_iv_rank=Decimal(str(args.min_iv_rank)),
+            width_steps=args.width_steps,
+            account=config.account_id,
+        )
+
+    out(report.describe())
+    journal.record(**report.to_record())
+    out("")
+    note("scan complete; no order was transmitted and none can be from this path")
     return EXIT_OK
 
 
@@ -488,6 +532,7 @@ COMMANDS = {
     "resume": cmd_resume,
     "journal": cmd_journal,
     "probe-options-data": cmd_probe_options_data,
+    "options-scan": cmd_options_scan,
 }
 
 

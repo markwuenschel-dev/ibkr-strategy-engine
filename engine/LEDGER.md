@@ -65,6 +65,46 @@ None of these are proven against a live broker — see *Runtime capabilities sti
 | T2 | `engine/README.md` documents an equities-only engine with no status or roadmap section. | Will need updating once options ship. Out of scope until the domain lands. |
 | T3 | `Broker.preview`/`place` docstring at `broker.py:15-16` claims the engine requests type 4 outside hours; no code path ever does. | Stale comment. Fix opportunistically in M3. |
 
+## Live broker results — 2026-07-29, paper DUR318607, pre-market (07:25 ET)
+
+First options data ever taken from IBKR by repository-owned code.
+
+**Verified working, no subscription needed:**
+
+| What | Result |
+|---|---|
+| IV Rank | **26.02** from 251 real bars, 2025-07-29..2026-07-28. Independently reproduces the 28 Jul probe figure to 2 d.p. |
+| Expiry selection | 2026-09-18 chosen, 51 DTE, from 35 expirations (2 in the 35–55 window) |
+| Strike enumeration | 320 listed for that expiry; 25 qualified with real multipliers |
+| `whatIfOrder` on a combo | **initial margin 500.00, maintenance 500.00** on a 5-wide spread — exactly width × multiplier. Defined risk recognised. |
+| DBL_MAX screen | Fired in production: commission came back as the sentinel and normalized to `None` |
+
+**Delayed greeks: available, but not while the market is shut.** Run 1 (07:0x ET)
+returned four greek callbacks per contract and real, monotonic deltas —
+`-0.1899 / -0.1939 / -0.1979 / -0.2020` across the 698/699/700/701 puts. Runs 2
+and 3, minutes later, returned `greek_cbs=0` and no deltas. US options open at
+09:30 ET. **Re-run after the open for the definitive answer** — one positive
+result is enough to prove the capability exists, not enough to depend on.
+
+**The underlying is genuinely blocked.** Error 10089 on SPY stock, and no
+market-data-type callback at all (`reported=NONE`). Options report type 3.
+So the two feeds are entitled differently, exactly as IBKR documents.
+
+**Error codes, corrected from live observation:**
+
+| Code | Text | Note |
+|---|---|---|
+| `10167` | "Requested market data is not subscribed. Displaying delayed market data." | The real code. **Not 10168**, which this ledger and three sessions of notes had wrong. |
+| `10089` | "Requested market data requires additional subscription for API" | On the underlying. |
+| `10091` | "Part of requested market data requires additional subscription for API" | Per option contract — the predicted have-options-not-underlying diagnostic, at 10091 rather than the documented 10090. |
+
+## Confirmed bugs found by running it
+
+| # | What | Fix |
+|---|---|---|
+| C6 | IBKR returns `bid=-1.0 ask=-1.0` for options with no quote, alongside valid greeks. Unscreened, a spread reads as tradeable at a negative mid. Not caught by the NaN or DBL_MAX screens. | `_price()` in `probe.py` screens negatives for prices only; greeks keep their own normalization, since a delta of -1.0 is a legitimate deep-ITM put. |
+| C7 | `Quote.source` printed **"live"** during the scan while holding no price and having received no callback — the fail-open default (`Ticker.marketDataType = 1`) demonstrating itself in production. The M3 fix makes the label honest only where the server answers. | Equity path unchanged; this is why the options path must use `MarketDataProvenance.callback_received`, not the ticker field. |
+
 ## Runtime capabilities still unverified
 
 Everything below is unproven against a live broker and must not be described as working:
