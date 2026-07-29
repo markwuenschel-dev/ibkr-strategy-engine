@@ -74,6 +74,23 @@ class InvalidStrategyError(RefusedError):
     """
 
 
+class MarketDataRefusedError(RefusedError):
+    """Market data was not good enough to make a trading decision on.
+
+    Carries a machine-readable ``reason`` because the caller's response differs
+    by cause: an entitlement problem is a purchase, a stale quote is a retry,
+    and a generation mismatch is a bug in the subscription lifecycle. A human
+    reading the message must not be the only way to tell them apart.
+    """
+
+    def __init__(self, reason: str, message: str, *, hint: str | None = None) -> None:
+        super().__init__(message, hint=hint)
+        self.reason = reason
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return f"[{self.reason}] {super().__str__()}"
+
+
 class ConnectionError_(EngineError):
     """Could not reach TWS / IB Gateway, or the connection was rejected.
 

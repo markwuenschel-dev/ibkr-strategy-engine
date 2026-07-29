@@ -10,13 +10,16 @@ after the last edit; `[inferred]` = derived, chain shown; `[assumed]` = unchecke
 
 ## Confirmed bugs
 
-| # | What | Evidence | Milestone |
+| # | What | Evidence | Status |
 |---|---|---|---|
-| C1 | `Quote.market_data_type` is set from the *requested* constant, never the server's reported value, so the field cannot witness entitlement. | `broker.py:290,323` [verified] | M3 |
-| C2 | `ib_async` never nulls the `-2.0` sentinel for theta/vega — `vega if vega != -2 else vega`, both branches identical. Finite, so the DBL_MAX screen at `broker.py:467-468` does not catch it. | `wrapper.py:1390-1391` [verified] | M4 |
-| C3 | `Ticker.marketDataType` defaults to `1` and is written only by the server callback, so "no callback" is indistinguishable from "live". Fail-open. | `ticker.py:56`, `wrapper.py:889-892` [verified] | M3 |
-| C4 | `Ticker` greeks fields are not reset in `__post_init__` and tickers are reused per contract, so stale greeks survive a subscription or data-type change. | `ticker.py:146-150`, `wrapper.py:406-411` [verified] | M4 |
-| C5 | `modelGreeks is not None` does not imply `delta is not None` — the computation is assigned even when every field sanitizes away. | `wrapper.py:1383-1393` [verified] | M4 |
+| C1 | `Quote.market_data_type` was set from the *requested* constant, never the server's reported value, so the field could not witness entitlement — a quote read "live" because live was asked for. | `broker.py:290,323` [verified] | **Fixed.** Split into `requested_market_data_type` / `reported_market_data_type`; `source` reports the provider's answer and says "unconfirmed" when there was none. `broker.py:83-108, 331-346`. Two regression tests. |
+| C2 | `ib_async` never nulls the `-2.0` sentinel for theta/vega — `vega if vega != -2 else vega`, both branches identical. Finite, so the DBL_MAX screen at `broker.py:467-468` does not catch it. | `wrapper.py:1390-1391` [verified] | **Contained** at our boundary by `normalize_greek`, which also screens DBL_MAX on every field and extends the `-2.0` screen to gamma. Upstream package deliberately not patched. |
+| C3 | `Ticker.marketDataType` defaults to `1` and is written only by the server callback, so "no callback" is indistinguishable from "live". Fail-open. | `ticker.py:56`, `wrapper.py:889-892` [verified] | **Contained.** `MarketDataProvenance` records `callback_received` separately; absent callback classifies `UNKNOWN` and `require_live_quote` refuses it. Mutation-checked. |
+| C4 | `Ticker` greeks fields are not reset in `__post_init__` and tickers are reused per contract, so stale greeks survive a subscription or data-type change. | `ticker.py:146-150`, `wrapper.py:406-411` [verified] | **Contained.** Per-subscription generation UUIDs; `restart()` discards all observations, `current_greeks()` drops any stamped with a superseded generation. |
+| C5 | `modelGreeks is not None` does not imply `delta is not None` — the computation is assigned even when every field sanitizes away. | `wrapper.py:1383-1393` [verified] | **Contained.** `OptionGreeks.has_valid_delta` is the eligibility signal; `require_uniform_live_provenance` refuses `DELTA_INVALID` separately from `GREEKS_MISSING`. |
+
+"Contained" means the defect still exists upstream and our boundary neutralizes it.
+None of these are proven against a live broker — see *Runtime capabilities still unverified*.
 
 ## Suspected bugs
 
