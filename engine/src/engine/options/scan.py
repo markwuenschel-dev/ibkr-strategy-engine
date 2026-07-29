@@ -46,7 +46,12 @@ from .domain import (
     compute_maximum_loss_per_contract,
 )
 from .execution import MarginAssessment, what_if
+from .governor import GovernorVerdict, PortfolioGovernor
 from .ivrank import IVRankMetric, build_iv_rank, observations_from_bars
+from .policy import RiskPolicy
+from .portfolio import PortfolioSnapshot
+from .ports import LiveMarketDataPort, PortfolioStatePort, StrategyQuoteSnapshot
+from .risk import CandidateRiskAssessment, assess_candidate
 
 __all__ = ["SelectionMethod", "ScanReport", "run_scan", "CONFIG_VERSION"]
 
@@ -79,8 +84,13 @@ class ScanReport:
     selection_method: SelectionMethod = SelectionMethod.SHADOW_STRIKE_OFFSET
     candidate: OptionStrategyIntent | None = None
     margin: MarginAssessment | None = None
+    risk: CandidateRiskAssessment | None = None
+    governor: GovernorVerdict | None = None
+    portfolio: PortfolioSnapshot | None = None
+    policy_version: str = ""
     tradeable: bool = False
     blockers: list[str] = field(default_factory=list)
+    refusal_codes: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
     def describe(self) -> str:
@@ -119,9 +129,19 @@ class ScanReport:
         lines.append(self.margin.describe() if self.margin else "  not run")
         lines.append("")
 
+        lines.append(self.risk.describe() if self.risk else "CANDIDATE RISK   not evaluated")
+        lines.append("")
+
+        lines.append(
+            self.governor.describe() if self.governor else "PORTFOLIO GOVERNOR   not evaluated"
+        )
+        lines.append("")
+
         lines.append(f"TRADEABLE        {'YES' if self.tradeable else 'NO'}")
         for blocker in self.blockers:
             lines.append(f"  blocked by      {blocker}")
+        for code in self.refusal_codes:
+            lines.append(f"  refusal code    {code}")
         if self.errors:
             lines.append("")
             lines.append("BROKER MESSAGES")
@@ -150,8 +170,12 @@ class ScanReport:
             if self.candidate
             else None,
             "margin": self.margin.to_record() if self.margin else None,
+            "risk": self.risk.to_record() if self.risk else None,
+            "governor": self.governor.to_record() if self.governor else None,
+            "policy_version": self.policy_version or None,
             "tradeable": self.tradeable,
             "blockers": list(self.blockers),
+            "refusal_codes": list(self.refusal_codes),
             "errors": list(self.errors),
         }
 
@@ -187,6 +211,60 @@ def _shadow_spread(
     return short, long
 
 
+def _portfolio_snapshot(
+    port: PortfolioStatePort | None,
+    decision_time: dt.datetime,
+    report: ScanReport,
+) -> PortfolioSnapshot | None:
+    """Read the book, or record why it could not be read and return ``None``.
+
+    Swallowing the failure into ``None`` is safe *here specifically* because
+    ``None`` is what the governor refuses on. The error text is still recorded,
+    so an adapter that is broken looks different in the report from an adapter
+    that was never supplied -- both refuse, and the operator can tell which.
+    """
+    if port is None:
+        return None
+    try:
+        return port.snapshot(as_of=decision_time)
+    # Deliberately broad. This is an adapter boundary: whatever ib_async raises
+    # -- a timeout, an asyncio error, an attribute that moved between versions --
+    # the correct outcome is a recorded refusal, never a crashed scan. Narrowing
+    # this would turn an unfamiliar broker error into a traceback in place of a
+    # report, and the refusal is identical either way.
+    except Exception as exc:  # noqa: BLE001
+        report.errors.append(f"portfolio snapshot unavailable: {type(exc).__name__}: {exc}")
+        return None
+
+
+def _strategy_quotes(
+    port: LiveMarketDataPort | None,
+    report: ScanReport,
+) -> StrategyQuoteSnapshot | None:
+    """Read live quotes for the built structure, or ``None``.
+
+    Same contract as :func:`_portfolio_snapshot`: ``None`` is refused downstream
+    by the entitlement check, so a failure here cannot become a pass. The
+    candidate's own leg ids are used, so the quotes are for the structure that
+    was actually built rather than for whatever was most recently looked at.
+    """
+    if port is None or report.candidate is None:
+        return None
+    try:
+        return port.strategy_quotes(
+            underlying_symbol=report.candidate.underlying,
+            con_ids=[leg.con_id for leg in report.candidate.legs],
+        )
+    # Deliberately broad. This is an adapter boundary: whatever ib_async raises
+    # -- a timeout, an asyncio error, an attribute that moved between versions --
+    # the correct outcome is a recorded refusal, never a crashed scan. Narrowing
+    # this would turn an unfamiliar broker error into a traceback in place of a
+    # report, and the refusal is identical either way.
+    except Exception as exc:  # noqa: BLE001
+        report.errors.append(f"live quotes unavailable: {type(exc).__name__}: {exc}")
+        return None
+
+
 def run_scan(
     broker: Any,
     *,
@@ -200,9 +278,23 @@ def run_scan(
     width_steps: int = 5,
     credit_fraction: Decimal = Decimal("0.30"),
     account: str = "",
+    policy: RiskPolicy | None = None,
+    market_data: LiveMarketDataPort | None = None,
+    portfolio: PortfolioStatePort | None = None,
 ) -> ScanReport:
-    """Run every step that works without a market-data subscription."""
+    """Run every step that works without a market-data subscription.
+
+    ``policy`` defaults to :class:`~engine.options.policy.RiskPolicy` defaults.
+    ``market_data`` and ``portfolio`` default to ``None``, and ``None`` is a
+    refusal rather than a skip: with no live feed the entitlement check refuses
+    with ``OPTIONS_NO_MARKET_DATA_SNAPSHOT``, and with no portfolio port every
+    governor check refuses with ``GOVERNOR_PORTFOLIO_STATE_UNAVAILABLE``. A scan
+    run with no ports is therefore a complete, correctly-refused scan -- which is
+    exactly what the current entitlement allows and what the operator should see.
+    """
     report = ScanReport(symbol=symbol, started_at=_utcnow(), account=account)
+    active_policy = policy if policy is not None else RiskPolicy()
+    report.policy_version = active_policy.version
     ib = broker.ib
 
     def on_error(req_id: int, code: int, message: str, *_: Any) -> None:
@@ -334,6 +426,38 @@ def run_scan(
         # ---- broker what-if: real margin, nothing transmitted ---------------
         report.margin = what_if(ib, report.candidate, observed_at=_utcnow())
 
+        # ---- portfolio state, for the governor -------------------------------
+        decision_time = _utcnow()
+        report.portfolio = _portfolio_snapshot(portfolio, decision_time, report)
+
+        # ---- candidate risk: the four checks, none skippable ----------------
+        # The entitlement gate lives inside assess_candidate as a required check,
+        # so there is no arrangement of these lines that evaluates a candidate
+        # without asking whether its market data was allowed to inform a decision.
+        report.risk = assess_candidate(
+            report.candidate,
+            policy=active_policy,
+            quotes=_strategy_quotes(market_data, report),
+            margin=report.margin,
+            underlying_price=report.underlying_price,
+            net_liquidation=(
+                report.portfolio.net_liquidation if report.portfolio else None
+            ),
+            evaluated_at=decision_time,
+        )
+
+        # ---- portfolio governor ---------------------------------------------
+        # Runs here, before anything downstream could act on the candidate. When
+        # delta selection lands, this same call moves inside the selection loop so
+        # a refusal ("the technology sector is full") can redirect the search
+        # rather than only veto its result.
+        report.governor = PortfolioGovernor(active_policy).evaluate(
+            report.candidate,
+            snapshot=report.portfolio,
+            margin=report.margin,
+            decision_time=decision_time,
+        )
+
         # ---- eligibility ----------------------------------------------------
         if report.iv_rank is None or not report.iv_rank.meets(minimum_iv_rank):
             actual = (
@@ -342,11 +466,24 @@ def run_scan(
                 else "unavailable"
             )
             report.blockers.append(f"IV Rank {actual} is below the {minimum_iv_rank} entry filter")
-        if report.margin is None or not report.margin.accepted:
-            report.blockers.append("broker what-if did not return usable margin")
 
+        for refusal in report.risk.refusals:
+            report.blockers.append(f"candidate risk: {refusal.detail}")
+        for refusal in report.governor.refusals:
+            report.blockers.append(f"portfolio governor: {refusal.detail}")
+        report.refusal_codes.extend(report.risk.reason_codes)
+        report.refusal_codes.extend(report.governor.reason_codes)
+
+        # Every conjunct is required. `risk.approved` alone already implies live,
+        # current, same-generation data for the underlying and every leg, so a
+        # delayed-data run cannot reach True here by any route -- but the
+        # selection-method term is kept explicit because an offset-selected
+        # structure is not this strategy even when its data is impeccable.
         report.tradeable = (
-            report.selection_method is SelectionMethod.DELTA and not report.blockers
+            report.selection_method is SelectionMethod.DELTA
+            and report.risk.approved
+            and report.governor.approved
+            and not report.blockers
         )
 
     except Exception as exc:  # noqa: BLE001 - a scan reports, it does not crash

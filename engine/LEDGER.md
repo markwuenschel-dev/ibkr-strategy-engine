@@ -1,7 +1,12 @@
 # Options engine — working ledger
 
-Baseline: **116 passed, exit 0** at `b585ddd`, clean tree, recorded 2026-07-29.
+Baseline: **578 passed, exit 0**, recorded 2026-07-29 after M6.
 Branch: `feat/options-domain-model`.
+
+> Superseded: this line read "**116 passed** at `b585ddd`" until M6. That figure
+> predated four commits of options work (`f3dab2a`, `d80896c`, `2393178`,
+> `e2f0322`) and was stale by 180 tests before M6 added any. Re-measured, not
+> adjusted.
 
 Status labels follow the house rule: `[verified]` = read or ran it this session
 after the last edit; `[inferred]` = derived, chain shown; `[assumed]` = unchecked.
@@ -105,12 +110,171 @@ So the two feeds are entitled differently, exactly as IBKR documents.
 | C6 | IBKR returns `bid=-1.0 ask=-1.0` for options with no quote, alongside valid greeks. Unscreened, a spread reads as tradeable at a negative mid. Not caught by the NaN or DBL_MAX screens. | `_price()` in `probe.py` screens negatives for prices only; greeks keep their own normalization, since a delta of -1.0 is a legitimate deep-ITM put. |
 | C7 | `Quote.source` printed **"live"** during the scan while holding no price and having received no callback — the fail-open default (`Ticker.marketDataType = 1`) demonstrating itself in production. The M3 fix makes the label honest only where the server answers. | Equity path unchanged; this is why the options path must use `MarketDataProvenance.callback_received`, not the ticker field. |
 
+## M6 — risk gates and the portfolio governor, 2026-07-29
+
+**New modules** (all under `engine/src/engine/options/`): `policy.py` (validated,
+env-driven thresholds), `portfolio.py` (`PortfolioSnapshot`, `PositionExposure`),
+`ports.py` (five Protocols, no `ib_async`), `risk.py` (four candidate checks),
+`governor.py` (six portfolio checks), `adapters.py` (the only new module that
+imports `ib_async`).
+
+**The entitlement gate now has production callers.** Before M6,
+`require_uniform_live_provenance` and `require_live_quote` were reachable only
+from `test_options_marketdata.py:291` and `:403` — the C3/C5 containment above
+was real at the type level and absent at runtime. `risk.py` calls the gate as one
+of four `REQUIRED_CHECKS`, and `CandidateRiskAssessment.__post_init__` refuses to
+construct without all four, so approval-by-omission is not expressible.
+`MarketDataSubscription` also gained its first production caller
+(`adapters.py::IBKRLiveMarketDataAdapter`).
+
+**`gate_notional` is not used for options.** It multiplies a share price by a
+share count, which for a credit spread has no relationship to what the position
+can lose. The equity path is untouched.
+
+### Live probe re-run — resolves the open M5 question
+
+`engine probe-options-data --symbol SPY`, exit 0, nothing transmitted:
+
+| What | Result |
+|---|---|
+| Outcome | `DELAYED_GREEKS_AVAILABLE` |
+| Option legs | `reported=3` (DELAYED), 17–21 greek callbacks each, real monotonic deltas −0.2085 / −0.2128 / −0.2172 / −0.2216 on the 698/699/700/701 puts, two-sided quotes |
+| Underlying SPY | `reported=NONE`, `greek_cbs=0`, **no prices at all** — error 10089 |
+
+So the M5 question "do delayed greeks populate at all" is **answered yes** — this
+run returned 17–21 callbacks per contract, against 4 in the pre-market run and 0
+in runs 2 and 3. Delayed greeks are usable for development.
+
+**This changes nothing about tradeability, and the gate proves it twice over:**
+the options report type 3, which is `Liveness.DELAYED` → `REALTIME_DATA_REQUIRED`;
+and the underlying never sent a data-type callback at all, which is
+`Liveness.UNKNOWN` → `NO_DATA_TYPE_CALLBACK`. Either alone refuses.
+
+### Live `engine options-scan` with the adapters wired — the end-to-end proof
+
+`cli.py::cmd_options_scan` now constructs `IBKRLiveMarketDataAdapter` and
+`IBKRPortfolioStateAdapter` and passes them in. Against live TWS, exit 0, nothing
+transmitted:
+
+```
+CANDIDATE RISK   REFUSED
+  REFUSE  market_data_entitlement  [MARKET_DATA_TYPE_CALLBACK_MISSING] underlying SPY: the provider never reported a market-data type
+  PASS    defined_loss  (350.00 of 20001.7216)
+  PASS    broker_margin  (500.0 of 20001.7216)
+  REFUSE  stress_loss  [OPTIONS_STRESS_REFERENCE_PRICE_MISSING] no usable underlying reference price (None)
+PORTFOLIO GOVERNOR   APPROVED  (SPY)   net liq 1000086.08, BPR 0, 0 positions
+TRADEABLE        NO
+```
+
+Three things this establishes that no unit test could. `IBKRPortfolioStateAdapter`
+really reads `NetLiquidation` from `accountSummary` — the governor's caps are
+computed against a **real** account figure, not a fixture. The broker-margin check
+passes on a real `whatIfOrder` result. And the entitlement refusal is the true
+one: **the underlying is what fails first**, with `MARKET_DATA_TYPE_CALLBACK_MISSING`
+rather than `REALTIME_DATA_REQUIRED`, because SPY stock is entitled to nothing at
+all and never answers — the C3 fail-open defect refusing correctly in production
+for the first time.
+
+Before this wiring the same command refused with `OPTIONS_NO_MARKET_DATA_SNAPSHOT`
+for every check. Safe, but it proved only that the ports were absent.
+
+### Self-caught in M6
+
+| # | What | Fix |
+|---|---|---|
+| C8 | `policy.py::_seconds` handed a parsed `Decimal` straight to `timedelta`. `NaN` and `Infinity` are valid Decimals, so `IBKR_OPTIONS_QUOTE_MAXIMUM_AGE_SECONDS=NaN` raised `ValueError`/`OverflowError` — escaping the `ConfigError` contract a caller catches to exit 3. | Finiteness guard, plus a second guard on the float conversion: `Decimal("1e400")` **is** finite as a Decimal and only becomes `inf` as a float. The first guard alone did not catch it. |
+| C9 | `portfolio.py`'s module docstring claimed the max(derived, reported) rule stopped unattributed buying power being "invisible to the concentration caps". It does not — only `total_buying_power_reserved` consumes the max; the three concentration checks iterate `positions` alone. | Docstring corrected to state the real boundary. The gap itself is genuine and open — see below. |
+| C10 | The governor reported "the broker did not report what this structure would reserve" even when the broker had explicitly *rejected* the what-if. | `_bpr_unknown_detail()` distinguishes the three causes in prose; the code stays `CANDIDATE_BPR_UNKNOWN`, since the governor's decision is the same either way and `check_broker_margin` already separates them at code level. |
+| C11 | `GovernorVerdict`/`CandidateRiskAssessment` read `.tzinfo` without an isinstance guard, so a string `evaluated_at` raised `AttributeError` rather than the `ValueError` every other invariant raises. | Guarded in both; `underlying` and `policy_version` now validated too. |
+| C12 | **A coverage ratchet that did not ratchet.** `test_options_governor.py`'s "every refusal reason has a test" check matched enum members against *test method names*. An independent verifier refuted it by executing the case: inject a phantom member plus an empty `def test_phantom_member(self): pass`, and the assertion passes. A name proves someone thought about a code; only running a producer proves it is reachable. | Replaced with a `GOVERNOR_PRODUCERS` table mirroring `test_options_risk.py`: set-equality against the enum, plus a parametrized test that executes each producer against the real `PortfolioGovernor` and asserts the emitted code. Re-verified by injection — phantom member **plus** the empty test now yields 2 failures. |
+
+## M7 — execution, exits, and the armed runner, 2026-07-29
+
+**New modules**: `selection.py` (delta strike selection + max-loss sizing),
+`lifecycle.py` (50%-profit close, 21-DTE exit/roll), `positions.py` (event-sourced
+position store), `transmit.py` (the chokepoint), `runner.py` (one strategy pass).
+**New commands**: `engine options-run [--arm]`, `engine options-positions`.
+
+### The safety property inverted, deliberately
+
+Until M7, `engine.options` provably could not transmit — zero `placeOrder` in the
+package, enforced by an AST test. That is gone. What replaces it:
+
+> **Exactly one function transmits, and it cannot be called without a token that
+> only exists if every gate passed.**
+
+`place_combo` takes a `TransmitAuthorization` as a **required, defaultless**
+keyword argument. The token's `__post_init__` refuses any instance not built with
+a module-private sentinel, and only `authorize_open` / `authorize_close` hold it.
+"Forgot to check the gates" is therefore a `TypeError` at the call site, not a
+latent bug. `test_options_transmit.py` pins all of it, including that the single
+`placeOrder` is inside `place_combo` and that a forged key is rejected.
+
+**Closes are authorized differently, on purpose.** `authorize_close` does not
+consult the governor and is exempt from the daily order cap. Refusing to close
+because the book is concentrated is backwards — closing is what reduces
+concentration — and a cap that can stop you exiting is not a safety feature. The
+kill switch still blocks both.
+
+### Live proof, armed
+
+`engine options-run --symbol SPY --market-data-type 3 --min-iv-rank 0 --arm`
+against live TWS, exit 0:
+
+```
+ENTRY   OPEN 1x PUT_CREDIT_SPREAD SPY @ 0.98 CREDIT [max loss 402.00]
+        SELL 1x SPY 2026-09-18 712.0 P | BUY 1x SPY 2026-09-18 707.0 P
+CANDIDATE RISK   REFUSED
+  REFUSE  market_data_entitlement [MARKET_DATA_TYPE_CALLBACK_MISSING]
+  PASS    defined_loss   (402.00 of 20001.7216)
+  PASS    broker_margin  (500.0 of 20001.7216)
+  REFUSE  stress_loss    [OPTIONS_STRESS_REFERENCE_PRICE_MISSING]
+PORTFOLIO GOVERNOR   APPROVED  (all six, net liq 1000086.08)
+TRANSMITTED  0 order(s)      ENTERED  NO
+```
+
+Everything downstream of market data now works on real IBKR data: **strikes were
+delta-selected** (712/707 from delayed greeks), sized against the risk budget,
+priced from the book at 0.98 rather than a fraction of the width, margined by a
+real `whatIfOrder`, and graded by a governor using a real net-liquidation figure.
+The two refusals are both the missing underlying subscription.
+
+`--arm` was passed and **nothing transmitted**, and `positions.jsonl` has zero
+lines — the refusal happened before the record-before-transmit step. That is the
+interlock demonstrated in production rather than only in tests.
+
+### Self-caught in M7
+
+| # | What | Fix |
+|---|---|---|
+| C13 | `runner._manage_one` called `closing_intent_for` with no `limit_price`. Only the profit-target rule computes one, so **every 21-DTE exit would have raised** instead of closing. Caught by the lifecycle lane's interface report before it ever ran. | The DTE exit is priced from the current mark; with no mark it refuses loudly rather than sending an unpriced combo. A market order on a spread nobody can price is how a defensive exit becomes the worst fill of the day. |
+| C14 | `OpenPosition.to_record()` and `from_record()` were not inverses — the reload read an `entry_credit` key only `record_open_submitted` injected. Any other writer's record raised `KeyError` inside the replay, where it was swallowed: **the position silently vanished from the book.** | `to_record` now emits it; a round-trip test pins the inverse property. |
+| C21 | **A defensive exit after a partial fill sold contracts that were never bought.** `_manage_one` called `closing_intent_for` without `quantity=`, so it inherited `OptionStrategyIntent.closing_intent`'s default of the full order size. A position with `quantity=3, filled_quantity=1` produced a closing order for **3** at 21 DTE — a defensive exit opening a naked short. `OpenPosition.manageable_quantity` was written for exactly this and its own docstring warns of exactly this; it simply was not called. Found by a recovery lane, reproduced directly. | `quantity=position.manageable_quantity`. The test that documented the defect now asserts 1 and cross-checks it against both `manageable_quantity` and `quantity`. |
+| C22 | **A reconnect blocked all new entries, permanently.** `_reconcile_orders` differenced the `permId` and `orderId` sets independently, so a broker order matched on its durable `permId` was *also* reported as unknown by its reassigned `orderId`. Since IBKR reassigns `orderId` on reconnect — the precise case `permId` exists to survive — any reconnect produced a phantom disagreement that made `agrees` False forever. | Broker orders are kept as `(order_id, perm_id)` pairs; an entry matched by **either** identifier is known. Unknown ones are reported once, by the durable id, so the count equals the number of orders rather than the number of identifiers. |
+| C16 | **A successful credit fill was recorded as a failure.** `build_combo` submits a net credit as a `BUY` at a *negative* limit, so IBKR reports the fill at a negative average price — and `transmit._decimal_or_none` screened negatives, returning `None`. The runner reads that as "did not fill" and writes `OPEN_FAILED`. Net effect: **a spread live in the market, recorded as never opened** — exactly the unrecorded position the whole store exists to prevent, arriving through the one path nobody thought to check the sign on. Found by *running* the armed path end to end against a fake broker, not by any test. | Renamed to `_fill_price`, negatives allowed, zero still rejected (a zero fill is an unpopulated field, not a price). The runner already took `abs()` when storing the credit; the close path now does too, so the sign convention stays inside the broker boundary. |
+| C15 | **One malformed line made the entire book unreadable.** The replay's `try/except` wrapped only the `OPEN_SUBMITTED` branch; a `CLOSE_FILLED` with a naive timestamp raised straight out of `positions()`. An engine that cannot read its book cannot manage what it already holds — worse than any single lost event. | Every branch guarded. A bad line now costs one transition, is **recorded** in `integrity_errors()`, and makes `ReconciliationReport.agrees` False — which stops the runner opening new risk against a partly-understood book while still allowing exits. Degraded, loud, and still able to get out. |
+
 ## Runtime capabilities still unverified
 
 Everything below is unproven against a live broker and must not be described as working:
 
-- Real-time option quotes and greeks (blocked on subscription).
-- Whether delayed greeks populate at all (M5 probe).
+- Real-time option quotes and greeks (**blocked on subscription — reconfirmed
+  2026-07-29**: options are type 3, the underlying is entitled to nothing).
 - `engine trade --arm` has never transmitted an order, for equity or options.
 - Combo submission, cancel, and replace.
 - Reconciliation against real broker state after a restart.
+- Every adapter in `adapters.py` except the what-if path. `IBKRLiveMarketDataAdapter`
+  and `IBKRPortfolioStateAdapter` are unit-tested against fakes only and have
+  never run against TWS.
+
+## Open gaps this milestone did not close
+
+| # | Gap | Why it is open |
+|---|---|---|
+| ~~G1~~ | ~~Sector and correlation caps count only the candidate.~~ **CLOSED in M7.** `PositionStore.exposures()` supplies per-position attribution, and `runner.run_once` injects it into the snapshot before the governor evaluates, so the three concentration buckets now aggregate the engine's own open structures. Unattributed broker BPR still reaches only the total check — an inherent limit, since a reported total carries no attribution to invent one from. | Closed. |
+| G2 | The stress model is a **terminal** payoff. It bounds what a position can settle for and needs no volatility surface, but says nothing about pre-expiry mark-to-market, so it understates a gamma event with 40 days left. | A pre-expiry model needs a live greeks feed, which is the thing that is blocked. |
+| G3 | `options-scan`'s `report.tradeable` still cannot be `True`, because the **shadow scan** remains offset-selected. That is now a legacy path: `options-run` is the real entry point and does delta-select. | Superseded rather than fixed. `options-scan` is kept as the non-transmitting diagnostic it was built to be. |
+| ~~G4~~ | ~~delta strike selection, max-loss sizing, 50%-profit close, 21-DTE exit/roll~~ **all CLOSED in M7** (`selection.py`, `lifecycle.py`). | Closed. |
+| G5 | **No scheduler.** `run_once` is a single pass with an explicit `now`; nothing calls it repeatedly. Deliberate — a pass that returns a report can be driven by cron, by hand, or by a future loop, and none of those need each other. | Open. The unit of work exists; the driver does not. |
+| G6 | **A roll only closes.** `ManagementAction.ROLL` sends the close half; the follow-on open re-enters through the ordinary entry path on a later pass, so it is gated like any other entry. Nothing yet writes the `ROLLED` link record joining the two. | Open. The link record has a store event (`PositionEvent.ROLLED`) and no writer. |
+| G7 | **Nothing has ever filled.** Every transmit-path test uses a fake. `place_combo` has never sent an order to IBKR, so partial fills, rejections, and the `Trade.isDone()` polling loop are unproven against the real API. | Open, and blocked on the same market-data entitlement — the entitlement gate refuses before the transmit path is reached. |

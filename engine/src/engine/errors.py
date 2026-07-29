@@ -74,6 +74,21 @@ class InvalidStrategyError(RefusedError):
     """
 
 
+class InvalidPortfolioStateError(RefusedError):
+    """A portfolio snapshot is malformed and was not built.
+
+    Distinct from RefusedError for the same reason InvalidStrategyError is: "the
+    book is too concentrated to add this" is a governor decision the caller
+    should log and move past, while "net liquidation came back as a float" is a
+    broken adapter. A loop that catches RefusedError to try the next candidate
+    must not be able to swallow the second one and keep trading against a
+    portfolio view it never successfully read.
+
+    Raised at construction time, so a snapshot that cannot be trusted cannot
+    exist as an object the governor might size against.
+    """
+
+
 class MarketDataRefusedError(RefusedError):
     """Market data was not good enough to make a trading decision on.
 

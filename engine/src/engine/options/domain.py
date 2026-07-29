@@ -582,17 +582,28 @@ class OptionStrategyIntent:
         limit_price: Decimal,
         created_at: datetime,
         configuration_version: str,
-        quantity: int | None = None,
+        quantity: int,
     ) -> OptionStrategyIntent:
         """Build the order that retires this position, from *these* legs.
 
         The legs are inverted copies of the persisted ones, carrying the same
         ``con_id`` values. Nothing is re-derived from current chain data, so a
         close cannot land on a contract the position never held.
+
+        ``quantity`` is **required and has no default.** It used to default to
+        ``self.quantity``, and that default cost a real defect: a position whose
+        opening order only partially filled holds fewer contracts than its intent
+        says, and a caller that omitted the argument closed the *ordered* size.
+        On a one-of-three fill that emits a three-contract close, two of which
+        were never bought -- a defensive exit opening a naked short.
+
+        Restoring the default would restore the bug, because the failure was
+        never a wrong value: it was an omission that silently resolved to a
+        plausible one. The caller must state what it is closing.
         """
         if self.strategy_action is not StrategyAction.OPEN:
             _refuse("only an opening strategy can be closed")
-        closing_quantity = self.quantity if quantity is None else quantity
+        closing_quantity = quantity
         _positive_int(closing_quantity, "quantity")
         if closing_quantity > self.quantity:
             _refuse(

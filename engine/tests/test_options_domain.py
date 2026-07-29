@@ -595,6 +595,7 @@ class TestClosingIntent:
             limit_price=D("0.75"),
             created_at=NOW,
             configuration_version=CONFIG_VERSION,
+            quantity=opened.quantity,
         )
         assert closing.strategy_action is StrategyAction.CLOSE
         assert closing.price_effect is PriceEffect.DEBIT
@@ -617,6 +618,7 @@ class TestClosingIntent:
             limit_price=D("1.00"),
             created_at=NOW,
             configuration_version=CONFIG_VERSION,
+            quantity=opened.quantity,
         )
         assert len(closing.legs) == 4
         assert all(l.is_long for l in closing.legs if l.strike in (D("500"), D("520")))
@@ -651,6 +653,7 @@ class TestClosingIntent:
             limit_price=D("0.75"),
             created_at=NOW,
             configuration_version=CONFIG_VERSION,
+            quantity=opened.quantity,
         )
         with pytest.raises(InvalidStrategyError, match="only an opening strategy"):
             closing.closing_intent(
@@ -658,6 +661,7 @@ class TestClosingIntent:
                 limit_price=D("0.50"),
                 created_at=NOW,
                 configuration_version=CONFIG_VERSION,
+                quantity=closing.quantity,
             )
 
 
