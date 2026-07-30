@@ -59,6 +59,7 @@ from engine.options.positions import (
     PositionEvent,
     PositionState,
     PositionStore,
+    ReconciliationOutcome,
 )
 from engine.options.runner import RunReport, mark_from_snapshot, run_once
 from engine.options.selection import Bias
@@ -1011,6 +1012,282 @@ class TestKillSwitch:
 
         assert ib.placed == []
         assert PositionEvent.CLOSE_SUBMITTED.value not in event_names(store)
+
+
+# ===========================================================================
+# An unanswered reconciliation is doubt, never permission
+# ===========================================================================
+
+
+class SilentBroker:
+    """A broker that cannot answer, in the two ways a real one cannot.
+
+    ``error`` raises out of ``positions()`` -- a dropped socket, a rejected
+    request. ``None`` returns no data at all, which is what a query that failed
+    inside the adapter looks like from here and is emphatically **not** the same
+    as a flat account: a flat account answers with an empty sequence.
+
+    Both are on the same fake because the defect they prove is the same one --
+    the absence of an answer being read as an answer of "you hold nothing".
+    """
+
+    def __init__(
+        self, *, ib: FakeIB | None = None, error: Exception | None = None
+    ) -> None:
+        self.ib = ib if ib is not None else FakeIB()
+        self.error = error
+        self.calls = 0
+
+    def positions(self) -> Any:
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return None
+
+
+def corrupt_the_store(store: PositionStore, strategy_id: Any) -> None:
+    """Append a CLOSE_FILLED whose timestamp is naive, so the replay skips it.
+
+    A skipped transition is the dangerous corruption, not a torn line: the
+    position stays in its last good state, so the book *looks* readable while
+    saying something the log does not. ``integrity_errors`` is what reports it.
+    """
+    line = '{"v": 1, "event": "CLOSE_FILLED", "at": "2026-07-29T14:00:00", '
+    line += f'"strategy_id": "{strategy_id}", "closing_debit": "0.40"}}'
+    with store.path.open("a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+
+
+class TestOnlyAReconciledBookAuthorisesAnEntry:
+    """The four outcomes, and which of them may open risk.
+
+    The defect these close: the entry gate used to ask ``if
+    report.reconciliation is not None and not ...agrees``. When the broker threw,
+    the reconciler left ``reconciliation`` as ``None``, that condition was false,
+    and the pass proceeded to transmit -- so a restart while a spread was held
+    sent the same spread again. Absence of a disagreement was being read as
+    evidence of agreement.
+
+    Every test here asserts ``ib.placed == []``, not merely a blocker. A blocker
+    beside a transmitted order would be the exact bug wearing a warning label.
+    """
+
+    def test_a_broker_that_raises_blocks_the_entry_and_transmits_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        ib = FakeIB()
+        broker = SilentBroker(ib=ib, error=RuntimeError("socket closed"))
+        report = run_pass(broker, gate_for(tmp_path), store_for(tmp_path), armed=True)
+
+        assert broker.calls == 1
+        assert report.reconciliation_outcome is ReconciliationOutcome.UNAVAILABLE
+        assert report.reconciliation is None
+        assert report.entered is False
+        assert ib.placed == []
+        assert "RUNNER_RECONCILIATION_UNAVAILABLE" in report.refusal_codes
+
+    def test_a_broker_that_answers_with_no_data_blocks_the_entry(
+        self, tmp_path: Path
+    ) -> None:
+        """The quieter half of the same defect. ``None`` back from the broker
+        used to reach the reconciler, which read it as an empty account, agreed
+        with an empty store and authorised an entry against a book nobody had
+        actually checked."""
+        ib = FakeIB()
+        broker = SilentBroker(ib=ib)
+        report = run_pass(broker, gate_for(tmp_path), store_for(tmp_path), armed=True)
+
+        assert broker.calls == 1
+        assert report.reconciliation_outcome is ReconciliationOutcome.UNAVAILABLE
+        assert report.entered is False
+        assert ib.placed == []
+        assert "RUNNER_RECONCILIATION_UNAVAILABLE" in report.refusal_codes
+
+    def test_a_broker_that_cannot_report_positions_at_all_blocks_the_entry(
+        self, tmp_path: Path
+    ) -> None:
+        """A missing capability is still an unanswered question."""
+
+        class NoPositionsBroker:
+            def __init__(self) -> None:
+                self.ib = FakeIB()
+
+        broker = NoPositionsBroker()
+        report = run_pass(broker, gate_for(tmp_path), store_for(tmp_path), armed=True)
+
+        assert report.reconciliation_outcome is ReconciliationOutcome.UNAVAILABLE
+        assert report.entered is False
+        assert broker.ib.placed == []
+
+    def test_an_unreplayable_store_blocks_the_entry_even_when_the_broker_answers(
+        self, tmp_path: Path
+    ) -> None:
+        """CORRUPT, not DISAGREEMENT: the broker is fine, the log on disk is not,
+        and the classification has to name the half the operator must go and fix.
+        The position is at 40 DTE so nothing is due -- this isolates the store."""
+        ib = FakeIB()
+        store = store_for(tmp_path)
+        intent = seed_open_position(store, dte=40)
+        corrupt_the_store(store, intent.strategy_id)
+
+        report = run_pass(
+            FakeBroker(ib=ib, positions=(("SPY", 1, 100.0),)),
+            gate_for(tmp_path),
+            store,
+            armed=True,
+        )
+
+        assert store.integrity_errors() != ()
+        assert report.reconciliation_outcome is ReconciliationOutcome.CORRUPT
+        assert report.entered is False
+        assert ib.placed == []
+        assert "RUNNER_RECONCILIATION_CORRUPT" in report.refusal_codes
+
+    def test_an_unreplayable_store_blocks_even_when_the_broker_is_silent_too(
+        self, tmp_path: Path
+    ) -> None:
+        """Both halves broken at once. Under the old gate this was the worst
+        case: the throwing broker erased the reconciliation entirely, so the
+        unreadable book never got a chance to refuse anything."""
+        ib = FakeIB()
+        store = store_for(tmp_path)
+        intent = seed_open_position(store, dte=40)
+        corrupt_the_store(store, intent.strategy_id)
+
+        report = run_pass(
+            SilentBroker(ib=ib, error=RuntimeError("socket closed")),
+            gate_for(tmp_path),
+            store,
+            armed=True,
+        )
+
+        assert report.reconciliation_outcome is ReconciliationOutcome.CORRUPT
+        assert report.entered is False
+        assert ib.placed == []
+
+    def test_a_genuine_disagreement_blocks_the_entry_and_transmits_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        """The store holds a 40 DTE SPY spread the broker does not report. At 40
+        DTE nothing is due, so the only order this pass could send is the entry
+        -- and an empty ``placed`` therefore means the entry, specifically."""
+        ib = FakeIB()
+        store = store_for(tmp_path)
+        seed_open_position(store, dte=40)
+
+        report = run_pass(
+            FakeBroker(ib=ib, positions=()), gate_for(tmp_path), store, armed=True
+        )
+
+        assert report.reconciliation_outcome is ReconciliationOutcome.DISAGREEMENT
+        assert report.entered is False
+        assert ib.placed == []
+        assert "RUNNER_RECONCILIATION_DISAGREEMENT" in report.refusal_codes
+
+    def test_the_control_a_clean_book_still_transmits_an_entry(
+        self, tmp_path: Path
+    ) -> None:
+        """Without this the five refusals above prove nothing: a gate that
+        refuses everything refuses correctly by accident."""
+        ib = FakeIB()
+        report = run_pass(
+            FakeBroker(ib=ib, positions=()),
+            gate_for(tmp_path),
+            store_for(tmp_path),
+            armed=True,
+        )
+
+        assert report.reconciliation_outcome is ReconciliationOutcome.RECONCILED
+        assert report.blockers == [], report.describe()
+        assert report.entered is True
+        assert len(ib.placed) == 1
+
+    def test_the_default_outcome_is_the_refusing_one(self) -> None:
+        """A report that never reached the reconciler has established nothing.
+        Constructed fail-closed so no future early return can leak an entry."""
+        report = RunReport(started_at=NOW, armed=True, symbol="SPY")
+
+        assert report.reconciliation_outcome is ReconciliationOutcome.UNAVAILABLE
+        assert report.reconciliation_outcome.may_open_new_risk is False
+
+    def test_only_reconciled_may_open_new_risk(self) -> None:
+        permitted = [o for o in ReconciliationOutcome if o.may_open_new_risk]
+        assert permitted == [ReconciliationOutcome.RECONCILED]
+
+
+class TestExitsStillRunWhenTheBookIsNotUnderstood:
+    """The asymmetry, held under the new outcomes.
+
+    Closing is what reduces risk, and the reason the book is not understood may
+    be exactly the position that needs closing. A fix that blocked exits along
+    with entries would trap a position, which is a worse failure than the
+    duplicate send it set out to prevent.
+    """
+
+    def test_an_exit_transmits_while_the_broker_is_unreachable(
+        self, tmp_path: Path
+    ) -> None:
+        ib = FakeIB()
+        store = store_for(tmp_path)
+        seed_open_position(store, dte=10)
+
+        report = run_pass(
+            SilentBroker(ib=ib, error=RuntimeError("socket closed")),
+            gate_for(tmp_path),
+            store,
+            armed=True,
+        )
+
+        assert report.reconciliation_outcome is ReconciliationOutcome.UNAVAILABLE
+        assert report.entered is False
+        assert len(ib.placed) == 1
+        assert [t.action for t in report.transmissions] == [StrategyAction.CLOSE]
+
+    def test_an_exit_transmits_while_the_broker_returns_no_data(
+        self, tmp_path: Path
+    ) -> None:
+        ib = FakeIB()
+        store = store_for(tmp_path)
+        seed_open_position(store, dte=10)
+
+        report = run_pass(
+            SilentBroker(ib=ib), gate_for(tmp_path), store, armed=True
+        )
+
+        assert report.reconciliation_outcome is ReconciliationOutcome.UNAVAILABLE
+        assert [t.action for t in report.transmissions] == [StrategyAction.CLOSE]
+
+    def test_an_exit_transmits_while_the_book_disagrees(self, tmp_path: Path) -> None:
+        ib = FakeIB()
+        store = store_for(tmp_path)
+        seed_open_position(store, dte=10)
+
+        report = run_pass(
+            FakeBroker(ib=ib, positions=()), gate_for(tmp_path), store, armed=True
+        )
+
+        assert report.reconciliation_outcome is ReconciliationOutcome.DISAGREEMENT
+        assert [t.action for t in report.transmissions] == [StrategyAction.CLOSE]
+
+    def test_management_still_evaluates_every_position_when_reconciliation_fails(
+        self, tmp_path: Path
+    ) -> None:
+        """Not just the due ones: the whole management pass has to run, or a
+        position would go unevaluated for as long as the broker stayed silent."""
+        ib = FakeIB()
+        store = store_for(tmp_path)
+        seed_open_position(store, dte=40)
+
+        report = run_pass(
+            SilentBroker(ib=ib, error=RuntimeError("socket closed")),
+            gate_for(tmp_path),
+            store,
+            armed=True,
+        )
+
+        assert report.reconciliation_outcome is ReconciliationOutcome.UNAVAILABLE
+        assert len(report.decisions) == 1
+        assert report.decisions[0].action is ManagementAction.HOLD
 
 
 # ===========================================================================

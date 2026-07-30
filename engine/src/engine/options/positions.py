@@ -57,6 +57,7 @@ __all__ = [
     "OpenPosition",
     "PositionStore",
     "ReconciliationReport",
+    "ReconciliationOutcome",
     "SCHEMA_VERSION",
 ]
 
@@ -519,6 +520,51 @@ class ReconciliationReport:
             "orders_absent_at_broker": [str(i) for i in self.orders_absent_at_broker],
             "orders_unknown_to_store": list(self.orders_unknown_to_store),
         }
+
+
+class ReconciliationOutcome(Enum):
+    """Whether the book is understood well enough to open new risk.
+
+    Four states, and **never absent**. The runner used to carry this as a
+    ``ReconciliationReport | None`` and read the ``None`` -- the reconciler could
+    not be run at all -- as silence rather than as doubt. A broker that refused
+    to answer therefore authorised exactly what a broker that answered "you hold
+    nothing" would have, which is how a restart could re-send a spread it was
+    already holding. Naming the outcome removes the state that had no meaning:
+    every path ends on one of these four, and only one of them opens risk.
+    """
+
+    #: The broker answered and its answer matches the replayed store.
+    RECONCILED = "RECONCILED"
+    #: The broker answered and it does not match.
+    DISAGREEMENT = "DISAGREEMENT"
+    #: The broker could not be asked -- exception, disconnect, or no data.
+    UNAVAILABLE = "UNAVAILABLE"
+    #: The store could not be replayed cleanly, so there is nothing to compare.
+    CORRUPT = "CORRUPT"
+
+    @property
+    def may_open_new_risk(self) -> bool:
+        """Only a positive answer authorises an entry; everything else is doubt.
+
+        Deliberately not the inverse of "is there a disagreement". Absence of a
+        disagreement is not the same as evidence of agreement, and conflating
+        the two is the defect this type exists to make unrepresentable.
+        """
+        return self is ReconciliationOutcome.RECONCILED
+
+    @classmethod
+    def for_report(cls, report: ReconciliationReport) -> "ReconciliationOutcome":
+        """Classify a reconciliation the broker actually answered.
+
+        ``replay_errors`` outrank the comparison. A book that could not be
+        replayed cleanly is not a book whose agreement means anything, and
+        calling that CORRUPT rather than DISAGREEMENT points the operator at the
+        store rather than at the broker. Both block entries either way.
+        """
+        if report.replay_errors:
+            return cls.CORRUPT
+        return cls.RECONCILED if report.agrees else cls.DISAGREEMENT
 
 
 class PositionStore:
