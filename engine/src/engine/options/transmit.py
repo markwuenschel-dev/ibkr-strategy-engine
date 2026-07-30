@@ -20,6 +20,19 @@ holding one, the invariants have already been checked. Here, if you are holding 
 symbol was on the allowlist, the daily cap had room, and both the candidate risk
 assessment and the portfolio governor approved *this* strategy id.
 
+**And, for an opening order, an independent reviewer said yes.**
+:func:`authorize_open` takes a :class:`~engine.options.approval.VerifierGate`
+and a :class:`~engine.options.approval.VerificationPacket` as required
+arguments: it proposes the packet to a separate persistent reviewer session
+through collab-kit's handoff lifecycle and refuses unless an APPROVED answer
+comes back bound to this trade intent id and this
+:class:`~engine.options.approval.AuthorizedOrderSpec` digest. Approvals are
+single-use. REFUSED, UNAVAILABLE, missing, expired, mismatched and
+already-spent all block. That gate is *not* cryptographic tamper-proofing --
+see :mod:`engine.options.approval`, which states exactly what it does and does
+not assert -- it is autonomous independent review with exact digest binding and
+fail-closed authorization.
+
 **Closes are authorized differently, and that asymmetry is the point.**
 :func:`authorize_close` deliberately does **not** consult the governor, and is
 exempt from the daily order cap:
@@ -53,7 +66,9 @@ What a cancel still needs, and why:
 
 **A replace is a new send, and is authorized as one.** :func:`authorize_reprice`
 mints an ordinary :class:`TransmitAuthorization`, so the repriced order goes out
-through :func:`place_combo` past the same digest check as any other. It builds
+through :func:`place_combo` past the same digest check as any other -- and, when
+the order being repriced is an OPEN, past a fresh independent review, because
+the protocol's invalidation rule names price. It builds
 the repriced intent *itself* from the structure that was originally approved,
 so the only thing a caller can vary is a single price -- and that price must
 land inside the :class:`~engine.options.proof.PriceEnvelope` the risk gates were
@@ -74,13 +89,22 @@ from uuid import UUID
 
 from ..errors import RefusedError
 from ..safety import SafetyGate
+from .approval import (
+    ApprovalContext,
+    AuthorizedOrderSpec,
+    VerificationPacket,
+    VerifierApproval,
+    VerifierGate,
+    packet_for,
+    spec_for_open,
+)
 from .domain import (
     OptionStrategyIntent,
     PriceEffect,
     StrategyAction,
     compute_maximum_loss_per_contract,
 )
-from .execution import build_combo
+from .execution import COMBO_ORDER_TYPE, COMBO_TIME_IN_FORCE, build_combo
 from .governor import GovernorVerdict
 from .orderstate import BrokerOrderSnapshot, OrderLifecycleState, snapshot_from_trade
 from .proof import PriceEnvelope
@@ -208,6 +232,11 @@ class TransmitAuthorization:
     digest: str = ""
     risk: CandidateRiskAssessment | None = None
     governor: GovernorVerdict | None = None
+    #: The full spec the independent reviewer approved, and the approval itself.
+    #: Required on an OPEN and absent on a close, which is the asymmetry the
+    #: module docstring argues for expressed as a field rather than a comment.
+    spec: AuthorizedOrderSpec | None = None
+    approval: VerifierApproval | None = None
     key: Any = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -252,6 +281,34 @@ class TransmitAuthorization:
                     f"risk assessment is for {self.risk.strategy_id}, not "
                     f"{self.strategy_id}",
                     hint="an approval for one candidate must not authorize another",
+                )
+            # The verifier gate, re-checked here for the same reason as the two
+            # above: so the invariant travels with the object rather than being
+            # trusted from the function that built it. An opening token without
+            # an independent approval bound to its own spec cannot exist.
+            if self.spec is None or self.approval is None:
+                raise RefusedError(
+                    "an opening authorization requires an independent verifier "
+                    "approval and the spec it approved",
+                    hint="see engine.options.approval; opening risk is gated on a "
+                    "reviewer answer, closes and cancels are not",
+                )
+            if self.approval.spec_digest != self.spec.digest:
+                raise RefusedError(
+                    f"the approval binds spec {self.approval.spec_digest[:12]}, but "
+                    f"this authorization carries {self.spec.digest[:12]}"
+                )
+            if self.spec.intent_id != self.strategy_id:
+                raise RefusedError(
+                    f"the approved spec is for intent {self.spec.intent_id}, not "
+                    f"{self.strategy_id}"
+                )
+            if self.spec.structure_digest != self.digest:
+                raise RefusedError(
+                    "the approved spec describes a different structure than this "
+                    "authorization",
+                    hint="quantity, legs, strikes or price moved between the review "
+                    "and the token",
                 )
 
     def describe(self) -> str:
@@ -361,13 +418,32 @@ def authorize_open(
     governor: GovernorVerdict,
     armed: bool,
     now: dt.datetime,
+    verifier: VerifierGate,
+    packet: VerificationPacket,
 ) -> TransmitAuthorization:
-    """Run every gate and mint the token, or raise.
+    """Run every gate, demand an independent APPROVED answer, and mint the token.
+
+    ``verifier`` and ``packet`` have **no defaults**. A caller who has not
+    arranged for an independent review has nothing to pass, and the call does
+    not compile into a working program -- the same move the token itself makes
+    on ``place_combo``. This is what turns "no opening trade without an
+    independent APPROVED artifact" from a sentence in a handoff into a property
+    of the code.
 
     Order matters and mirrors :func:`engine.cli.cmd_trade`: cheapest and most
     absolute first, ``--arm`` checked **last** so an unarmed run still surfaces
     every other refusal rather than stopping at "not armed" and hiding a problem
-    that would have bitten on the next run.
+    that would have bitten on the next run. The verifier sits immediately before
+    the arm gate, so an unarmed pass exercises the whole review path -- it
+    proposes, it reads the answer, it validates the digest -- and then refuses
+    on arming without spending the approval. Consumption is the very last step,
+    after arming, because burning an approval on a dry run would disarm the real
+    run that follows it.
+
+    Raises :class:`engine.options.approval.AwaitingVerification` -- a
+    ``RefusedError`` subclass -- when the request is filed and unanswered. The
+    caller is expected to record ``AWAITING_VERIFICATION`` and carry on with the
+    rest of the pass; nothing here waits.
     """
     if intent.strategy_action is not StrategyAction.OPEN:
         raise RefusedError(
@@ -391,16 +467,44 @@ def authorize_open(
             hint="; ".join(r.detail for r in governor.refusals),
         )
 
+    # The packet is what the reviewer was shown. Deriving the spec here from the
+    # intent, the risk and the governor that are actually in hand -- and
+    # refusing if it differs from the packet's -- is what stops a caller
+    # submitting one order for review and authorizing another. Without it the
+    # packet would be a claim rather than a binding.
+    digest = structure_digest(intent)
+    expected = spec_for_open(
+        intent_id=intent.strategy_id,
+        structure_digest=digest,
+        risk=risk,
+        governor=governor,
+        context=packet.context,
+        order_type=COMBO_ORDER_TYPE,
+        time_in_force=COMBO_TIME_IN_FORCE,
+    )
+    if expected.digest != packet.spec.digest:
+        raise RefusedError(
+            "the packet sent for review does not describe the order being authorized",
+            hint=f"packet {packet.spec.digest[:12]}, order {expected.digest[:12]}; "
+            "quantity, price, legs, account, port, order type, TIF, risk or "
+            "governor result changed after the packet was built",
+        )
+
+    approval = verifier.require(packet, now=now)
+
     gate.gate_armed(armed=armed)
+    verifier.consume(approval, now=now)
 
     return TransmitAuthorization(
         strategy_id=intent.strategy_id,
         action=StrategyAction.OPEN,
         authorized_at=now,
         armed=armed,
-        digest=structure_digest(intent),
+        digest=digest,
         risk=risk,
         governor=governor,
+        spec=expected,
+        approval=approval,
         key=_AUTHORIZATION_KEY,
     )
 
@@ -547,8 +651,23 @@ def authorize_reprice(
     gate: SafetyGate,
     armed: bool,
     now: dt.datetime,
+    verifier: VerifierGate | None = None,
+    context: ApprovalContext | None = None,
 ) -> RepricedOrder:
     """Re-authorize the same structure at a new price, or refuse.
+
+    **A reprice of an opening order is a new opening order, and is verified as
+    one.** The protocol's invalidation rule names price explicitly, so the
+    approval that covered the resting order does not cover its replacement. When
+    ``reference`` is an OPEN, ``verifier`` and ``context`` are required and a
+    fresh review is demanded for the new price -- this function builds the
+    packet itself, from the structure it is already refusing to let vary, so the
+    thing reviewed and the thing sent cannot come apart.
+
+    They stay optional in the signature only because a **closing** reprice needs
+    neither, and forcing an exit path to carry a verifier would be the exact
+    asymmetry violation the module docstring forbids. An opening reprice with
+    ``verifier=None`` raises; it does not quietly proceed.
 
     ``previous`` is the authorization that covered the order now working. It is
     required, and not merely as bookkeeping: it is the proof that the gates ran
@@ -653,16 +772,56 @@ def authorize_reprice(
         )
 
     gate.assert_not_halted()
+
+    spec: AuthorizedOrderSpec | None = None
+    approval: VerifierApproval | None = None
+    repriced_digest = structure_digest(repriced)
+    if repriced.strategy_action is StrategyAction.OPEN:
+        if verifier is None or context is None:
+            raise RefusedError(
+                "repricing an opening order requires an independent verifier gate "
+                "and an approval context",
+                hint="the protocol's invalidation rule names price: the approval "
+                "that covered the resting order does not cover its replacement",
+            )
+        if previous.risk is None or previous.governor is None:  # pragma: no cover
+            raise RefusedError(
+                "an opening authorization without risk and governor verdicts cannot "
+                "be repriced"
+            )
+        repriced_packet = packet_for(
+            repriced,
+            structure_digest=repriced_digest,
+            risk=previous.risk,
+            governor=previous.governor,
+            context=context,
+            order_type=COMBO_ORDER_TYPE,
+            time_in_force=COMBO_TIME_IN_FORCE,
+            now=now,
+            evidence={
+                "reprice_of": str(reference.strategy_id),
+                "previous_price": str(reference.limit_price),
+                "envelope_minimum": str(envelope.minimum),
+                "envelope_maximum": str(envelope.maximum),
+            },
+        )
+        spec = repriced_packet.spec
+        approval = verifier.require(repriced_packet, now=now)
+
     gate.gate_armed(armed=armed)
+    if approval is not None:
+        verifier.consume(approval, now=now)
 
     authorization = TransmitAuthorization(
         strategy_id=repriced.strategy_id,
         action=repriced.strategy_action,
         authorized_at=now,
         armed=armed,
-        digest=structure_digest(repriced),
+        digest=repriced_digest,
         risk=previous.risk,
         governor=previous.governor,
+        spec=spec,
+        approval=approval,
         key=_AUTHORIZATION_KEY,
     )
     return RepricedOrder(
@@ -725,6 +884,32 @@ def place_combo(
     bag, order = build_combo(intent)
     if account:
         order.account = account
+
+    # The spec check, against the order object itself rather than against the
+    # intent it came from. The digest above proves the *structure* is the one
+    # that was approved; this proves the four things the structure digest cannot
+    # see -- which account it is going to, on which port, as what order type,
+    # with what time in force. All four move the risk and none of them appear in
+    # the legs, so an approval that did not bind them would survive the same
+    # spread being sent to a different account as a GTC market order.
+    if authorization.spec is not None:
+        approved = authorization.spec
+        sending_account = getattr(order, "account", "") or account or approved.account
+        sending_type = str(getattr(order, "orderType", "") or COMBO_ORDER_TYPE)
+        sending_tif = str(getattr(order, "tif", "") or "")
+        drift = []
+        if sending_account != approved.account:
+            drift.append(f"account {sending_account!r} != approved {approved.account!r}")
+        if sending_type != approved.order_type:
+            drift.append(f"order type {sending_type!r} != approved {approved.order_type!r}")
+        if sending_tif != approved.time_in_force:
+            drift.append(f"TIF {sending_tif!r} != approved {approved.time_in_force!r}")
+        if drift:
+            raise RefusedError(
+                "the order about to be sent is not the order that was approved",
+                hint="; ".join(drift),
+            )
+
     # Set explicitly rather than relying on ib_async's default. This is the one
     # file permitted to arm an order, and an armed order should say so in the
     # code that arms it rather than inheriting it from a library default that

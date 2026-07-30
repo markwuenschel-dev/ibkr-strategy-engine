@@ -115,6 +115,7 @@ from ..safety import SafetyGate
 from .domain import OptionStrategyIntent
 from .orderstate import OrderLifecycleState
 from .proof import PriceEnvelope, envelope_for
+from .approval import ApprovalContext, VerifierGate
 from .transmit import (
     RepricedOrder,
     TransmitAuthorization,
@@ -389,6 +390,8 @@ def work_order(
     account: str = "",
     sink: Any = None,
     closing: bool = False,
+    verifier: VerifierGate | None = None,
+    approval_context: ApprovalContext | None = None,
 ) -> RepriceOutcome:
     """Work a transmitted order that is still alive, then stop -- flat or filled.
 
@@ -540,6 +543,13 @@ def work_order(
                 gate=gate,
                 armed=armed,
                 now=clock(),
+                # Passed straight through. A reprice of an OPEN needs its own
+                # review -- the invalidation rule names price -- and
+                # ``authorize_reprice`` refuses an opening reprice with no
+                # verifier rather than proceeding on the previous approval. A
+                # *closing* reprice needs neither and gets neither.
+                verifier=verifier,
+                context=approval_context,
             )
         except RefusedError as exc:
             return done(

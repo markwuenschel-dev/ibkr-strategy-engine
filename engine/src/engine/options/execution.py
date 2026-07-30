@@ -35,6 +35,8 @@ from typing import Any
 from .domain import OptionStrategyIntent, OrderAction, PriceEffect
 
 __all__ = [
+    "COMBO_ORDER_TYPE",
+    "COMBO_TIME_IN_FORCE",
     "MarginAssessment",
     "IB_UNSET",
     "build_combo",
@@ -42,6 +44,15 @@ __all__ = [
 ]
 
 IB_UNSET = 1.7976931348623157e308
+
+#: What :func:`build_combo` produces, named so the two facts can be *bound*
+#: rather than assumed. An approval that did not cover the order type and the
+#: time in force would survive the same legs at the same price being sent as a
+#: market order, or good-till-cancelled -- two orders with the same structure
+#: digest and very different risk. ``place_combo`` compares the order it is
+#: about to send against these, so the names are load-bearing and not decoration.
+COMBO_ORDER_TYPE = "LMT"
+COMBO_TIME_IN_FORCE = "DAY"
 
 _ORDER_STATE_FIELDS = (
     "initMarginChange",
@@ -157,7 +168,7 @@ def build_combo(intent: OptionStrategyIntent) -> tuple[Any, Any]:
     order = LimitOrder(OrderAction.BUY.value, intent.quantity, float(signed))
     # Without this, TWS fills the TIF from a preset and error 10349 ends the
     # request, so whatIfOrder returns [] rather than an OrderState.
-    order.tif = "DAY"
+    order.tif = COMBO_TIME_IN_FORCE
     order.orderRef = str(intent.strategy_id)
 
     return bag, order

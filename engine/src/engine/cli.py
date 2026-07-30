@@ -522,6 +522,7 @@ def cmd_options_run(args: argparse.Namespace, broker_factory: Any = Broker) -> i
     if not args.arm:
         note("DRY RUN -- every gate will run and nothing will be transmitted.")
 
+    _verifier, _context = _verifier_for(config, policy)
     with broker_factory(config, journal) as broker:
         report = run_once(
             broker,
@@ -539,6 +540,8 @@ def cmd_options_run(args: argparse.Namespace, broker_factory: Any = Broker) -> i
             target_dte=args.dte,
             minimum_iv_rank=Decimal(str(args.min_iv_rank)),
             account=config.account_id,
+            verifier=_verifier,
+            approval_context=_context,
         )
 
     out(report.describe())
@@ -547,6 +550,26 @@ def cmd_options_run(args: argparse.Namespace, broker_factory: Any = Broker) -> i
     if not args.arm:
         note("dry run complete; nothing was transmitted. Pass --arm to trade.")
     return EXIT_OK
+
+
+
+def _verifier_for(config: EngineConfig, policy: Any) -> tuple[Any, Any]:
+    """The independent-verifier gate and the context an approval binds to.
+
+    Returns ``(None, None)`` when no collab can be found. That is deliberately
+    not an error here: reconciliation, management and exits all run fine without
+    a reviewer, and only the *entry* needs one -- so the runner refuses the entry
+    with a named code rather than this command refusing to start and leaving an
+    open position unmanaged. Trapping a position to enforce a gate on new risk
+    would invert the whole asymmetry this engine is built around.
+    """
+    from .options.approval import ApprovalContext, CollabVerifierGate, default_collab_root
+
+    root = default_collab_root(config.project)
+    if root is None:
+        return None, None
+    gate = CollabVerifierGate(root=root, ledger=config.state_dir / "verification")
+    return gate, ApprovalContext.for_run(config=config, policy=policy, account=config.account_id)
 
 
 def cmd_options_cancel(args: argparse.Namespace, broker_factory: Any = Broker) -> int:
@@ -745,6 +768,7 @@ def cmd_options_verify_execution(
     out(f"  armed          {'YES -- one order may be transmitted' if args.arm else 'NO'}")
     out("")
 
+    _verifier, _context = _verifier_for(config, policy)
     with broker_factory(config, journal) as broker:
         report = run_once(
             broker,
@@ -762,6 +786,8 @@ def cmd_options_verify_execution(
             target_dte=args.dte,
             minimum_iv_rank=Decimal(str(args.min_iv_rank)),
             account=config.account_id,
+            verifier=_verifier,
+            approval_context=_context,
         )
 
     out(report.describe())
@@ -877,6 +903,7 @@ def cmd_options_execution_proof(
     preflight = ProofEntryPreflight(profile=profile, budget=budget, emit=out)
     capture = RecordingLifecycleSink(inner=LifecycleRecorder(store))
 
+    _verifier, _context = _verifier_for(config, policy)
     with broker_factory(config, journal) as broker:
         report = run_once(
             broker,
@@ -901,6 +928,8 @@ def cmd_options_execution_proof(
             ),
             entry_preflight=preflight,
             sink=capture,
+            verifier=_verifier,
+            approval_context=_context,
         )
 
         # Restart reconciliation, in the same connection but through a *fresh*

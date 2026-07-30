@@ -65,6 +65,7 @@ from engine.options.proof import (
 from engine.options.runner import run_once
 from engine.options.selection import Bias
 
+from reviewer import reviewed  # noqa: E402 - sibling test module, see docstring
 from test_options_runner import (  # noqa: E402 - sibling test module, see docstring
     NOW,
     SPOT,
@@ -209,6 +210,11 @@ def run_proof(
     budget = OpeningOrderBudget(limit=profile.maximum_opening_orders)
     preflight = ProofEntryPreflight(profile=profile, budget=budget)
     capture = RecordingLifecycleSink(inner=LifecycleRecorder(store))
+    # The proof opens risk, so it needs a reviewer like any other entry. The
+    # gate is the shipped one over a temp collab; only the reviewer's latency is
+    # collapsed, so an unreviewed pass here refuses for the reason the test is
+    # about rather than for the missing seat.
+    verifier, context = reviewed(tmp_path)
 
     report = run_once(
         broker,
@@ -228,6 +234,8 @@ def run_proof(
         enforce_iv_rank=False,
         entry_preflight=preflight,
         sink=capture,
+        verifier=verifier,
+        approval_context=context,
     )
     return report, preflight, capture, broker
 
@@ -281,6 +289,34 @@ def _patch_adapters(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         adapters, "IBKRPortfolioStateAdapter", lambda _broker: FakePortfolioPort()
     )
+
+
+def _review_in_line(monkeypatch: pytest.MonkeyPatch, home: Path) -> None:
+    """Give the command a reviewer, in a collab of its own.
+
+    Two things are needed. ``IBKR_COLLAB_ROOT`` is the first: the command finds
+    its collab through :func:`default_collab_root`, and without the override a
+    proof run would file its review requests into the operator's real
+    correspondence. The second is somebody to answer them -- the command builds
+    a plain gate, and an unanswered request is ``AWAITING_VERIFICATION``, so the
+    proof would print no lifecycle at all and every assertion below would fail
+    for a reason none of these tests are about.
+
+    The swap is of *timing*, not of the gate: :class:`ReviewedGate` is the
+    shipped ``CollabVerifierGate`` with the reviewer's turn taken immediately
+    before the builder looks, so the whole exchange -- request, claim, answer,
+    completion, match -- is still the real one.
+    """
+    from engine.options import approval
+
+    from reviewer import ReviewedGate, ScriptedReviewer, collab_at
+
+    monkeypatch.setenv(approval.ENV_COLLAB_ROOT, str(collab_at(home)))
+
+    def _gate(**kwargs: Any) -> ReviewedGate:
+        return ReviewedGate(**kwargs, reviewer=ScriptedReviewer(root=kwargs["root"]))
+
+    monkeypatch.setattr(approval, "CollabVerifierGate", _gate)
 
 
 def _proof_args(state_dir: Path, *, execution_proof: bool = True, arm: bool = True) -> Any:
@@ -1063,6 +1099,7 @@ class TestTheExecutionProofCommand:
         from engine.errors import EXIT_OK
 
         _patch_adapters(monkeypatch)
+        _review_in_line(monkeypatch, state_dir.parent)
         code = cli.cmd_options_execution_proof(
             _proof_args(state_dir), broker_factory=_ContextBroker
         )
@@ -1095,6 +1132,7 @@ class TestTheExecutionProofCommand:
         from engine import cli
 
         _patch_adapters(monkeypatch)
+        _review_in_line(monkeypatch, state_dir.parent)
         cli.cmd_options_execution_proof(
             _proof_args(state_dir), broker_factory=_ContextBroker
         )
@@ -1108,6 +1146,7 @@ class TestTheExecutionProofCommand:
         from engine import cli
 
         _patch_adapters(monkeypatch)
+        _review_in_line(monkeypatch, state_dir.parent)
         cli.cmd_options_execution_proof(
             _proof_args(state_dir, arm=False), broker_factory=_ContextBroker
         )
@@ -1125,6 +1164,7 @@ class TestTheExecutionProofCommand:
         from engine import cli
 
         _patch_adapters(monkeypatch)
+        _review_in_line(monkeypatch, state_dir.parent)
         cli.cmd_options_execution_proof(
             _proof_args(state_dir), broker_factory=_ContextBroker
         )

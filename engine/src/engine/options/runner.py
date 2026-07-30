@@ -89,7 +89,21 @@ from .selection import (
     select_vertical,
     target_delta_for,
 )
-from .transmit import TransmitResult, authorize_close, authorize_open, place_combo
+from .approval import (
+    ApprovalContext,
+    AwaitingVerification,
+    VerificationState,
+    VerifierGate,
+    packet_for,
+)
+from .execution import COMBO_ORDER_TYPE, COMBO_TIME_IN_FORCE
+from .transmit import (
+    TransmitResult,
+    authorize_close,
+    authorize_open,
+    place_combo,
+    structure_digest,
+)
 
 __all__ = [
     "RunReport",
@@ -154,6 +168,13 @@ class RunReport:
     #: Absent on every pass where the order resolved on its own.
     reprice: RepriceOutcome | None = None
     entered: bool = False
+    #: Where the proposed entry stands with the independent reviewer. Defaults
+    #: to PROPOSED rather than to anything permissive, and is only ever moved to
+    #: CONSUMED by an authorization that actually passed the gate.
+    verification: VerificationState = VerificationState.PROPOSED
+    #: The collab-kit handoff id the reviewer was asked on, when there is one.
+    #: Carried so an operator can find the request without grepping the tree.
+    verification_request: str = ""
     blockers: list[str] = field(default_factory=list)
     refusal_codes: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
@@ -830,6 +851,76 @@ def _build_candidate(
     return intent, snapshot
 
 
+def _entry_evidence(
+    report: "RunReport", *, margin: Any, snapshot: Any
+) -> dict[str, Any]:
+    """The section 3.1 evidence the reviewer needs and the digest cannot bind.
+
+    Every field is pulled from what this pass actually observed rather than
+    recomputed, so a reviewer recomputing from it is checking the engine's work
+    instead of repeating it. Anything genuinely unavailable is left out entirely
+    -- :meth:`VerificationPacket.render` renders an absent field as ``MISSING``,
+    which is legible to the reviewer as grounds for UNAVAILABLE. Substituting a
+    plausible default here would be the engine answering a question that was
+    asked of the reviewer.
+    """
+
+    def observed(source: Any, check: str) -> str | None:
+        if source is None:
+            return None
+        try:
+            result = source.result_for(check)
+        except (KeyError, AttributeError, ValueError):
+            return None
+        return None if result.observed is None else str(result.observed)
+
+    evidence: dict[str, Any] = {
+        "iv_rank": (
+            str(report.iv_rank.iv_rank)
+            if report.iv_rank is not None and report.iv_rank.iv_rank is not None
+            else None
+        ),
+        "iv_rank_filter": (
+            "BYPASSED"
+            if "OPTIONS_IV_RANK_FILTER_BYPASSED" in report.refusal_codes
+            else "ENFORCED"
+        ),
+        "defined_max_loss": observed(report.risk, "defined_loss"),
+        "stress_loss": observed(report.risk, "stress_loss"),
+        "broker_what_if_margin": (
+            str(margin.initial_margin_change)
+            if margin is not None and margin.initial_margin_change is not None
+            else None
+        ),
+        "portfolio_exposure_before": (
+            str(snapshot_total(report.portfolio)) if report.portfolio else None
+        ),
+        "pending_reservations": (
+            str(report.portfolio.reported_buying_power_reserved)
+            if report.portfolio is not None
+            and report.portfolio.reported_buying_power_reserved is not None
+            else None
+        ),
+        "sector_impact": observed(report.governor, "sector_concentration"),
+        "correlation_impact": observed(report.governor, "correlation_concentration"),
+    }
+    if snapshot is not None:
+        under = getattr(snapshot, "underlying", None)
+        evidence["market_data_provenance"] = (
+            getattr(getattr(under, "liveness", None), "value", None) if under else None
+        )
+        evidence["quote_timestamps"] = (
+            getattr(under, "observed_at", None).isoformat()
+            if under is not None and getattr(under, "observed_at", None) is not None
+            else None
+        )
+    return {name: value for name, value in evidence.items() if value is not None}
+
+
+def snapshot_total(snapshot: Any) -> Any:
+    return getattr(snapshot, "total_buying_power_reserved", None)
+
+
 def run_once(
     broker: Any,
     *,
@@ -856,6 +947,8 @@ def run_once(
     entry_preflight: EntryPreflight | None = None,
     sink: Any = None,
     reprice: RepriceLadder | None = DEFAULT_LADDER,
+    verifier: VerifierGate | None = None,
+    approval_context: ApprovalContext | None = None,
 ) -> RunReport:
     """Reconcile, manage every open position, then consider one new entry.
 
@@ -1056,7 +1149,31 @@ def run_once(
                 report.refusal_codes.append("OPTIONS_ENTRY_PREFLIGHT_REFUSED")
                 return report
 
-        # -- 4. authorize and transmit -------------------------------------
+        # -- 4. propose to the reviewer, authorize, transmit ----------------
+        # The verifier is required for an entry and optional for the pass: a
+        # run that only reconciles and manages must not need a reviewer, and a
+        # run that wants to *open* must not proceed without one. Fail-closed, so
+        # the missing-verifier case blocks rather than defaults to permitted.
+        if verifier is None or approval_context is None:
+            report.blockers.append(
+                "entry refused: no independent verifier gate is configured for this "
+                "pass, so no opening trade can be authorized"
+            )
+            report.refusal_codes.append("OPTIONS_VERIFIER_NOT_CONFIGURED")
+            return report
+
+        packet = packet_for(
+            candidate,
+            structure_digest=structure_digest(candidate),
+            risk=report.risk,
+            governor=report.governor,
+            context=approval_context,
+            order_type=COMBO_ORDER_TYPE,
+            time_in_force=COMBO_TIME_IN_FORCE,
+            now=now,
+            evidence=_entry_evidence(report, margin=margin, snapshot=snapshot),
+        )
+
         try:
             authorization = authorize_open(
                 candidate,
@@ -1065,10 +1182,24 @@ def run_once(
                 governor=report.governor,
                 armed=armed,
                 now=now,
+                verifier=verifier,
+                packet=packet,
             )
+        except AwaitingVerification as exc:
+            # Not a refusal of the candidate -- a statement that the answer has
+            # not arrived. Recorded and returned, never waited on: everything
+            # else this pass did (reconciliation, management, exits) already
+            # happened above, and the next pass picks the answer up.
+            report.verification = VerificationState.AWAITING_VERIFICATION
+            report.verification_request = exc.request_id
+            report.blockers.append(f"entry awaiting verification: {exc.message}")
+            report.refusal_codes.append("OPTIONS_AWAITING_VERIFICATION")
+            return report
         except RefusedError as exc:
+            report.verification = VerificationState.REFUSED
             report.blockers.append(f"entry refused: {exc.message}")
             return report
+        report.verification = VerificationState.CONSUMED
 
         bpr = (
             margin.initial_margin_change
@@ -1109,6 +1240,12 @@ def run_once(
                 authorization=authorization,
                 gate=gate,
                 armed=armed,
+                # The ladder reprices an OPEN, and a reprice is a new opening
+                # order under the invalidation rule. It gets the same verifier
+                # the entry did, so every rung is reviewed rather than riding on
+                # the approval that covered the first price.
+                verifier=verifier,
+                approval_context=approval_context,
                 # Both ends of the deadline come from the same clock. ``now``
                 # is the pass's *logical* time and may be injected -- measuring
                 # a two-minute wall-clock deadline from it made the ladder

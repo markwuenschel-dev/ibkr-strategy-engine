@@ -95,7 +95,9 @@ from .portfolio import PortfolioSnapshot, PositionExposure
 from .pricing import PriceLadder, build_ladder, midpoint_credit, tick_regime_for
 from .proof import PriceEnvelope, envelope_for, vertical_width
 from .risk import CandidateRiskAssessment, assess_candidate
-from .transmit import authorize_open, place_combo
+from .approval import ApprovalContext, VerifierGate, packet_for
+from .execution import COMBO_ORDER_TYPE, COMBO_TIME_IN_FORCE
+from .transmit import authorize_open, place_combo, structure_digest
 
 __all__ = [
     "OrderCancellationPort",
@@ -640,6 +642,12 @@ class PriceWalk:
     emit: Callable[[str], None] | None = None
     on_fill: Callable[[UUID, Decimal, BrokerOrderSnapshot], None] | None = None
     on_release: Callable[[UUID, Decimal], None] | None = None
+    #: The independent reviewer, and the facts an approval binds beyond the
+    #: order. Optional on the dataclass and *required* at the rung: every rung
+    #: is a different price, so every rung is a different order under the
+    #: invalidation rule, and a walk with no verifier authorizes nothing.
+    verifier: VerifierGate | None = None
+    approval_context: ApprovalContext | None = None
 
     # -- small helpers ----------------------------------------------------
 
@@ -999,13 +1007,39 @@ class PriceWalk:
 
             # -- 8. authorize the NEW intent and send ---------------------
             try:
+                if self.verifier is None or self.approval_context is None:
+                    raise RefusedError(
+                        "a price walk opens risk at every rung and has no "
+                        "independent verifier configured",
+                        hint="each rung is a new price, so each rung is a new "
+                        "order that needs its own review",
+                    )
+                rung_now = self._now()
                 authorization = authorize_open(
                     candidate,
                     gate=self.gate,
                     risk=verdict.risk,
                     governor=verdict.governor,
                     armed=armed,
-                    now=self._now(),
+                    now=rung_now,
+                    verifier=self.verifier,
+                    packet=packet_for(
+                        candidate,
+                        structure_digest=structure_digest(candidate),
+                        risk=verdict.risk,
+                        governor=verdict.governor,
+                        context=self.approval_context,
+                        order_type=COMBO_ORDER_TYPE,
+                        time_in_force=COMBO_TIME_IN_FORCE,
+                        now=rung_now,
+                        evidence={
+                            "rung": rung,
+                            "credit": str(credit),
+                            "remaining_quantity": remaining,
+                            "envelope_minimum": str(envelope.minimum),
+                            "envelope_maximum": str(envelope.maximum),
+                        },
+                    ),
                 )
             except EngineError as exc:
                 # Includes HaltedError. A kill switch thrown mid-walk ends the
