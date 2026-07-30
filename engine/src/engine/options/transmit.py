@@ -38,6 +38,8 @@ said "stop", and the engine obeying literally is the whole value of the file.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import json
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
@@ -67,6 +69,50 @@ __all__ = [
 _AUTHORIZATION_KEY = object()
 
 
+def structure_digest(intent: OptionStrategyIntent) -> str:
+    """A fingerprint of everything about an order that determines its risk.
+
+    The strategy id names *which* candidate was approved; this names *what was
+    approved about it*. Those are different questions, and binding only the
+    first is what let an approval for a 1-lot authorize a 50-lot: two intents
+    sharing an id are indistinguishable to an id check, however carefully it is
+    written.
+
+    Every field that moves the maximum loss is in here -- quantity, each leg's
+    contract, side and ratio, the limit price and its direction. Deliberately
+    *not* included: ``created_at`` and anything advisory, so that re-deriving
+    the digest from the same structure is stable.
+    """
+    legs = sorted(
+        (
+            leg.con_id,
+            leg.action.value,
+            leg.ratio,
+            leg.multiplier,
+            str(leg.strike),
+            leg.right.value,
+        )
+        for leg in intent.legs
+    )
+    payload = json.dumps(
+        {
+            "strategy_id": str(intent.strategy_id),
+            "action": intent.strategy_action.value,
+            "type": intent.strategy_type.value,
+            "underlying": intent.underlying.strip().upper(),
+            "quantity": intent.quantity,
+            "expiration": intent.expiration.isoformat(),
+            "limit_price": str(intent.limit_price),
+            "price_effect": intent.price_effect.value,
+            "maximum_loss_per_contract": str(intent.maximum_loss_per_contract),
+            "legs": legs,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True)
 class TransmitAuthorization:
     """Proof that every gate passed for one specific strategy.
@@ -75,12 +121,17 @@ class TransmitAuthorization:
     against a private sentinel, so neither a caller nor a test can mint one by
     passing a plausible-looking value -- and a test that *needs* one has to go
     through the real gates, which is the point.
+
+    ``digest`` pins the structure itself. Without it the token proves only that
+    *something* under this strategy id was approved, and ``place_combo``'s id
+    check cannot tell a 1-lot from a 50-lot carrying the same id.
     """
 
     strategy_id: UUID
     action: StrategyAction
     authorized_at: dt.datetime
     armed: bool
+    digest: str = ""
     risk: CandidateRiskAssessment | None = None
     governor: GovernorVerdict | None = None
     key: Any = field(default=None, repr=False)
@@ -96,6 +147,12 @@ class TransmitAuthorization:
             raise RefusedError("authorization must name a strategy id")
         if self.armed is not True:
             raise RefusedError("an authorization may only exist for an armed run")
+        if not isinstance(self.digest, str) or len(self.digest) != 64:
+            raise RefusedError(
+                "an authorization must carry a structure digest",
+                hint="mint it with authorize_open()/authorize_close(), which "
+                "compute the digest from the intent they approved",
+            )
         if self.authorized_at.tzinfo is None:
             raise RefusedError("authorized_at must be timezone-aware")
 
@@ -259,6 +316,7 @@ def authorize_open(
         action=StrategyAction.OPEN,
         authorized_at=now,
         armed=armed,
+        digest=structure_digest(intent),
         risk=risk,
         governor=governor,
         key=_AUTHORIZATION_KEY,
@@ -297,6 +355,7 @@ def authorize_close(
         action=intent.strategy_action,
         authorized_at=now,
         armed=armed,
+        digest=structure_digest(intent),
         key=_AUTHORIZATION_KEY,
     )
 
@@ -337,6 +396,17 @@ def place_combo(
         raise RefusedError(
             f"authorization is for {authorization.action.value}, but the order is "
             f"{intent.strategy_action.value}"
+        )
+    # The check the two above only looked like. An id and an action are shared
+    # by every variant of a structure, so on their own they authorize a 50-lot
+    # against an approval for a 1-lot -- demonstrated, not theorised. This
+    # compares what was actually approved against what is about to be sent.
+    sending = structure_digest(intent)
+    if authorization.digest != sending:
+        raise RefusedError(
+            "the order does not match the structure that was authorized",
+            hint="quantity, legs, strikes, limit price or maximum loss changed "
+            "after approval; re-run the gates on the order you intend to send",
         )
 
     bag, order = build_combo(intent)

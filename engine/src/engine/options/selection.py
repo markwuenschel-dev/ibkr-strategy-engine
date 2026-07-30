@@ -558,6 +558,22 @@ def select_vertical(
             f"target_width must be positive, got {target_width}",
             hint="a width of zero puts the protection on the short strike itself",
         )
+    # Validated on exactly the same terms as target_width. An unvalidated bound
+    # is worse than no bound: ``Decimal("Infinity")`` is a perfectly ordinary
+    # Decimal that silently disables the check while reading as a limit, and
+    # ``NaN`` turns the comparison into an uncaught InvalidOperation deep in the
+    # selector rather than a refusal here.
+    if maximum_width is not None:
+        if not isinstance(maximum_width, Decimal) or not maximum_width.is_finite():
+            _refuse(
+                f"maximum_width must be a finite Decimal, got {maximum_width!r}",
+                hint="an infinite or NaN bound disables the check it claims to be",
+            )
+        if maximum_width < target_width:
+            _refuse(
+                f"maximum_width {maximum_width} is below target_width "
+                f"{target_width}, so no structure can satisfy both",
+            )
 
     short = select_short_strike(
         candidates, target_delta=target_delta, right=right

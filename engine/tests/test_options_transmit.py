@@ -17,6 +17,7 @@ that compiles.
 from __future__ import annotations
 
 import ast
+from dataclasses import replace
 import datetime as dt
 from decimal import Decimal
 from pathlib import Path
@@ -56,6 +57,7 @@ from engine.options.transmit import (
     authorize_close,
     authorize_open,
     place_combo,
+    structure_digest,
 )
 from engine.safety import SafetyGate
 
@@ -607,3 +609,104 @@ class TestUnarmedCannotReachTheBroker:
             )
             place_combo(ib, intent, authorization=auth)
         assert ib.placed == []
+
+
+class TestTheAuthorizationBindsTheStructureNotJustTheId:
+    """A genuine token must not authorize a *different* order under the same id.
+
+    Found by an adversarial lane on 2026-07-30, which executed it rather than
+    argued it: mint a real authorization for a 1-lot 5-wide spread, then hand
+    ``place_combo`` a 50-lot 100-wide spread carrying the same ``strategy_id``.
+    Both identity checks pass -- the id matches and the action matches -- and a
+    $350 approval transmitted a $492,500 order.
+
+    The docstring on ``place_combo`` claimed the id check prevented exactly this
+    ("an approval for a 1-lot could transmit a 10-lot"). It did not. Nothing in
+    the token described the structure, so nothing could contradict a substitute.
+    """
+
+    def _substitute(self, approved: OptionStrategyIntent) -> OptionStrategyIntent:
+        """The same strategy id and action, a materially larger order."""
+        legs = (
+            replace(approved.legs[0], strike=D("500")),
+            replace(approved.legs[1], strike=D("400"), con_id=1003),
+        )
+        return replace(
+            approved,
+            quantity=50,
+            legs=legs,
+            maximum_loss_per_contract=(D("100") - approved.limit_price) * 100,
+        )
+
+    def test_a_substituted_larger_order_is_refused(self, tmp_path: Path) -> None:
+        approved = spread(quantity=1, credit="1.50")
+        authorization = authorized(tmp_path, approved)
+        bigger = self._substitute(approved)
+
+        # The two checks that used to be the whole defence both still pass.
+        assert authorization.strategy_id == bigger.strategy_id
+        assert authorization.action is bigger.strategy_action
+
+        ib = RecordingIB()
+        with pytest.raises(RefusedError, match="does not match the structure"):
+            place_combo(ib, bigger, authorization=authorization, account="DU1234567")
+        assert ib.placed == [], "nothing may reach the broker"
+
+    def test_the_order_it_was_minted_for_still_transmits(self, tmp_path: Path) -> None:
+        """The control. A digest that refuses everything proves nothing."""
+        approved = spread(quantity=1, credit="1.50")
+        ib = RecordingIB()
+        place_combo(
+            ib,
+            approved,
+            authorization=authorized(tmp_path, approved),
+            account="DU1234567",
+        )
+        assert len(ib.placed) == 1
+
+    def test_changing_only_the_quantity_is_enough_to_refuse(
+        self, tmp_path: Path
+    ) -> None:
+        approved = spread(quantity=1, credit="1.50")
+        authorization = authorized(tmp_path, approved)
+        ib = RecordingIB()
+        with pytest.raises(RefusedError, match="does not match the structure"):
+            place_combo(
+                ib,
+                replace(approved, quantity=2),
+                authorization=authorization,
+                account="DU1234567",
+            )
+        assert ib.placed == []
+
+    def test_changing_only_the_limit_price_is_enough_to_refuse(
+        self, tmp_path: Path
+    ) -> None:
+        """Price moves max loss, so it is part of what was approved.
+
+        The substitute has to stay *internally consistent* to be interesting:
+        ``OptionStrategyIntent`` recomputes ``maximum_loss_per_contract`` from
+        the legs and refuses a mismatch, so a bare price swap never constructs
+        and the digest is never reached. Adjusting both is what produces a
+        perfectly valid intent that is nonetheless not the one approved --
+        which is precisely the case the digest exists for.
+        """
+        approved = spread(quantity=1, credit="1.50")
+        authorization = authorized(tmp_path, approved)
+        cheaper = replace(
+            approved,
+            limit_price=D("0.10"),
+            maximum_loss_per_contract=(D("5") - D("0.10")) * 100,
+        )
+        ib = RecordingIB()
+        with pytest.raises(RefusedError, match="does not match the structure"):
+            place_combo(ib, cheaper, authorization=authorization, account="DU1234567")
+        assert ib.placed == []
+
+    def test_the_digest_is_stable_for_the_same_structure(self) -> None:
+        """Otherwise the check would refuse the very order it authorized."""
+        approved = spread(quantity=1, credit="1.50")
+        assert structure_digest(approved) == structure_digest(approved)
+        assert structure_digest(approved) != structure_digest(
+            replace(approved, quantity=2)
+        )

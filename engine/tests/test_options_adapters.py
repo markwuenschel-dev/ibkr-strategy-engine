@@ -17,6 +17,9 @@ import datetime as dt
 from decimal import Decimal
 from typing import Any
 
+import pytest
+
+from engine.errors import InvalidStrategyError
 from engine.options.adapters import IBKRLiveMarketDataAdapter
 from engine.options.chain import QualifiedOption, narrow_strikes
 from engine.options.selection import DeltaCandidate, OptionRight, select_vertical
@@ -411,14 +414,56 @@ class TestTheProtectiveLegCannotBeArbitrarilyFar:
         assert selection is not None
         assert selection.width == D("5")
 
-    def test_an_explicit_bound_overrides_the_derived_one(self) -> None:
-        dense = [D(s) for s in range(700, 761)]
-        selection = select_vertical(
-            _candidates(dense, right=OptionRight.PUT),
+    def test_an_explicit_bound_tighter_than_the_derived_one_is_honoured(self) -> None:
+        """A ladder spaced 7 apart derives a bound of 5+7=12, which admits a
+        7-wide. An explicit 6 must exclude it and yield no structure."""
+        spaced = [D(s) for s in range(700, 841, 7)]
+        candidates = _candidates(spaced, right=OptionRight.PUT)
+
+        derived = select_vertical(
+            candidates,
             target_delta=D("0.30"),
             right=OptionRight.PUT,
             target_width=D("5"),
-            maximum_width=D("2"),
         )
-        assert selection is not None
-        assert selection.width <= D("2")
+        assert derived is not None and derived.width == D("7")
+
+        explicit = select_vertical(
+            candidates,
+            target_delta=D("0.30"),
+            right=OptionRight.PUT,
+            target_width=D("5"),
+            maximum_width=D("6"),
+        )
+        assert explicit is None
+
+    def test_an_unvalidated_bound_cannot_silently_disable_the_check(self) -> None:
+        """``Decimal("Infinity")`` is an ordinary finite-looking Decimal.
+
+        Passed as a bound it reads like a limit and enforces nothing, which is
+        strictly worse than no bound at all -- and ``NaN`` turns the width
+        comparison into an uncaught InvalidOperation inside the selector rather
+        than a refusal at the boundary.
+        """
+        dense = [D(s) for s in range(700, 761)]
+        candidates = _candidates(dense, right=OptionRight.PUT)
+        for bad in (D("Infinity"), D("NaN"), D("-Infinity")):
+            with pytest.raises(InvalidStrategyError):
+                select_vertical(
+                    candidates,
+                    target_delta=D("0.30"),
+                    right=OptionRight.PUT,
+                    target_width=D("5"),
+                    maximum_width=bad,
+                )
+
+    def test_a_bound_below_the_target_is_refused_as_contradictory(self) -> None:
+        dense = [D(s) for s in range(700, 761)]
+        with pytest.raises(InvalidStrategyError):
+            select_vertical(
+                _candidates(dense, right=OptionRight.PUT),
+                target_delta=D("0.30"),
+                right=OptionRight.PUT,
+                target_width=D("5"),
+                maximum_width=D("2"),
+            )
