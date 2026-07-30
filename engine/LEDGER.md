@@ -370,6 +370,64 @@ Landed on branch `lane4-callback-persistence`, **not yet merged**. Suite there:
 1166 passed, exit 0 (against 1153 at `a373063`). `transmit.py` untouched, single
 `placeOrder` call site unchanged, AST guard green.
 
+## M9 — the adversarial shield, 2026-07-30. **Armed execution is blocked.**
+
+An independent lane was told to *disprove* the safety claims rather than confirm
+them, and to execute every attack. It broke six of them. The headline finding
+invalidates the property this whole design rests on.
+
+### D1 — a *genuine* authorization transmitted an arbitrarily larger order. **FIXED**
+
+No forgery involved. `place_combo` bound only `strategy_id` and `action`
+(`transmit.py:330,336`) — and an id and an action are shared by every variant of
+a structure. Executed: mint a real token for a 1-lot 5-wide spread, hand
+`place_combo` a 50-lot 100-wide spread carrying the same id. Both checks pass.
+
+```
+AUTHORIZED   : qty=1   strikes 500/495   max loss $350
+TRANSMITTED  : qty=50  strikes 500/400   max loss $492,500      (1407x)
+```
+
+`place_combo`'s own docstring claimed that check prevented exactly this — *"an
+approval for a 1-lot could transmit a 10-lot."* It did not. The docstring was
+the load-bearing lie: it described a guarantee nobody had implemented, and three
+sessions of notes repeated it.
+
+**Fixed** in `b3504fb`: the token carries a sha256 `structure_digest` over
+everything that moves the maximum loss — quantity, each leg's contract/side/
+ratio/multiplier, limit price and direction. `authorize_*` compute it from the
+intent they approved; `place_combo` recomputes from the intent it is about to
+send. Mutation-verified: disabling the comparison fails all three attack tests,
+and a control test proves the order it *was* minted for still transmits.
+
+### D11 — `maximum_width` was unvalidated. **FIXED**
+
+Mine, introduced in `8d90529`. `target_width` is validated; the bound I added
+beside it was not. `Decimal("Infinity")` is an ordinary Decimal that reads as a
+limit and enforces nothing — strictly worse than no bound — and `NaN` turned the
+comparison into an uncaught `InvalidOperation` inside the selector. Fixed in
+`b3504fb` on the same terms as `target_width`, plus a contradiction check.
+
+### Still open — each one blocks the first armed order
+
+| # | What | Why it blocks |
+|---|---|---|
+| D2 | **Absence of a reconciler reads as permission.** `runner.py:641` swallows a reconciliation exception into `report.errors` and leaves `report.reconciliation is None`; the gate at `:679` only blocks when it is *not* None and disagrees. Executed: restart with `broker.positions()` raising → one `placeOrder`, book holds two strategies for the identical spread. | Duplicate send after restart. |
+| D5 | **The single-`placeOrder` AST proof has two holes.** It inspects only `Call.func` and globs non-recursively. A subpackage `options/execution_ext/sender.py` containing a literal `ib.placeOrder(...)` left the suite green; so did `sender = ib.placeOrder; sender(c,o)` and `getattr(ib, "plac"+"eOrder")` inside `positions.py`. | The chokepoint is the whole safety story and it is not actually enforced. |
+| D6 | **The token is forgeable** by `object.__new__`, subclass overriding `__post_init__`, `dataclasses.replace`, and pickle round-trip (which never re-runs `__post_init__`). | Weaker threat model — all require in-process code — but the stated property is "cannot be constructed", and that is false. |
+| D4 | **The C21 guard is load-bearing and untested.** Disabling `lifecycle.py:505` leaves the full suite green. The test that looks like coverage uses ordered=1/close=5, so `domain.py:608` catches it first — it passes for the wrong reason and never exercises close-more-than-*filled*. | A naked short is the failure mode. |
+| D7 | Three more guards whose removal breaks nothing: `transmit.py:97` (armed-only), `transmit.py:111-118` (risk/governor re-check), `marketdata.py:564` (cross-leg uniform-LIVE). | The C12 failure mode, three more times. |
+| D8 | Foreign or corrupt events silently size exits to the **ordered** quantity, and `integrity_errors()` stays empty so the reconciler never engages. | |
+| D9 | `has_valid_delta` is `delta is not None` and nothing else. Deltas of `-5.0`, `12345`, `0` and `NaN` were all **approved**; `NaN` then crashes `selection.py:309` with an uncaught `InvalidOperation`. | Fail-closed by crash, not by refusal. |
+| D10 | A future-dated quote (`age = -3600s`) bypasses the staleness bound. | |
+| D3 | Second exit after a partial close is a naked short. **Already fixed** on `lane4-callback-persistence` (C24), unmerged. | |
+
+**Survived**, and worth recording as genuinely holding: the width bound (nine
+chain shapes, including the real 2026-07-30 incident chain); the provenance gate
+on all six named conditions, with a control proving the checks are not vacuous;
+C21 partial-fill exit sizing; and three forgery attempts stopped by domain
+invariants before reaching the target.
+
 ## Runtime capabilities still unverified
 
 Everything below is unproven against a live broker and must not be described as working:
