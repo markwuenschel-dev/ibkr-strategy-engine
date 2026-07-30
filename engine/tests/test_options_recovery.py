@@ -2514,3 +2514,58 @@ class TestTheNextPassSeesTheWorkingOrder:
         assert report.reconciliation.orders_unknown_to_store == ()
         assert report.reconciliation_outcome.may_open_new_risk is True
         assert report.entered is True, report.describe()
+
+
+class TestAReopenedPartialCloseIsNotResoldInFull:
+    """C21's failure reached by a different road, on the *transmitting* path.
+
+    The existing C21 test covers a partial *open*: ordered 3, filled 1, close 1.
+    This is the other shape. The open fills in full, the CLOSE partially fills,
+    and then the close fails -- which returns the position to OPEN, where
+    ``decide_management_action`` re-decides it from scratch.
+
+    At that point ``manageable_quantity`` still reports 3, because it subtracts
+    what the *open* filled and nothing that the *close* already retired. Sizing
+    the exit off it sells two contracts that are no longer held.
+
+    The lifecycle's hold-while-CLOSING guard is why this looked safe and is not:
+    CLOSE_FAILED ends the CLOSING state.
+    """
+
+    def test_the_second_exit_closes_only_the_unclosed_remainder(
+        self, tmp_path: Path
+    ) -> None:
+        store = store_for(tmp_path)
+        intent = spread_intent(
+            expiration=TODAY + dt.timedelta(days=10), quantity=3
+        )
+        store.record_open_submitted(intent, at=NOW, buying_power_reserved=BPR)
+        store.record_open_filled(
+            intent.strategy_id, at=NOW, filled_credit=D("1.50"), filled_quantity=D("3")
+        )
+        store.record_close_submitted(intent.strategy_id, at=NOW, target_debit=D("0.75"))
+        store.record_partial_fill(
+            intent.strategy_id, at=NOW, filled_quantity=D("2"), closing=True
+        )
+        store.record_close_failed(
+            intent.strategy_id, at=NOW, reason="the closing order was cancelled"
+        )
+
+        position = store.get(intent.strategy_id)
+        assert position is not None
+        # The premise, asserted so this cannot pass for the wrong reason.
+        assert position.state is PositionState.OPEN, "it must be re-decided"
+        assert position.manageable_quantity == 3, "the misleading number"
+        assert position.remaining_quantity == D("1"), "the true holding"
+
+        ib = ScriptedIB(scripts=(SCRIPT_CLEAN_FILL,))
+        report = run_pass(
+            FakeBroker(ib=ib, positions=()), gate_for(tmp_path), store, armed=True
+        )
+
+        assert len(ib.placed) == 1, report.describe()
+        _bag, order = ib.placed[0]
+        assert order.totalQuantity == 1, (
+            "the exit must close the 1 contract still held, not the 3 the open "
+            "filled -- selling 2 unheld contracts is a naked short"
+        )

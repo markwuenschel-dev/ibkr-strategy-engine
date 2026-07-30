@@ -37,6 +37,7 @@ from ..errors import MarketDataRefusedError
 from .chain import QualifiedOption
 from .domain import OptionStrategyIntent
 from .execution import MarginAssessment
+from .executions import ExecutionRecord
 from .ivrank import IVObservation
 from .marketdata import OptionQuote, RefusalReason, UnderlyingQuote
 from .portfolio import PortfolioSnapshot
@@ -48,6 +49,7 @@ __all__ = [
     "LiveMarketDataPort",
     "VolatilityHistoryPort",
     "BrokerWhatIfPort",
+    "ExecutionReportPort",
     "PortfolioStatePort",
 ]
 
@@ -185,6 +187,26 @@ class BrokerWhatIfPort(Protocol):
         self, intent: OptionStrategyIntent, *, observed_at: dt.datetime
     ) -> MarginAssessment:
         """What the broker says this would cost. Places nothing."""
+        ...
+
+
+@runtime_checkable
+class ExecutionReportPort(Protocol):
+    """What actually filled, and what the broker charged for it.
+
+    A read-only query, and separate from every other port here because it answers
+    a question about the *past*: a fill that already happened and a commission
+    that has already been charged. Every other port describes the present.
+
+    It is a port rather than a direct ``ib.fills()`` call inside the marking code
+    for the usual reason -- so the completeness rules in
+    :mod:`engine.options.executions` can be exercised against hand-written fills,
+    including the ones with an unpopulated commission report, which is the case
+    that mattered and the case a live broker will not produce on demand.
+    """
+
+    def executions(self) -> Sequence[ExecutionRecord]:
+        """Every execution the broker will report for this session."""
         ...
 
 

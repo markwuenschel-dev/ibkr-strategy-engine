@@ -517,7 +517,9 @@ class TestPortsCannotTransmit:
 
 
 class TestOptionsCliIsNotArmable:
-    @pytest.mark.parametrize("command", ["options-scan", "probe-options-data"])
+    @pytest.mark.parametrize(
+        "command", ["options-scan", "probe-options-data", "options-mark"]
+    )
     def test_options_commands_reject_arm(self, command: str) -> None:
         """--arm is the flag that transmits. An options command accepting it --
         even if it currently ignored it -- is the affordance this milestone must
@@ -540,7 +542,7 @@ class TestOptionsCliIsNotArmable:
         import engine.cli as cli_module
 
         tree = parse(Path(cli_module.__file__).resolve())
-        handlers = {"cmd_options_scan", "cmd_probe_options_data"}
+        handlers = {"cmd_options_scan", "cmd_probe_options_data", "cmd_options_mark"}
         offenders: list[str] = []
         for node in ast.walk(tree):
             if not isinstance(node, ast.FunctionDef) or node.name not in handlers:

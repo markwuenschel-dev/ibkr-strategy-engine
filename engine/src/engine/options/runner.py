@@ -67,6 +67,7 @@ from .lifecycle import (
     decide_management_action,
 )
 from .marketdata import Liveness
+from .marking import closing_midpoint_debit, confirmed_remaining_quantity
 from .policy import RiskPolicy
 from .portfolio import PortfolioSnapshot
 from .ports import LiveMarketDataPort, PortfolioStatePort, StrategyQuoteSnapshot
@@ -242,20 +243,25 @@ def mark_from_snapshot(
     because the lifecycle rules want to distinguish "no mark at all" from "a mark
     we may not act on" -- and only the second tells the operator the feed is up
     but unentitled.
+
+    **The arithmetic is not repeated here.** It is
+    :func:`engine.options.marking.closing_midpoint_debit`, and delegating rather
+    than re-deriving is the same discipline
+    :func:`engine.options.pricing.midpoint_credit` follows when it defers to
+    ``proof.observed_credit``: two implementations of "what is this structure
+    worth" can disagree while both look right in isolation, and the one that is
+    wrong is whichever one an exit is priced against.
+
+    Note this is the **midpoint**, which is a valuation and not an exit price.
+    :func:`engine.options.marking.closing_natural_debit` is what a close can
+    actually be done at, and it is what the marking report prices a proposal on.
     """
     if snapshot is None:
         return None
 
-    quotes = {quote.con_id: quote for quote in snapshot.legs}
-    total = ZERO
-    for leg in position.legs:
-        quote = quotes.get(leg.con_id)
-        if quote is None:
-            return None
-        mid = quote.mid
-        if mid is None or mid < ZERO:
-            return None
-        total += mid * leg.ratio if leg.is_short else -mid * leg.ratio
+    total = closing_midpoint_debit(position.legs, snapshot)
+    if total is None:
+        return None
 
     if total < ZERO:
         # A negative buy-back price is a sign error or a crossed book, not a
@@ -373,7 +379,20 @@ def _manage_one(
         created_at=now,
         configuration_version=configuration_version,
         limit_price=limit_price,
-        quantity=position.manageable_quantity,
+        # What the position is PROVEN to still hold, not what it once filled.
+        #
+        # ``manageable_quantity`` does not subtract a partial close. The
+        # lifecycle holds a position while it is CLOSING, so a second close
+        # cannot double the order -- but a CLOSE_FAILED after a partial fill
+        # returns the position to OPEN, and it is re-decided with the full
+        # original fill. Three filled, two already closed, and the exit is
+        # sized three: two contracts sold that nobody holds.
+        #
+        # This is ledger C21 reached by a different road, and the reason the
+        # number is trustworthy now is the C24 replay fix -- before it,
+        # ``close_filled_quantity`` was silently reset to zero by any
+        # transition that did not name it.
+        quantity=confirmed_remaining_quantity(position),
     )
 
     try:
