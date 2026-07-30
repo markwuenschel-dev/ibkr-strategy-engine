@@ -886,3 +886,110 @@ class TestAssessmentRecord:
         assert positions == sorted(positions)
         assert CHECK_BROKER_MARGIN in text
         assert CHECK_STRESS_LOSS in text
+
+
+#: The contract that vetoed a spread it had nothing to do with, on 2026-07-30.
+#: Never selected, never to be traded -- it merely sat in the same chain window.
+BYSTANDER_CON_ID = 891847214
+
+
+class TestEntitlementIsScopedToTheSelectedStructure:
+    """The regression for the incident that blocked the first fill.
+
+    A quote snapshot is two things under one name. As a *selection universe* it
+    holds every contract the scan inspected -- dozens of strikes, most of them
+    considered and discarded. As an *execution proof* it should hold exactly the
+    underlying and the legs about to be sent.
+
+    Conflating them let contract 891847214, which was never selected, refuse a
+    722/721 spread three times. Narrowing to the intent's legs is what let the
+    engine's first order fill.
+
+    This test exists because a mutation sweep found the narrowing was **not
+    load-bearing**: reverting ``execution_entitlement_set`` to ``snapshot.legs``
+    failed nothing, because every other call site omits ``intent`` and so takes
+    the identical ``intent is None`` branch. The fix could have been silently
+    reverted and the suite would have stayed green -- the C12 pattern again, and
+    the honest gap carried from the day it was written.
+
+    Note what kind of guard this is: reverting it makes the engine **stricter**,
+    not laxer. It over-refuses rather than authorizing anything unsafe, which is
+    exactly why no safety test caught it. That does not make it optional -- an
+    engine that refuses every correct trade is as unusable as one that accepts
+    wrong ones, and this one demonstrably did.
+    """
+
+    def _with_bystander(self, **kwargs: Any) -> StrategyQuoteSnapshot:
+        """A live snapshot plus one unusable contract that is *not* in the intent."""
+        base = live_snapshot()
+        bystander_gen = uuid4()
+        stranded = OptionQuote(
+            con_id=BYSTANDER_CON_ID,
+            # The exact condition observed: the provider never reported a
+            # market-data type for it, so its liveness is UNKNOWN.
+            provenance=provenance(bystander_gen, reported=None, callback=False),
+            bid=None,
+            ask=None,
+            greeks=None,
+        )
+        # It has to carry a declared generation, or the snapshot refuses to
+        # construct and the test never reaches the gate at all -- the scan really
+        # did subscribe to this contract, it simply never heard back about it.
+        return StrategyQuoteSnapshot(
+            underlying=base.underlying,
+            legs=(*base.legs, stranded),
+            generations=(*base.generations, (str(BYSTANDER_CON_ID), bystander_gen)),
+        )
+
+    def test_an_unselected_chain_contract_does_not_veto_the_structure(self) -> None:
+        intent = spread()
+        result = check_market_data_entitlement(
+            self._with_bystander(),
+            decision_time=NOW,
+            policy=RiskPolicy(),
+            intent=intent,
+        )
+        assert result.approved, result.detail
+        assert BYSTANDER_CON_ID not in {leg.con_id for leg in intent.legs}
+
+    def test_the_bystander_really_would_have_vetoed_it(self) -> None:
+        """The control. Without it the test above proves nothing.
+
+        Omitting ``intent`` is what every other call site does, and it is the
+        behaviour the mutation restored -- so this pins the difference the
+        narrowing actually makes.
+        """
+        result = check_market_data_entitlement(
+            self._with_bystander(), decision_time=NOW, policy=RiskPolicy()
+        )
+        assert not result.approved, (
+            "the whole-chain check must refuse here, or the narrowing above is "
+            "not being tested at all"
+        )
+
+    def test_a_selected_leg_still_vetoes(self) -> None:
+        """Narrowing must not become skipping.
+
+        The same defect made harmless is one thing; the gate going quiet on a
+        leg that IS being traded is the failure it was protecting against.
+        """
+        intent = spread()
+        base = live_snapshot()
+        broken = StrategyQuoteSnapshot(
+            underlying=base.underlying,
+            legs=(
+                base.legs[0],
+                OptionQuote(
+                    con_id=LONG_CON_ID,
+                    provenance=provenance(uuid4(), reported=None, callback=False),
+                    bid=None,
+                    ask=None,
+                    greeks=None,
+                ),
+            ),
+            generations=base.generations,
+        )
+        result = check_market_data_entitlement(
+            broken, decision_time=NOW, policy=RiskPolicy(), intent=intent
+        )
+        assert not result.approved, "a traded leg with no callback must refuse"
