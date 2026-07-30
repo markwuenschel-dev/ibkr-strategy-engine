@@ -88,6 +88,7 @@ from engine.options.transmit import (
 )
 from engine.errors import ConfigError
 from engine.safety import SafetyGate
+from reviewer import packet, reviewed
 
 D = Decimal
 NOW = dt.datetime(2026, 7, 29, 13, 0, tzinfo=dt.timezone.utc)
@@ -189,15 +190,40 @@ def approving_governor(intent: OptionStrategyIntent) -> Any:
     )
 
 
+def review_root(gate: SafetyGate) -> Path:
+    """A fresh collab for one review, beside the gate's own state.
+
+    One per call rather than one per test: an approval is single-use per spec
+    digest, and several of these tests mint two tokens for the same order at the
+    same price -- which a shared ledger would refuse as already consumed.
+    """
+    return gate.config.state_dir.parent / "review" / uuid4().hex
+
+
+def reviewing(gate: SafetyGate) -> tuple[Any, Any]:
+    """``(verifier, context)`` -- what an *opening* reprice now requires.
+
+    A reprice of an OPEN is a new opening order and gets its own review, because
+    the protocol's invalidation rule names price. Closing reprices need neither
+    and are not given one.
+    """
+    return reviewed(review_root(gate))
+
+
 def authorized(gate: SafetyGate, intent: OptionStrategyIntent) -> TransmitAuthorization:
     """A real token, through the real gates. There is no other way to get one."""
+    risk = approving_risk(intent.strategy_id)
+    governor = approving_governor(intent)
+    verifier, context = reviewing(gate)
     return authorize_open(
         intent,
         gate=gate,
-        risk=approving_risk(intent.strategy_id),
-        governor=approving_governor(intent),
+        risk=risk,
+        governor=governor,
         armed=True,
         now=NOW,
+        verifier=verifier,
+        packet=packet(intent, risk=risk, governor=governor, context=context, now=NOW),
     )
 
 
@@ -381,6 +407,9 @@ def work(
         def journalled(sent: Any) -> None:
             journal.record("order_placed", **sent.to_record())
 
+    # Every rung is an opening reprice, so the ladder needs a reviewer of its
+    # own -- one review per price, which is what the invalidation rule demands.
+    verifier, context = reviewing(gate)
     return work_order(
         ib,
         intent,
@@ -395,6 +424,8 @@ def work(
         ladder=ladder,
         envelope=envelope,
         sink=sink,
+        verifier=verifier,
+        approval_context=context,
     )
 
 
@@ -545,6 +576,7 @@ class TestCancelChokepoint:
 
         (gate.config.state_dir / "HALT").write_text("stop", encoding="utf-8")
 
+        verifier, context = reviewing(gate)
         outcome = work_order(
             ib,
             intent,
@@ -557,6 +589,8 @@ class TestCancelChokepoint:
             record_submission=RECORDED_ELSEWHERE,
             record_transmission=NOT_JOURNALLED,
             ladder=FAST,
+            verifier=verifier,
+            approval_context=context,
         )
 
         assert ib.cancelled == []
@@ -587,6 +621,7 @@ class TestRepriceStaysInsideTheEnvelope:
         envelope = envelope_for(intent)
         assert envelope.minimum == D("1.35")
 
+        verifier, context = reviewing(gate)
         repriced = authorize_reprice(
             authorized(gate, intent),
             intent,
@@ -596,6 +631,8 @@ class TestRepriceStaysInsideTheEnvelope:
             gate=gate,
             armed=True,
             now=NOW,
+            verifier=verifier,
+            context=context,
         )
 
         assert repriced.intent.limit_price == D("1.40")
@@ -613,6 +650,7 @@ class TestRepriceStaysInsideTheEnvelope:
         intent = spread(credit="1.50")
         envelope = envelope_for(intent)
 
+        verifier, context = reviewing(gate)
         with pytest.raises(RefusedError, match="outside the approved envelope"):
             authorize_reprice(
                 authorized(gate, intent),
@@ -623,6 +661,8 @@ class TestRepriceStaysInsideTheEnvelope:
                 gate=gate,
                 armed=True,
                 now=NOW,
+                verifier=verifier,
+                context=context,
             )
 
     def test_a_replace_above_the_envelope_ceiling_is_refused_too(
@@ -634,6 +674,7 @@ class TestRepriceStaysInsideTheEnvelope:
         gate = gate_for(tmp_path)
         intent = spread(credit="1.50")
 
+        verifier, context = reviewing(gate)
         with pytest.raises(RefusedError, match="outside the approved envelope"):
             authorize_reprice(
                 authorized(gate, intent),
@@ -644,6 +685,8 @@ class TestRepriceStaysInsideTheEnvelope:
                 gate=gate,
                 armed=True,
                 now=NOW,
+                verifier=verifier,
+                context=context,
             )
 
     def test_an_off_tick_replace_is_refused(self, tmp_path: Path) -> None:
@@ -657,6 +700,7 @@ class TestRepriceStaysInsideTheEnvelope:
         intent = spread(credit="1.50")
         envelope = envelope_for(intent)
 
+        off_grid, off_grid_context = reviewing(gate)
         with pytest.raises(RefusedError, match="tick increment"):
             authorize_reprice(
                 authorized(gate, intent),
@@ -667,8 +711,11 @@ class TestRepriceStaysInsideTheEnvelope:
                 gate=gate,
                 armed=True,
                 now=NOW,
+                verifier=off_grid,
+                context=off_grid_context,
             )
 
+        verifier, context = reviewing(gate)
         assert (
             authorize_reprice(
                 authorized(gate, intent),
@@ -679,6 +726,8 @@ class TestRepriceStaysInsideTheEnvelope:
                 gate=gate,
                 armed=True,
                 now=NOW,
+                verifier=verifier,
+                context=context,
             ).intent.limit_price
             == D("1.45")
         )
@@ -686,6 +735,7 @@ class TestRepriceStaysInsideTheEnvelope:
     def test_a_replace_that_changes_nothing_is_refused(self, tmp_path: Path) -> None:
         gate = gate_for(tmp_path)
         intent = spread(credit="1.50")
+        verifier, context = reviewing(gate)
         with pytest.raises(RefusedError, match="does not change"):
             authorize_reprice(
                 authorized(gate, intent),
@@ -696,12 +746,15 @@ class TestRepriceStaysInsideTheEnvelope:
                 gate=gate,
                 armed=True,
                 now=NOW,
+                verifier=verifier,
+                context=context,
             )
 
     def test_the_kill_switch_blocks_a_replace(self, tmp_path: Path) -> None:
         gate = gate_for(tmp_path)
         intent = spread(credit="1.50")
         token = authorized(gate, intent)
+        verifier, context = reviewing(gate)
         (gate.config.state_dir / "HALT").write_text("stop", encoding="utf-8")
 
         with pytest.raises(HaltedError):
@@ -714,6 +767,8 @@ class TestRepriceStaysInsideTheEnvelope:
                 gate=gate,
                 armed=True,
                 now=NOW,
+                verifier=verifier,
+                context=context,
             )
 
 
@@ -754,6 +809,7 @@ class TestRepriceCannotBecomeADifferentOrder:
         assert bigger.strategy_id == approved.strategy_id
         assert structure_digest(bigger) != token.digest
 
+        verifier, context = reviewing(gate)
         with pytest.raises(RefusedError, match="not the structure that was authorized"):
             authorize_reprice(
                 token,
@@ -764,6 +820,8 @@ class TestRepriceCannotBecomeADifferentOrder:
                 gate=gate,
                 armed=True,
                 now=NOW,
+                verifier=verifier,
+                context=context,
             )
 
     def test_the_same_call_succeeds_on_the_structure_that_was_authorized(
@@ -772,6 +830,7 @@ class TestRepriceCannotBecomeADifferentOrder:
         """The mutation half. Identical call, correct reference."""
         gate = gate_for(tmp_path)
         approved = spread(quantity=1, credit="1.50")
+        verifier, context = reviewing(gate)
         repriced = authorize_reprice(
             authorized(gate, approved),
             approved,
@@ -781,6 +840,8 @@ class TestRepriceCannotBecomeADifferentOrder:
             gate=gate,
             armed=True,
             now=NOW,
+            verifier=verifier,
+            context=context,
         )
         assert repriced.intent.quantity == 1
 
@@ -789,6 +850,7 @@ class TestRepriceCannotBecomeADifferentOrder:
     ) -> None:
         gate = gate_for(tmp_path)
         mine, other = spread(), spread()
+        verifier, context = reviewing(gate)
         with pytest.raises(RefusedError, match="authorization is for strategy"):
             authorize_reprice(
                 authorized(gate, other),
@@ -799,6 +861,8 @@ class TestRepriceCannotBecomeADifferentOrder:
                 gate=gate,
                 armed=True,
                 now=NOW,
+                verifier=verifier,
+                context=context,
             )
 
     def test_the_repriced_token_still_binds_the_send(self, tmp_path: Path) -> None:
@@ -810,6 +874,7 @@ class TestRepriceCannotBecomeADifferentOrder:
         """
         gate = gate_for(tmp_path)
         intent = spread(credit="1.50")
+        verifier, context = reviewing(gate)
         repriced = authorize_reprice(
             authorized(gate, intent),
             intent,
@@ -819,6 +884,8 @@ class TestRepriceCannotBecomeADifferentOrder:
             gate=gate,
             armed=True,
             now=NOW,
+            verifier=verifier,
+            context=context,
         )
         ib = LadderIB()
 
@@ -1040,6 +1107,7 @@ class TestTheLadderIsBounded:
         assert partial.state is OrderLifecycleState.PARTIALLY_FILLED
         assert partial.snapshot is not None and partial.snapshot.is_working is True
 
+        verifier, context = reviewing(gate)
         outcome = work_order(
             ib,
             intent,
@@ -1052,6 +1120,8 @@ class TestTheLadderIsBounded:
             record_submission=RECORDED_ELSEWHERE,
             record_transmission=NOT_JOURNALLED,
             ladder=FAST,
+            verifier=verifier,
+            approval_context=context,
         )
 
         assert outcome.stop is RepriceStop.RESOLVED
@@ -1304,6 +1374,7 @@ class TestEveryStateChangePersistsAsObserved:
             after = store.get(replacement.strategy_id)
             reserved_at_send.append(after.buying_power_reserved if after else None)
 
+        verifier, context = reviewing(gate)
         outcome = work_order(
             ib,
             intent,
@@ -1324,6 +1395,8 @@ class TestEveryStateChangePersistsAsObserved:
             record_transmission=NOT_JOURNALLED,
             ladder=FAST,
             sink=recorder,
+            verifier=verifier,
+            approval_context=context,
         )
 
         assert outcome.attempts == 4
@@ -1394,6 +1467,7 @@ class TestEveryStateChangePersistsAsObserved:
         def refuse(_replacement: OptionStrategyIntent) -> None:
             raise RuntimeError("the position store is unwritable")
 
+        verifier, context = reviewing(gate)
         with pytest.raises(RuntimeError, match="unwritable"):
             work_order(
                 ib,
@@ -1407,6 +1481,8 @@ class TestEveryStateChangePersistsAsObserved:
                 record_submission=refuse,
                 record_transmission=NOT_JOURNALLED,
                 ladder=FAST,
+                verifier=verifier,
+                approval_context=context,
             )
 
         assert len(ib.placed) == 1, "a replacement was sent without being recorded"

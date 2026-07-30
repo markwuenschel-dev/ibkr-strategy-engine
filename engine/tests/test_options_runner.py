@@ -31,6 +31,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+import reviewer
 from engine.config import EngineConfig
 from engine.errors import HaltedError
 from engine.journal import OrderJournal
@@ -508,7 +509,23 @@ def run_pass(
     market_data: Any = None,
     portfolio: Any = None,
     policy: RiskPolicy | None = None,
+    verifier: Any = None,
+    approval_context: Any = None,
 ) -> RunReport:
+    """One pass, with a real reviewed verifier gate unless one is supplied.
+
+    The runner refuses an entry outright when no verifier is configured, so the
+    default here is a real :class:`~reviewer.ReviewedGate` over a temp collab --
+    a real request, a real reviewer, a real answer -- rather than an argument
+    that waves the gate through. Its collab and its ledger hang off the same
+    ``tmp_path`` the safety gate's state directory does, so two passes in one
+    test share one ledger and the single-use rule really applies to them. A
+    test that wants a second, independent approval passes its own ``verifier``.
+    """
+    if verifier is None:
+        verifier = reviewer.approving_gate(gate.config.state_dir.parent / "verifier")
+    if approval_context is None:
+        approval_context = reviewer.approval_context()
     return run_once(
         broker,
         gate=gate,
@@ -523,6 +540,8 @@ def run_pass(
         now=NOW,
         today=TODAY,
         account="DU1234567",
+        verifier=verifier,
+        approval_context=approval_context,
     )
 
 

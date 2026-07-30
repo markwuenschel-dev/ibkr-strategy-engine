@@ -60,6 +60,7 @@ from engine.options.walk import (
 )
 from engine.safety import SafetyGate
 
+from reviewer import reviewed  # noqa: E402 - sibling test module, see docstring
 from test_options_pricing import (  # noqa: E402 - sibling test module, see docstring
     EXPECTED_RUNGS,
     LONG_ASK,
@@ -451,6 +452,12 @@ def walk_for(
         what_if=what_if,
         portfolio=FakePortfolio(clock),
     )
+    # A walk with no independent verifier authorizes nothing, so every test here
+    # would refuse at rung one for a reason none of them are about. The gate is
+    # the real one over a temp collab, with the reviewer seat answering as each
+    # rung's request is filed -- and each rung is a new price, so a new spec, so
+    # its own request and its own answer.
+    verifier, context = reviewed(tmp_path)
     return PriceWalk(
         ib=ib,
         market_data=market,
@@ -468,6 +475,8 @@ def walk_for(
         ),
         clock=clock,
         pause=clock.advance,
+        verifier=verifier,
+        approval_context=context,
         on_fill=(
             (lambda sid, qty, snap: fills.append((sid, qty)))
             if fills is not None

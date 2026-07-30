@@ -60,6 +60,7 @@ from engine.options.transmit import (
     structure_digest,
 )
 from engine.safety import SafetyGate
+from reviewer import packet, reviewed
 
 D = Decimal
 NOW = dt.datetime(2026, 7, 29, 13, 0, tzinfo=dt.timezone.utc)
@@ -198,14 +199,40 @@ def _margin() -> Any:
     )
 
 
+def review_for(
+    tmp_path: Path,
+    intent: OptionStrategyIntent,
+    *,
+    risk: CandidateRiskAssessment,
+    governor: Any,
+) -> tuple[Any, Any]:
+    """``(verifier, packet)`` -- a reviewer that approves *this* order, and the
+    packet it is shown.
+
+    Every call gets its own collab under ``tmp_path``, because an approval is
+    single-use per spec digest and several of these tests mint two tokens for
+    the same order. The packet is built from the same ``risk`` and ``governor``
+    the caller hands ``authorize_open``, since the two are compared there.
+    """
+    verifier, context = reviewed(tmp_path / "review" / uuid4().hex)
+    return verifier, packet(
+        intent, risk=risk, governor=governor, context=context, now=NOW
+    )
+
+
 def authorized(tmp_path: Path, intent: OptionStrategyIntent) -> TransmitAuthorization:
+    risk = approving_risk(intent.strategy_id)
+    governor = approving_governor(intent)
+    verifier, review = review_for(tmp_path, intent, risk=risk, governor=governor)
     return authorize_open(
         intent,
         gate=gate_for(tmp_path),
-        risk=approving_risk(intent.strategy_id),
-        governor=approving_governor(intent),
+        risk=risk,
+        governor=governor,
         armed=True,
         now=NOW,
+        verifier=verifier,
+        packet=review,
     )
 
 
@@ -375,62 +402,89 @@ class TestAuthorizeOpen:
         gate = gate_for(tmp_path)
         gate.config.halt_file.write_text("stopped by hand", encoding="utf-8")
         intent = spread()
+        risk = approving_risk(intent.strategy_id)
+        governor = approving_governor(intent)
+        # A working, approving reviewer throughout: the refusal under test must
+        # be the kill switch and nothing else.
+        verifier, review = review_for(tmp_path, intent, risk=risk, governor=governor)
         with pytest.raises(HaltedError):
             authorize_open(
                 intent,
                 gate=gate,
-                risk=approving_risk(intent.strategy_id),
-                governor=approving_governor(intent),
+                risk=risk,
+                governor=governor,
                 armed=True,
                 now=NOW,
+                verifier=verifier,
+                packet=review,
             )
 
     def test_an_unarmed_run_refuses(self, tmp_path: Path) -> None:
         intent = spread()
+        risk = approving_risk(intent.strategy_id)
+        governor = approving_governor(intent)
+        verifier, review = review_for(tmp_path, intent, risk=risk, governor=governor)
         with pytest.raises(RefusedError, match="not armed"):
             authorize_open(
                 intent,
                 gate=gate_for(tmp_path),
-                risk=approving_risk(intent.strategy_id),
-                governor=approving_governor(intent),
+                risk=risk,
+                governor=governor,
                 armed=False,
                 now=NOW,
+                verifier=verifier,
+                packet=review,
             )
 
     def test_a_symbol_off_the_allowlist_refuses(self, tmp_path: Path) -> None:
         intent = spread(underlying="MSFT")
+        risk = approving_risk(intent.strategy_id)
+        governor = approving_governor(intent)
+        verifier, review = review_for(tmp_path, intent, risk=risk, governor=governor)
         with pytest.raises(RefusedError, match="allowlist"):
             authorize_open(
                 intent,
                 gate=gate_for(tmp_path),
-                risk=approving_risk(intent.strategy_id),
-                governor=approving_governor(intent),
+                risk=risk,
+                governor=governor,
                 armed=True,
                 now=NOW,
+                verifier=verifier,
+                packet=review,
             )
 
     def test_a_refused_risk_assessment_refuses(self, tmp_path: Path) -> None:
         intent = spread()
+        risk = refusing_risk(intent.strategy_id)
+        governor = approving_governor(intent)
+        verifier, review = review_for(tmp_path, intent, risk=risk, governor=governor)
         with pytest.raises(RefusedError, match="candidate risk refused"):
             authorize_open(
                 intent,
                 gate=gate_for(tmp_path),
-                risk=refusing_risk(intent.strategy_id),
-                governor=approving_governor(intent),
+                risk=risk,
+                governor=governor,
                 armed=True,
                 now=NOW,
+                verifier=verifier,
+                packet=review,
             )
 
     def test_a_refused_governor_refuses(self, tmp_path: Path) -> None:
         intent = spread()
+        risk = approving_risk(intent.strategy_id)
+        governor = refusing_governor(intent)
+        verifier, review = review_for(tmp_path, intent, risk=risk, governor=governor)
         with pytest.raises(RefusedError, match="governor refused"):
             authorize_open(
                 intent,
                 gate=gate_for(tmp_path),
-                risk=approving_risk(intent.strategy_id),
-                governor=refusing_governor(intent),
+                risk=risk,
+                governor=governor,
                 armed=True,
                 now=NOW,
+                verifier=verifier,
+                packet=review,
             )
 
     def test_the_daily_cap_refuses(self, tmp_path: Path) -> None:
@@ -438,14 +492,19 @@ class TestAuthorizeOpen:
         for _ in range(2):
             gate.journal.record("order_placed", symbol="SPY")
         intent = spread()
+        risk = approving_risk(intent.strategy_id)
+        governor = approving_governor(intent)
+        verifier, review = review_for(tmp_path, intent, risk=risk, governor=governor)
         with pytest.raises(RefusedError, match="already placed today"):
             authorize_open(
                 intent,
                 gate=gate,
-                risk=approving_risk(intent.strategy_id),
-                governor=approving_governor(intent),
+                risk=risk,
+                governor=governor,
                 armed=True,
                 now=NOW,
+                verifier=verifier,
+                packet=review,
             )
 
     def test_an_approval_for_another_strategy_is_refused(self, tmp_path: Path) -> None:
@@ -453,28 +512,41 @@ class TestAuthorizeOpen:
         1-lot could authorize a 10-lot."""
         intent = spread(quantity=1)
         other = spread(quantity=10)
+        risk = approving_risk(other.strategy_id)
+        governor = approving_governor(intent)
+        # The reviewer approves, and the packet describes exactly what is being
+        # authorized -- so the refusal below comes from the token's own check on
+        # the risk assessment's strategy id, not from a packet that disagrees.
+        verifier, review = review_for(tmp_path, intent, risk=risk, governor=governor)
         with pytest.raises(RefusedError, match="risk assessment is for"):
             authorize_open(
                 intent,
                 gate=gate_for(tmp_path),
-                risk=approving_risk(other.strategy_id),
-                governor=approving_governor(intent),
+                risk=risk,
+                governor=governor,
                 armed=True,
                 now=NOW,
+                verifier=verifier,
+                packet=review,
             )
 
     def test_arming_is_checked_last(self, tmp_path: Path) -> None:
         """An unarmed run must still surface a real problem rather than stopping
         at 'not armed' and hiding it until the next run."""
         intent = spread(underlying="MSFT")
+        risk = approving_risk(intent.strategy_id)
+        governor = approving_governor(intent)
+        verifier, review = review_for(tmp_path, intent, risk=risk, governor=governor)
         with pytest.raises(RefusedError, match="allowlist"):
             authorize_open(
                 intent,
                 gate=gate_for(tmp_path),
-                risk=approving_risk(intent.strategy_id),
-                governor=approving_governor(intent),
+                risk=risk,
+                governor=governor,
                 armed=False,
                 now=NOW,
+                verifier=verifier,
+                packet=review,
             )
 
 
@@ -598,14 +670,19 @@ class TestUnarmedCannotReachTheBroker:
         there is nothing to hand place_combo."""
         intent = spread()
         ib = RecordingIB()
+        risk = approving_risk(intent.strategy_id)
+        governor = approving_governor(intent)
+        verifier, review = review_for(tmp_path, intent, risk=risk, governor=governor)
         with pytest.raises(RefusedError):
             auth = authorize_open(
                 intent,
                 gate=gate_for(tmp_path),
-                risk=approving_risk(intent.strategy_id),
-                governor=approving_governor(intent),
+                risk=risk,
+                governor=governor,
                 armed=False,
                 now=NOW,
+                verifier=verifier,
+                packet=review,
             )
             place_combo(ib, intent, authorization=auth)
         assert ib.placed == []
