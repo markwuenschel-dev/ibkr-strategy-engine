@@ -148,6 +148,14 @@ class OpenPosition:
     #: Quantity actually filled on the opening order. Below ``quantity`` means a
     #: partial fill: the position is real but smaller than intended.
     filled_quantity: Decimal = Decimal("0")
+    #: Quantity actually filled on the *closing* order, which is a separate order
+    #: with its own independent fill count. Kept because the exit can partially
+    #: fill too, and when it does the difference from ``filled_quantity`` is the
+    #: only thing that says how many contracts are still held. Without it a
+    #: cancelled-after-partial exit leaves the store unable to answer "how much of
+    #: this position did we actually get out of", which is the mirror of the
+    #: opening-side defect recorded as C21.
+    close_filled_quantity: Decimal = Decimal("0")
     commission: Decimal | None = None
     #: Why the outcome is unknown, when ``state`` is UNCERTAIN.
     uncertainty: str | None = None
@@ -203,6 +211,28 @@ class OpenPosition:
                 f"quantity {self.intent.quantity}",
                 hint="a fill larger than the order is a parsing error, and sizing "
                 "an exit off it would sell contracts that were never bought",
+            )
+        if not isinstance(self.close_filled_quantity, Decimal):
+            _refuse(
+                f"close_filled_quantity must be a Decimal, got "
+                f"{type(self.close_filled_quantity).__name__}"
+            )
+        if self.close_filled_quantity < 0:
+            _refuse(
+                f"close_filled_quantity must not be negative, got "
+                f"{self.close_filled_quantity}"
+            )
+        # Bounded by the *ordered* quantity rather than by ``filled_quantity``.
+        # Replay applies events in journal order, and a CLOSE_PARTIAL can legally
+        # be read before an OPEN_FILLED that has not yet raised the opening count.
+        # Validating against the tighter bound would raise inside ``_replace``,
+        # where ``positions()`` records it as a problem and *drops the
+        # transition* -- losing the very fill this field exists to keep.
+        if self.close_filled_quantity > Decimal(self.intent.quantity):
+            _refuse(
+                f"close_filled_quantity {self.close_filled_quantity} exceeds the "
+                f"ordered quantity {self.intent.quantity}",
+                hint="closing more than was ever ordered is a parsing error",
             )
 
     # -- derived ----------------------------------------------------------
@@ -286,6 +316,33 @@ class OpenPosition:
             return int(self.filled_quantity)
         return self.quantity
 
+    @property
+    def is_partially_closed(self) -> bool:
+        """The exit filled for less than what is held, and stopped there.
+
+        A real and dangerous shape: some contracts are out, the rest are not,
+        and the two numbers that say so live on different orders.
+        """
+        return (
+            self.close_filled_quantity > Decimal("0")
+            and self.close_filled_quantity < self.filled_quantity
+        )
+
+    @property
+    def remaining_quantity(self) -> Decimal:
+        """Contracts still held: what the open filled, less what the close did.
+
+        Reported, never yet used to size an order. Sizing an exit off this is
+        the obvious next step and is deliberately **not** taken here -- a
+        position mid-close is held by ``decide_management_action``
+        (``lifecycle.py``) precisely so a second close cannot double the order,
+        and changing that is a lifecycle decision rather than a storage one.
+        This property exists so the number is *available* and durable when that
+        decision is made, instead of being unrecoverable after the fact.
+        """
+        remaining = self.filled_quantity - self.close_filled_quantity
+        return remaining if remaining > Decimal("0") else Decimal("0")
+
     def dte(self, today: dt.date) -> int:
         """Calendar days to expiry. Needs no market data, which is why the
         21-DTE rule keeps working when the quote feed does not."""
@@ -337,6 +394,7 @@ class OpenPosition:
             "close_order_id": self.close_order_id,
             "close_perm_id": self.close_perm_id,
             "filled_quantity": str(self.filled_quantity),
+            "close_filled_quantity": str(self.close_filled_quantity),
             "commission": str(self.commission) if self.commission is not None else None,
             "uncertainty": self.uncertainty,
             "legs": [
@@ -418,6 +476,12 @@ class OpenPosition:
             close_perm_id=_int_or_none(record.get("close_perm_id")),
             filled_quantity=(
                 _decimal_or_none(record.get("filled_quantity")) or Decimal("0")
+            ),
+            # Absent from every line written before this field existed, which is
+            # why it defaults rather than raising: an older journal must still
+            # replay, and "we never recorded a closing fill" is exactly zero.
+            close_filled_quantity=(
+                _decimal_or_none(record.get("close_filled_quantity")) or Decimal("0")
             ),
             commission=_decimal_or_none(record.get("commission")),
             uncertainty=record.get("uncertainty") or None,
@@ -913,7 +977,20 @@ class PositionStore:
             )
 
         if kind == PositionEvent.CLOSE_PARTIAL.value:
-            return _replace(current, state=PositionState.CLOSING)
+            # The quantity used to be dropped here. ``record_partial_fill``
+            # wrote it to the journal and this branch replayed only the state,
+            # so a cancelled-after-partial exit reloaded as "closing, amount
+            # unknown" -- the contracts that got out and the ones still held
+            # were indistinguishable on disk. Monotonic for the same reason the
+            # opening side is: IBKR reports cumulative fills and re-sends
+            # callbacks freely, so the smaller of two deliveries is never the
+            # newer fact.
+            quantity = _decimal_or_none(event.get("filled_quantity")) or Decimal("0")
+            return _replace(
+                current,
+                state=PositionState.CLOSING,
+                close_filled_quantity=max(quantity, current.close_filled_quantity),
+            )
 
         if kind in (
             PositionEvent.OPEN_UNCERTAIN.value,
@@ -978,6 +1055,13 @@ class PositionStore:
                 state=PositionState.CLOSED,
                 closed_at=closed_at,
                 closing_debit=_decimal_or_none(event.get("closing_debit")),
+                # A completed close retires everything that was held, so the
+                # closing count catches up to the opening one. Without this a
+                # CLOSED position that partially filled first would still report
+                # a positive ``remaining_quantity`` -- contracts nobody holds.
+                close_filled_quantity=max(
+                    current.close_filled_quantity, current.filled_quantity
+                ),
             )
 
         if kind == PositionEvent.CLOSE_FAILED.value:

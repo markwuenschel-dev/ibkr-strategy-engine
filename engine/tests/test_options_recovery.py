@@ -30,7 +30,7 @@ import datetime as dt
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from uuid import UUID, uuid4
 
 from engine.config import EngineConfig
@@ -52,7 +52,7 @@ from engine.options.marketdata import (
     OptionQuote,
     UnderlyingQuote,
 )
-from engine.options.orderstate import OrderLifecycleState
+from engine.options.orderstate import OrderLifecycleState, snapshot_from_trade
 from engine.options.policy import RiskPolicy
 from engine.options.portfolio import PortfolioSnapshot, PositionExposure
 from engine.options.ports import StrategyQuoteSnapshot
@@ -63,6 +63,7 @@ from engine.options.positions import (
 )
 from engine.options.runner import RunReport, run_once
 from engine.options.selection import Bias
+from engine.options.sink import LifecycleRecorder
 from engine.safety import SafetyGate
 
 D = Decimal
@@ -300,6 +301,27 @@ SCRIPT_STALE_SMALLER_FILL: tuple[Callback, ...] = (
 )
 
 
+def cancelled_empty(*, done: bool) -> Callback:
+    """Cancelled with nothing filled -- a terminal refusal, still being polled."""
+    return Callback(status="Cancelled", filled=0.0, done=done)
+
+
+#: A terminal cancel, then a *stale earlier status* re-delivered after it, then
+#: the cancel again. This is the sequence that exercises the progression guard
+#: rather than the fill-count guard: the re-delivered ``Submitted`` carries no
+#: new fill, so nothing but its **rank** marks it as old news. Without the
+#: guard it would walk the recorder's idea of the state back to ACKNOWLEDGED,
+#: and the next cancel would then look like a fresh terminal verdict and append
+#: a second OPEN_FAILED for one order that failed once.
+SCRIPT_STALE_STATUS_AFTER_TERMINAL: tuple[Callback, ...] = (
+    SUBMITTED,
+    ACKNOWLEDGED,
+    cancelled_empty(done=False),
+    ACKNOWLEDGED,
+    cancelled_empty(done=True),
+)
+
+
 class _Status:
     """The ``orderStatus`` shape ``snapshot_from_trade`` reads."""
 
@@ -339,12 +361,14 @@ class ScriptedTrade:
         perm_id: int,
         total_quantity: float,
         limit_price: float,
+        observer: Callable[[int], None] | None = None,
     ) -> None:
         if not script:
             raise ValueError("a scripted trade needs at least one callback")
         self.order = _Order(order_id=order_id, perm_id=perm_id)
         self.polls = 0
         self._index = 0
+        self._observer = observer
         self._script = tuple(
             _resolve(callback, total=total_quantity, limit=limit_price)
             for callback in script
@@ -374,6 +398,13 @@ class ScriptedTrade:
         Answer-then-advance rather than advance-then-answer, so the first poll
         observes the first scripted state instead of skipping it.
         """
+        # Called *before* this poll's emission, so an observer sees the store
+        # exactly as a process dying at this instant would have left it on
+        # disk. That is the only way to prove persistence is callback-driven
+        # rather than final-snapshot-driven: reading the store after the loop
+        # cannot distinguish the two, because both end up correct.
+        if self._observer is not None:
+            self._observer(self.polls)
         self.polls += 1
         done = self.current.done
         if self._index + 1 < len(self._script):
@@ -448,6 +479,7 @@ class ScriptedIB:
         today: dt.date = TODAY,
         connected_polls: int | None = None,
         place_error: str | None = None,
+        observer: Callable[[int], None] | None = None,
     ) -> None:
         if not scripts:
             raise ValueError("ScriptedIB needs at least one script")
@@ -455,6 +487,8 @@ class ScriptedIB:
         self.scripts = scripts
         self.connected_polls = connected_polls
         self.place_error = place_error
+        #: Called once per poll, before that poll's observation is persisted.
+        self.observer = observer
         self.placed: list[tuple[Any, Any]] = []
         self.trades: list[ScriptedTrade] = []
         self.slept = 0.0
@@ -506,6 +540,7 @@ class ScriptedIB:
             perm_id=8800 + len(self.trades),
             total_quantity=float(getattr(order, "totalQuantity", 1)),
             limit_price=float(getattr(order, "lmtPrice", 0.0)),
+            observer=self.observer,
         )
         self.trades.append(trade)
         return trade
@@ -1686,3 +1721,385 @@ class TestIntermediateTransitionsArePersisted:
         assert names.count(PositionEvent.OPEN_PARTIAL.value) <= 2, names
         held = store.open_positions()
         assert len(held) == 1
+
+
+# ===========================================================================
+# What is on disk *while* the order is still working
+# ===========================================================================
+
+
+def _book_watcher(store: PositionStore) -> tuple[list[dict[str, Any]], Any]:
+    """An observer that photographs the store before each poll is persisted.
+
+    The list it fills is the durable state a process dying at that instant
+    would have left behind, one entry per poll. Reading the store *after* the
+    loop proves nothing about when anything was written -- a final-snapshot
+    implementation ends up equally correct there, which is precisely why the
+    original defect survived so long.
+    """
+    timeline: list[dict[str, Any]] = []
+
+    def watch(poll: int) -> None:
+        for strategy_id, position in store.positions().items():
+            timeline.append(
+                {
+                    "poll": poll,
+                    "strategy_id": strategy_id,
+                    "state": position.state,
+                    "order_id": position.open_order_id,
+                    "perm_id": position.open_perm_id,
+                    "filled": position.filled_quantity,
+                }
+            )
+
+    return timeline, watch
+
+
+class TestTheStoreDoesNotLagTheBroker:
+    """Identity and exposure reach disk when observed, not when polling ends.
+
+    The class above proves the *log* keeps every transition. These prove the
+    stronger and more useful thing: that each fact was durable at the poll that
+    observed it. Every assertion here reads the store from inside ``isDone()``,
+    so it fails if persistence is moved back to after the loop even though the
+    finished log would still look identical.
+    """
+
+    def test_the_broker_identifiers_are_durable_before_the_first_poll_answers(
+        self, tmp_path: Path
+    ) -> None:
+        """``orderId`` and ``permId`` are the only things that let a restart find
+        this order at the broker. They exist the instant ``placeOrder`` returns,
+        so waiting for a terminal status to write them is a window in which a
+        crash leaves an order nobody can look up."""
+        store = store_for(tmp_path)
+        timeline, watch = _book_watcher(store)
+        ib = ScriptedIB(scripts=(SCRIPT_PARTIAL_THEN_FILLED,), observer=watch)
+
+        run_pass(
+            FakeBroker(ib=ib),
+            gate_for(tmp_path),
+            store,
+            armed=True,
+            policy=sized_policy(contracts=3),
+        )
+
+        first = [row for row in timeline if row["poll"] == 0]
+        assert first, timeline
+        # The values the fake minted, not merely "not None" -- an assertion that
+        # only checks presence passes against an implementation that writes a
+        # placeholder.
+        assert [row["order_id"] for row in first] == [70]
+        assert [row["perm_id"] for row in first] == [8800]
+
+    def test_a_partial_fill_is_durable_at_the_poll_that_observed_it(
+        self, tmp_path: Path
+    ) -> None:
+        """One lot of three is in the market. If the socket drops on the next
+        poll, the store must already say so -- this is the transition the
+        pre-sink implementation lost, and losing it means a live spread recorded
+        as an order that never filled."""
+        store = store_for(tmp_path)
+        timeline, watch = _book_watcher(store)
+        ib = ScriptedIB(scripts=(SCRIPT_PARTIAL_THEN_FILLED,), observer=watch)
+
+        run_pass(
+            FakeBroker(ib=ib),
+            gate_for(tmp_path),
+            store,
+            armed=True,
+            policy=sized_policy(contracts=3),
+        )
+
+        # The order ends completely filled at three. A store that only learned
+        # the outcome after the loop would show 0 for every poll and then 3.
+        assert any(row["filled"] == D("1") for row in timeline), timeline
+        assert store.get(timeline[0]["strategy_id"]).filled_quantity == D("3")
+
+    def test_the_partial_is_recorded_before_the_fill_that_supersedes_it(
+        self, tmp_path: Path
+    ) -> None:
+        """Ordering, not just presence: the 1 must appear on an *earlier* poll
+        than the 3, or the store is still learning both at the end."""
+        store = store_for(tmp_path)
+        timeline, watch = _book_watcher(store)
+        ib = ScriptedIB(scripts=(SCRIPT_PARTIAL_THEN_FILLED,), observer=watch)
+
+        run_pass(
+            FakeBroker(ib=ib),
+            gate_for(tmp_path),
+            store,
+            armed=True,
+            policy=sized_policy(contracts=3),
+        )
+
+        polls_at_one = [row["poll"] for row in timeline if row["filled"] == D("1")]
+        polls_at_three = [row["poll"] for row in timeline if row["filled"] == D("3")]
+        assert polls_at_one, timeline
+        assert polls_at_three, timeline
+        assert min(polls_at_one) < min(polls_at_three)
+
+    def test_the_recorded_fill_never_decreases_across_the_whole_poll_sequence(
+        self, tmp_path: Path
+    ) -> None:
+        """The monotonic property as a property, over every observation rather
+        than over the two the other tests happen to name. IBKR re-sends
+        callbacks and delivers fills out of order with respect to status, so a
+        smaller number arriving later is ordinary and must never win."""
+        store = store_for(tmp_path)
+        timeline, watch = _book_watcher(store)
+        ib = ScriptedIB(scripts=(SCRIPT_STALE_SMALLER_FILL,), observer=watch)
+
+        run_pass(
+            FakeBroker(ib=ib),
+            gate_for(tmp_path),
+            store,
+            armed=True,
+            policy=sized_policy(contracts=3),
+        )
+
+        seen = [row["filled"] for row in timeline]
+        assert seen == sorted(seen), seen
+        assert max(seen) == D("2"), seen
+
+    def test_a_stale_earlier_status_does_not_re_fire_a_terminal_verdict(
+        self, tmp_path: Path
+    ) -> None:
+        """The progression guard, which the fill-count guard cannot cover.
+
+        A re-delivered ``Submitted`` after a cancel carries no new fill, so
+        nothing about its *numbers* marks it as stale -- only its rank does.
+        Let it through and the recorder's idea of the state walks backwards,
+        and the next cancel reads as a fresh verdict: one order that failed
+        once, recorded as having failed twice.
+        """
+        ib = ScriptedIB(scripts=(SCRIPT_STALE_STATUS_AFTER_TERMINAL,))
+        store = store_for(tmp_path)
+
+        run_pass(FakeBroker(ib=ib), gate_for(tmp_path), store, armed=True)
+
+        names = event_names(store)
+        assert names.count(PositionEvent.OPEN_FAILED.value) == 1, names
+
+    def test_a_crash_mid_poll_leaves_a_store_a_restart_reads_without_transmitting(
+        self, tmp_path: Path
+    ) -> None:
+        """The end-to-end recovery property, with nothing hand-seeded.
+
+        A real ``place_combo`` is interrupted mid-poll by a dropped socket, and
+        then everything in memory is thrown away: the store object, the
+        recorder and its cache, and the broker connection. A second pass is
+        built from the **journal file alone**, against a fully healthy broker
+        that would happily accept an order. It must send nothing.
+        """
+        path = tmp_path / "state" / "positions.jsonl"
+        first_store = PositionStore(path)
+        dropped = ScriptedIB(
+            scripts=(SCRIPT_PARTIAL_STILL_WORKING,), connected_polls=2
+        )
+
+        run_pass(
+            FakeBroker(ib=dropped),
+            gate_for(tmp_path),
+            first_store,
+            armed=True,
+            policy=sized_policy(contracts=3),
+        )
+        assert len(dropped.placed) == 1
+
+        # The crash. Only the file survives.
+        del first_store
+        restarted = PositionStore(path)
+        stranded = restarted.open_positions()
+        assert len(stranded) == 1, [p.describe() for p in stranded]
+        assert stranded[0].is_uncertain, stranded[0].describe()
+        # The identifiers came from the interrupted poll loop, not from a test
+        # fixture -- which is what makes the order findable at the broker.
+        assert stranded[0].open_order_id == 70
+        assert stranded[0].open_perm_id == 8800
+
+        healthy = ScriptedIB(scripts=(SCRIPT_CLEAN_FILL,))
+        report = run_pass(
+            FakeBroker(ib=healthy, positions=(("SPY", -1, 100.0),)),
+            gate_for(tmp_path),
+            restarted,
+            armed=True,
+        )
+
+        assert healthy.placed == [], report.describe()
+        assert "RUNNER_UNRESOLVED_ORDER" in report.refusal_codes
+
+
+# ===========================================================================
+# The closing order has its own fill count
+# ===========================================================================
+
+
+def _replayed_close_trade() -> ScriptedTrade:
+    """The partial-close observation re-delivered verbatim after a restart.
+
+    Carries the identifiers ``ScriptedIB`` minted for the exit, because that is
+    what a reconnecting client would see: the same order, the same permId, the
+    same one lot already filled. Nothing here is new information, and the
+    recorder has to recognise that from the store alone.
+    """
+    return ScriptedTrade(
+        (partial(1.0),),
+        order_id=70,
+        perm_id=8800,
+        total_quantity=3.0,
+        limit_price=-0.5,
+    )
+
+
+class TestTheClosingFillIsPersistedToo:
+    """An exit can partially fill, and until now the amount was thrown away.
+
+    ``record_partial_fill(closing=True)`` wrote the quantity to the journal and
+    the replay ignored it, so a cancelled-after-partial exit reloaded as
+    "closing, amount unknown": the contracts that got out and the ones still
+    held were indistinguishable on disk. That is the mirror of the opening-side
+    defect the ledger records as C21, on the side where the position is being
+    retired rather than taken on.
+    """
+
+    def _partially_closed(self, tmp_path: Path) -> tuple[PositionStore, UUID]:
+        """Run a real exit that fills one of three lots and is then cancelled."""
+        ib = ScriptedIB(scripts=(SCRIPT_PARTIAL_THEN_CANCELLED,))
+        store = store_for(tmp_path)
+        # Blocks the entry path, so the single scripted order is the exit and
+        # the assertions below cannot be reading a fresh opening order.
+        seed_uncertain_position(store, dte=40)
+        held = seed_open_position(store, dte=10, quantity=3)
+
+        run_pass(
+            FakeBroker(ib=ib, positions=(("SPY", -3, 100.0),)),
+            gate_for(tmp_path),
+            store,
+            armed=True,
+        )
+        assert len(ib.placed) == 1
+        return store, held.strategy_id
+
+    def test_a_partial_close_records_how_much_of_the_exit_filled(
+        self, tmp_path: Path
+    ) -> None:
+        store, strategy_id = self._partially_closed(tmp_path)
+
+        assert PositionEvent.CLOSE_PARTIAL.value in event_names(store)
+        position = store.get(strategy_id)
+        assert position is not None
+        assert position.state is PositionState.CLOSING
+        assert position.close_filled_quantity == D("1")
+
+    def test_the_contracts_still_held_are_derivable_after_a_partial_close(
+        self, tmp_path: Path
+    ) -> None:
+        """Three were opened and one got out, so two are still in the market.
+
+        Before the closing fill was persisted this number did not exist at all:
+        ``filled_quantity`` still said three and nothing recorded the one.
+        """
+        store, strategy_id = self._partially_closed(tmp_path)
+
+        position = store.get(strategy_id)
+        assert position is not None
+        assert position.filled_quantity == D("3")
+        assert position.remaining_quantity == D("2")
+        assert position.is_partially_closed is True
+
+    def test_the_closing_fill_survives_a_restart(self, tmp_path: Path) -> None:
+        """It has to round-trip through ``to_record``/``from_record`` as well as
+        through the replay, or a restart silently resets it to zero."""
+        store, strategy_id = self._partially_closed(tmp_path)
+
+        restarted = PositionStore(store.path)
+        position = restarted.get(strategy_id)
+        assert position is not None
+        assert position.close_filled_quantity == D("1")
+        assert position.remaining_quantity == D("2")
+
+    def test_a_duplicate_closing_partial_does_not_double_the_closed_amount(
+        self, tmp_path: Path
+    ) -> None:
+        """Store-level, mirroring the opening-side test above: the guarantee has
+        to hold on the *disk replay*, because the recorder's cache dies with the
+        process and a restart replays the log with nothing in memory."""
+        store = store_for(tmp_path)
+        intent = seed_open_position(store, dte=10, quantity=3)
+        store.record_close_submitted(intent.strategy_id, at=NOW)
+        for _ in range(2):
+            store.record_partial_fill(
+                intent.strategy_id, at=NOW, filled_quantity=D("1"), closing=True
+            )
+
+        position = store.get(intent.strategy_id)
+        assert position is not None
+        assert position.close_filled_quantity == D("1")
+
+    def test_a_stale_smaller_closing_partial_never_walks_it_backwards(
+        self, tmp_path: Path
+    ) -> None:
+        store = store_for(tmp_path)
+        intent = seed_open_position(store, dte=10, quantity=3)
+        store.record_close_submitted(intent.strategy_id, at=NOW)
+        store.record_partial_fill(
+            intent.strategy_id, at=NOW, filled_quantity=D("2"), closing=True
+        )
+        store.record_partial_fill(
+            intent.strategy_id, at=NOW, filled_quantity=D("1"), closing=True
+        )
+
+        position = store.get(intent.strategy_id)
+        assert position is not None
+        assert position.close_filled_quantity == D("2")
+        assert position.remaining_quantity == D("1")
+
+    def test_a_completed_close_retires_everything_that_was_held(
+        self, tmp_path: Path
+    ) -> None:
+        """A position that partially filled its exit and then completed it holds
+        nothing. Leaving the closing count at the partial would report contracts
+        nobody owns."""
+        store = store_for(tmp_path)
+        intent = seed_open_position(store, dte=10, quantity=3)
+        store.record_close_submitted(intent.strategy_id, at=NOW)
+        store.record_partial_fill(
+            intent.strategy_id, at=NOW, filled_quantity=D("1"), closing=True
+        )
+        store.record_close_filled(intent.strategy_id, at=NOW, closing_debit=D("0.50"))
+
+        position = store.get(intent.strategy_id)
+        assert position is not None
+        assert position.state is PositionState.CLOSED
+        assert position.close_filled_quantity == D("3")
+        assert position.remaining_quantity == D("0")
+        assert position.is_partially_closed is False
+
+    def test_a_recorder_built_after_a_restart_does_not_re_append_a_closing_fill(
+        self, tmp_path: Path
+    ) -> None:
+        """The seeding half of the same property.
+
+        ``LifecycleRecorder`` seeded only the *opening* order, so a restart
+        mid-close came back believing nothing had filled on the exit and the
+        first callback after recovery re-appended a fill the store already
+        held. Re-delivering the exact observation must now write nothing.
+        """
+        store, strategy_id = self._partially_closed(tmp_path)
+        before = len(event_names(store))
+
+        restarted = PositionStore(store.path)
+        recorder = LifecycleRecorder(restarted)
+        wrote = recorder.observe(
+            strategy_id,
+            snapshot_from_trade(
+                _replayed_close_trade(),
+                observed_at=NOW,
+                quantity=3,
+            ),
+            closing=True,
+        )
+
+        assert wrote is False
+        assert len(event_names(restarted)) == before
