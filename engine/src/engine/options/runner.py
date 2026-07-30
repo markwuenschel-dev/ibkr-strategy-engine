@@ -34,7 +34,7 @@ from __future__ import annotations
 import datetime as dt
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from ..errors import EngineError, RefusedError
@@ -76,11 +76,29 @@ from .selection import (
 )
 from .transmit import TransmitResult, authorize_close, authorize_open, place_combo
 
-__all__ = ["RunReport", "run_once", "mark_from_snapshot", "CONFIG_VERSION"]
+__all__ = [
+    "RunReport",
+    "run_once",
+    "mark_from_snapshot",
+    "CONFIG_VERSION",
+    "EntryPreflight",
+]
 
 CONFIG_VERSION = "options-runner/1"
 
 ZERO = Decimal("0")
+
+#: A last check between "every gate approved" and "mint the authorization".
+#:
+#: It exists so a *bounded* caller -- currently only the execution proof -- can
+#: add constraints the strategy policy has no field for, without either editing
+#: the policy or reimplementing the pipeline. Returning a string refuses the
+#: entry as an ordinary blocker; returning ``None`` allows it.
+#:
+#: Deliberately cannot *widen* anything. It runs after every risk and governor
+#: check has already passed, so the only thing a preflight can do is refuse an
+#: entry the engine was otherwise willing to make.
+EntryPreflight = Callable[..., "str | None"]
 
 
 @dataclass
@@ -254,6 +272,7 @@ def _manage_one(
     now: dt.datetime,
     today: dt.date,
     account: str,
+    configuration_version: str,
     report: RunReport,
 ) -> None:
     """Decide and, if the decision acts, send the exit."""
@@ -310,7 +329,7 @@ def _manage_one(
         position,
         strategy_id=uuid4(),
         created_at=now,
-        configuration_version=CONFIG_VERSION,
+        configuration_version=configuration_version,
         limit_price=limit_price,
         quantity=position.manageable_quantity,
     )
@@ -433,6 +452,7 @@ def _build_candidate(
     minimum_dte: int,
     maximum_dte: int,
     strike_window: int,
+    configuration_version: str,
     report: RunReport,
 ) -> tuple[OptionStrategyIntent | None, StrategyQuoteSnapshot | None]:
     """Chain -> quotes -> delta selection -> a validated opening intent."""
@@ -521,7 +541,7 @@ def _build_candidate(
         selection,
         credit=credit,
         policy=policy,
-        configuration_version=CONFIG_VERSION,
+        configuration_version=configuration_version,
         created_at=now,
     )
     if intent is None:
@@ -551,12 +571,32 @@ def run_once(
     minimum_iv_rank: Decimal = Decimal("50"),
     strike_window: int = 24,
     account: str = "",
+    configuration_version: str = CONFIG_VERSION,
+    enforce_iv_rank: bool = True,
+    entry_preflight: EntryPreflight | None = None,
+    sink: Any = None,
 ) -> RunReport:
     """Reconcile, manage every open position, then consider one new entry.
 
     Returns a report rather than raising, except for the kill switch -- a halted
     engine stops before it does anything at all, and that is the one condition
     that should reach the caller as an exception rather than a line in a report.
+
+    The last four arguments exist for the execution proof and default to exactly
+    what the strategy path has always done, so a caller that ignores them gets
+    the previous behaviour byte for byte.
+
+    ``enforce_iv_rank`` is the only one that can *loosen* anything, and it
+    loosens precisely one thing: an opinion about whether now is a good moment
+    to sell premium. It is not a safety property, and no other filter is
+    reachable through it. Every gate that answers "is this order survivable"
+    runs unconditionally below, whatever this is set to.
+
+    ``entry_preflight`` runs after every risk and governor check has passed and
+    before the authorization token is minted, and can only refuse. ``sink``
+    replaces the default :class:`~engine.options.sink.LifecycleRecorder` -- a
+    caller that supplies one is responsible for it still reaching the store,
+    which is why the proof wraps rather than replaces the recorder.
     """
     now = now or dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
     today = today or now.date()
@@ -568,7 +608,7 @@ def run_once(
     # Seeded from the store, so a recorder built after a restart already knows
     # what the previous process persisted and will not re-append transitions it
     # can already see on disk.
-    recorder = LifecycleRecorder(store)
+    recorder: Any = LifecycleRecorder(store) if sink is None else sink
 
     try:
         # -- 1. reconcile -------------------------------------------------
@@ -596,6 +636,7 @@ def run_once(
                 now=now,
                 today=today,
                 account=account,
+                configuration_version=configuration_version,
                 report=report,
             )
 
@@ -633,21 +674,29 @@ def run_once(
             minimum_dte=minimum_dte,
             maximum_dte=maximum_dte,
             strike_window=strike_window,
+            configuration_version=configuration_version,
             report=report,
         )
         report.candidate = candidate
         if candidate is None:
             return report
 
+        # The one filter a bounded caller may switch off, and only because it is
+        # an opinion about timing rather than a statement about survivability.
+        # The refusal code is still recorded when it is off, so a proof run's
+        # journal says plainly that the filter would have refused.
         if report.iv_rank is None or not report.iv_rank.meets(minimum_iv_rank):
             actual = (
                 report.iv_rank.iv_rank
                 if report.iv_rank and report.iv_rank.iv_rank is not None
                 else "unavailable"
             )
-            report.blockers.append(
-                f"IV Rank {actual} is below the {minimum_iv_rank} entry filter"
-            )
+            if enforce_iv_rank:
+                report.blockers.append(
+                    f"IV Rank {actual} is below the {minimum_iv_rank} entry filter"
+                )
+            else:
+                report.refusal_codes.append("OPTIONS_IV_RANK_FILTER_BYPASSED")
 
         margin = IBKRWhatIfAdapter(ib).what_if(candidate, observed_at=now)
 
@@ -693,6 +742,27 @@ def run_once(
 
         if report.blockers:
             return report
+
+        # -- 3b. the caller's own last word --------------------------------
+        # After every engine gate, before the token exists. A refusal here means
+        # no TransmitAuthorization is ever minted for this candidate, rather than
+        # one being minted and then not used.
+        if entry_preflight is not None:
+            try:
+                refusal = entry_preflight(
+                    intent=candidate,
+                    snapshot=snapshot,
+                    market_data=market_data,
+                    policy=policy,
+                    now=now,
+                    armed=armed,
+                )
+            except Exception as exc:  # noqa: BLE001 - a broken preflight refuses
+                refusal = f"the entry preflight raised {type(exc).__name__}: {exc}"
+            if refusal:
+                report.blockers.append(f"entry preflight: {refusal}")
+                report.refusal_codes.append("OPTIONS_ENTRY_PREFLIGHT_REFUSED")
+                return report
 
         # -- 4. authorize and transmit -------------------------------------
         try:

@@ -180,6 +180,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--market-data-type", type=int, default=1, choices=[1, 2, 3, 4]
     )
     verify.add_argument(
+        "--execution-proof",
+        action="store_true",
+        help=(
+            "run the bounded execution proof instead of an ordinary armed pass: "
+            "SPY only, one 1-wide vertical, quantity 1, defined loss <= $100, "
+            "broker margin <= $150, stress loss <= $100, one opening order. The "
+            "IV Rank filter is off -- this is a lifecycle test, not a strategy "
+            "signal -- and every safety gate still runs. Requires --arm to send."
+        ),
+    )
+    verify.add_argument(
         "--arm",
         action="store_true",
         help=(
@@ -486,7 +497,15 @@ def cmd_options_verify_execution(
     rather than reimplementing the pipeline, it cannot drift from what the armed
     command does. A verification path with its own copy of the gates would prove
     something about the copy.
+
+    With ``--execution-proof`` it becomes a different and much narrower thing:
+    a bounded operational test of the broker's execution lifecycle, run under
+    :class:`engine.options.proof.ExecutionProofProfile` rather than under the
+    strategy's own policy. See :func:`cmd_options_execution_proof`.
     """
+    if getattr(args, "execution_proof", False):
+        return cmd_options_execution_proof(args, broker_factory)
+
     from decimal import Decimal
 
     from .options.adapters import IBKRLiveMarketDataAdapter, IBKRPortfolioStateAdapter
@@ -566,6 +585,217 @@ def cmd_options_verify_execution(
         note(
             "armed, and nothing was transmitted -- a gate refused first. The "
             "refusal codes above say which."
+        )
+    return EXIT_OK
+
+
+def cmd_options_execution_proof(
+    args: argparse.Namespace, broker_factory: Any = Broker
+) -> int:
+    """The bounded execution proof. Not a strategy pass, and it says so.
+
+    Two things make this different from ``options-verify-execution --arm``, and
+    both are the point of the command existing:
+
+    **Its bounds come from a schema, not the environment.** The policy it runs
+    under is :meth:`ExecutionProofProfile.derive_policy`, which folds the proof's
+    ceilings into whatever ``IBKR_OPTIONS_*`` says using ``min()`` -- so an
+    environment variable can make this run stricter and can never make it looser.
+    The profile's fingerprint is printed before anything happens, so what the run
+    was bounded by is a fact on the operator's screen rather than an inference
+    from a config file.
+
+    **It does not claim to be the strategy signal.** The IV Rank filter is off,
+    deliberately, and the refusal code that would have fired is recorded anyway.
+    Every gate that answers "is this survivable if it fills" -- provenance,
+    freshness, defined-risk construction, maximum loss, broker what-if margin,
+    stress loss, portfolio reconciliation, the authorization token, the kill
+    switch, the paper port and durable persistence -- runs untouched, because
+    this reaches them through the same :func:`engine.options.runner.run_once`
+    the armed strategy command uses.
+    """
+    from decimal import Decimal
+
+    from .options.adapters import IBKRLiveMarketDataAdapter, IBKRPortfolioStateAdapter
+    from .options.positions import PositionStore
+    from .options.proof import (
+        PROOF_CONFIGURATION_VERSION,
+        ExecutionProofProfile,
+        OpeningOrderBudget,
+        ProofEntryPreflight,
+        RecordingLifecycleSink,
+        new_proof_session_id,
+    )
+    from .options.runner import run_once
+    from .options.selection import Bias
+    from .options.sink import LifecycleRecorder
+
+    config = config_from(args)
+
+    # Constructed before the journal, before the gate and long before a socket.
+    # A non-paper port or a symbol other than SPY is refused here, as a
+    # ConfigError, with nothing yet opened -- which is the earliest any of the
+    # proof's bounds can possibly be checked.
+    profile = ExecutionProofProfile(
+        port=config.port,
+        account=config.account_id,
+        symbol=args.symbol.strip().upper(),
+    )
+
+    journal = OrderJournal(config.journal_path)
+    journal.preflight()
+
+    gate = SafetyGate(config, journal)
+    gate.assert_not_halted()
+
+    policy = profile.derive_policy()
+    store = PositionStore(config.state_dir / "positions.jsonl")
+    session_id = new_proof_session_id()
+
+    out("EXECUTION PROOF")
+    out(f"  session        {session_id}")
+    out(f"  venue          {config.venue} ({config.host}:{config.port})")
+    out(f"  armed          {'YES -- one order may be sent' if args.arm else 'NO'}")
+    out(profile.describe())
+    out("")
+    out("EFFECTIVE POLICY (proof ceilings folded into the environment)")
+    out(policy.describe())
+    out("")
+
+    budget = OpeningOrderBudget(limit=profile.maximum_opening_orders)
+    preflight = ProofEntryPreflight(profile=profile, budget=budget, emit=out)
+    capture = RecordingLifecycleSink(inner=LifecycleRecorder(store))
+
+    with broker_factory(config, journal) as broker:
+        report = run_once(
+            broker,
+            gate=gate,
+            journal=journal,
+            store=store,
+            policy=policy,
+            armed=bool(args.arm),
+            symbol=profile.symbol,
+            bias=Bias(args.bias),
+            market_data=IBKRLiveMarketDataAdapter(
+                broker.ib, requested_type=args.market_data_type
+            ),
+            portfolio=IBKRPortfolioStateAdapter(broker),
+            target_dte=args.dte,
+            minimum_iv_rank=Decimal(str(args.min_iv_rank)),
+            account=config.account_id,
+            configuration_version=PROOF_CONFIGURATION_VERSION,
+            enforce_iv_rank=False,
+            entry_preflight=preflight,
+            sink=capture,
+        )
+
+        # Restart reconciliation, in the same connection but through a *fresh*
+        # store and a fresh recorder. This is the question a proof exists to
+        # answer and a normal run cannot: would a process that started just now,
+        # knowing only what is on disk, agree with the broker about what is
+        # held? Reusing the store above would prove only that an object agrees
+        # with itself.
+        replayed = PositionStore(config.state_dir / "positions.jsonl")
+        try:
+            restart = replayed.reconcile_against_broker(
+                broker.positions(), checked_at=utc_now()
+            )
+        except Exception as exc:  # noqa: BLE001 - reporting must not crash the proof
+            restart = None
+            report.errors.append(f"restart reconciliation failed: {exc}")
+
+    out("")
+    out(report.describe())
+    out("")
+
+    out("ORDER IDENTITY")
+    if report.candidate is not None:
+        out(f"  intent id      {report.candidate.strategy_id}")
+        out(f"  orderRef       {report.candidate.strategy_id}")
+        out(f"  configuration  {report.candidate.configuration_version}")
+    else:
+        out("  no candidate was built, so no order identity exists")
+    for result in report.transmissions:
+        out(f"  orderId        {result.order_id}")
+        out(f"  permId         {result.perm_id}")
+        out(f"  state          {result.state.value}")
+        out(f"  filled         {result.filled}")
+        out(f"  average price  {result.average_price}")
+        if result.snapshot is not None:
+            out(f"  remaining      {result.snapshot.remaining}")
+            out(f"  commission     {result.snapshot.commission}")
+            if result.snapshot.message:
+                out(f"  broker text    {result.snapshot.message}")
+    out(f"  profile hash   {profile.fingerprint()}")
+    out(f"  audit tag      {profile.audit_tag}")
+    out("")
+
+    out(f"BROKER LIFECYCLE  {len(capture.observations)} observation(s), as heard")
+    if not capture.observations:
+        out("  none -- nothing reached the order-placement step")
+    for line in capture.timeline():
+        out(line)
+    out("")
+
+    out("DURABLE STORE EVENTS")
+    events = list(store.events())
+    if not events:
+        out("  no position events were written")
+    for event in events[-24:]:
+        out(
+            f"  {str(event.get('at', ''))[:19]}  {str(event.get('event', '')):<22}"
+            f"  order={event.get('order_id')} perm={event.get('perm_id')}"
+        )
+    integrity = store.integrity_errors()
+    out(f"  integrity      {'clean' if not integrity else f'{len(integrity)} bad'}")
+    for problem in integrity:
+        out(f"    {problem}")
+    out("")
+
+    out("RESTART RECONCILIATION (a fresh store, replayed from disk)")
+    out(restart.describe() if restart is not None else "  could not be run")
+    out("")
+
+    out("SESSION BUDGET")
+    out(f"  opening orders {budget.spent} of {budget.limit} used")
+    if preflight.envelope is not None:
+        out(f"  price envelope {preflight.envelope.describe()}")
+        out(f"  credit at send {preflight.credit_at_send}")
+    if preflight.refusal:
+        out(f"  refused by     {preflight.refusal}")
+
+    journal.record(
+        "options_execution_proof",
+        audit_tag=profile.audit_tag,
+        session_id=str(session_id),
+        profile_fingerprint=profile.fingerprint(),
+        profile=profile.to_record(),
+        armed=bool(args.arm),
+        opening_orders_used=budget.spent,
+        price_envelope=(
+            preflight.envelope.to_record() if preflight.envelope is not None else None
+        ),
+        credit_at_send=(
+            str(preflight.credit_at_send)
+            if preflight.credit_at_send is not None
+            else None
+        ),
+        preflight_refusal=preflight.refusal,
+        observations=capture.to_record(),
+        restart_reconciliation=(restart.to_record() if restart is not None else None),
+        run=report.to_record(),
+    )
+
+    out("")
+    if not args.arm:
+        note(
+            "not armed: every bound and every gate above was evaluated and "
+            "nothing was sent. Pass --execution-proof --arm to send one order."
+        )
+    elif not report.transmissions:
+        note(
+            "armed, and nothing was sent -- a bound or a gate refused first. The "
+            "blockers and refusal codes above say which."
         )
     return EXIT_OK
 

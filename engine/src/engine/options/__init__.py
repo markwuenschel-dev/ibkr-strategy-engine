@@ -27,6 +27,7 @@ from .governor import GovernorRefusalReason, GovernorVerdict, PortfolioGovernor
 from .policy import RiskPolicy
 from .portfolio import PortfolioSnapshot, PositionExposure
 from .positions import OpenPosition, PositionState, PositionStore
+from .proof import ExecutionProofProfile, PriceEnvelope
 from .risk import (
     CandidateRiskAssessment,
     CheckResult,
@@ -63,6 +64,8 @@ __all__ = [
     "OpenPosition",
     "PositionState",
     "PositionStore",
+    "ExecutionProofProfile",
+    "PriceEnvelope",
     "TransmitAuthorization",
     "TransmitResult",
     "authorize_open",
