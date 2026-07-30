@@ -8,12 +8,18 @@ without any of those needing to know how the others work.
 
 Three orderings here are load-bearing.
 
-**Reconcile first, and let disagreement stop entries but not exits.** If the
-store and the broker disagree about what is held, the engine does not know the
-book -- so opening more risk is refused. Managing existing positions is not, and
-must not be: the disagreement might be precisely a position that needs closing,
-and a reconciler that locks the exits would turn a bookkeeping problem into a
-market problem.
+**Reconcile first, and let anything short of agreement stop entries but not
+exits.** Reconciliation ends on one of four named outcomes -- RECONCILED,
+DISAGREEMENT, UNAVAILABLE, CORRUPT -- and only the first opens new risk. There
+is deliberately no fifth "we did not get round to asking" state: an unanswered
+question used to leave the result absent, and the entry gate read that absence
+as permission, so a broker that threw authorised exactly what a broker reporting
+an empty account would have.
+
+Managing existing positions is refused by none of the four, and must not be: the
+reason the book is not understood might be precisely a position that needs
+closing, and a reconciler that locks the exits would turn a bookkeeping problem
+into a market problem.
 
 **Manage before entering.** Closing frees buying power, and the governor sizes
 the entry against what is actually reserved. Entering first would measure the
@@ -63,7 +69,12 @@ from .marketdata import Liveness
 from .policy import RiskPolicy
 from .portfolio import PortfolioSnapshot
 from .ports import LiveMarketDataPort, PortfolioStatePort, StrategyQuoteSnapshot
-from .positions import OpenPosition, PositionStore, ReconciliationReport
+from .positions import (
+    OpenPosition,
+    PositionStore,
+    ReconciliationOutcome,
+    ReconciliationReport,
+)
 from .risk import CandidateRiskAssessment, assess_candidate
 from .sink import LifecycleRecorder
 from .selection import (
@@ -93,6 +104,11 @@ class RunReport:
     symbol: str
     finished_at: dt.datetime | None = None
     reconciliation: ReconciliationReport | None = None
+    #: Defaults to UNAVAILABLE, not to a permissive value. A report that has not
+    #: reached the reconciler yet has not established anything, and the entry
+    #: gate reads this field alone -- so the fail-closed default is what makes
+    #: "the pass died before reconciling" refuse instead of authorise.
+    reconciliation_outcome: ReconciliationOutcome = ReconciliationOutcome.UNAVAILABLE
     iv_rank: IVRankMetric | None = None
     decisions: list[ManagementDecision] = field(default_factory=list)
     transmissions: list[TransmitResult] = field(default_factory=list)
@@ -110,8 +126,10 @@ class RunReport:
             f"symbol           {self.symbol}",
             f"armed            {'YES' if self.armed else 'NO (dry run)'}",
             "",
-            "RECONCILIATION",
-            self.reconciliation.describe() if self.reconciliation else "  not run",
+            f"RECONCILIATION   {self.reconciliation_outcome.value}",
+            self.reconciliation.describe()
+            if self.reconciliation
+            else "  the broker was not successfully asked; nothing was compared",
             "",
             f"MANAGEMENT       {len(self.decisions)} open position(s) evaluated",
         ]
@@ -155,6 +173,7 @@ class RunReport:
             "started_at": self.started_at.isoformat(),
             "finished_at": self.finished_at.isoformat() if self.finished_at else None,
             "reconciliation": self.reconciliation.to_record() if self.reconciliation else None,
+            "reconciliation_outcome": self.reconciliation_outcome.value,
             "iv_rank": self.iv_rank.to_record() if self.iv_rank else None,
             "decisions": [d.to_record() for d in self.decisions],
             "transmissions": [t.to_record() for t in self.transmissions],
@@ -421,6 +440,95 @@ def _record_open_outcome(
     report.blockers.append(f"order did not fill: {result.state.value}")
 
 
+#: What to tell the operator for each outcome that refuses an entry. Keyed by
+#: outcome so the message names which half of the system to go and look at --
+#: "disagree" means the broker, "replayed" means the store on disk.
+_RECONCILIATION_BLOCKERS: dict[ReconciliationOutcome, str] = {
+    ReconciliationOutcome.DISAGREEMENT: (
+        "the position store and the broker disagree; refusing to open new risk "
+        "until the book is understood"
+    ),
+    ReconciliationOutcome.UNAVAILABLE: (
+        "the broker could not be asked what it holds, so the book is unverified; "
+        "refusing to open new risk. An unanswered question is not an answer of no"
+    ),
+    ReconciliationOutcome.CORRUPT: (
+        "the position store could not be replayed cleanly, so the book is only "
+        "partly readable; refusing to open new risk"
+    ),
+}
+
+
+def _reconcile(
+    broker: Any, store: PositionStore, *, now: dt.datetime, report: RunReport
+) -> None:
+    """Establish, explicitly, whether the book is understood.
+
+    Sets ``report.reconciliation_outcome`` on **every** path, including the
+    failing ones. That is the entire point of this function. The previous
+    version wrapped the reconciler in a bare ``try`` and, when the broker threw,
+    appended a line to ``report.errors`` and left ``report.reconciliation`` as
+    ``None`` -- and the entry gate then asked "is there a report that disagrees?"
+    which ``None`` answers with no. A broker that could not be asked authorised
+    an entry, so a restart mid-position re-sent the same spread.
+
+    The store is checked **before** the broker. If the log on disk cannot be
+    replayed there is nothing trustworthy to compare against, and reporting that
+    as CORRUPT sends the operator to the store rather than to TWS.
+    """
+    try:
+        integrity = store.integrity_errors()
+    except Exception as exc:  # noqa: BLE001 - an unreadable store refuses, it does not crash
+        report.errors.append(
+            f"the position store could not be read: {type(exc).__name__}: {exc}"
+        )
+        report.reconciliation_outcome = ReconciliationOutcome.CORRUPT
+        return
+    if integrity:
+        report.errors.append(
+            f"the position store could not be replayed cleanly: {list(integrity)}"
+        )
+        report.reconciliation_outcome = ReconciliationOutcome.CORRUPT
+        return
+
+    holdings = getattr(broker, "positions", None)
+    if not callable(holdings):
+        report.errors.append(
+            "this broker cannot report positions, so the book was never compared"
+        )
+        report.reconciliation_outcome = ReconciliationOutcome.UNAVAILABLE
+        return
+
+    try:
+        reported = holdings()
+    except Exception as exc:  # noqa: BLE001 - adapter boundary
+        report.errors.append(f"reconciliation failed: {type(exc).__name__}: {exc}")
+        report.reconciliation_outcome = ReconciliationOutcome.UNAVAILABLE
+        return
+
+    if reported is None:
+        # Not a flat account. A flat account answers with an empty sequence;
+        # ``None`` is what a failed or disconnected query returns, and letting
+        # the reconciler read it as "you hold nothing" is the same absence-as-
+        # permission mistake one layer down -- it would agree with an empty
+        # store and authorise an entry against a book nobody checked.
+        report.errors.append(
+            "the broker returned no position data, so the book was not compared"
+        )
+        report.reconciliation_outcome = ReconciliationOutcome.UNAVAILABLE
+        return
+
+    try:
+        result = store.reconcile_against_broker(reported, checked_at=now)
+    except Exception as exc:  # noqa: BLE001 - adapter boundary
+        report.errors.append(f"reconciliation failed: {type(exc).__name__}: {exc}")
+        report.reconciliation_outcome = ReconciliationOutcome.UNAVAILABLE
+        return
+
+    report.reconciliation = result
+    report.reconciliation_outcome = ReconciliationOutcome.for_report(result)
+
+
 def _underlying_reference_price(broker: Any, symbol: str) -> Decimal | None:
     """Spot, used only to centre the strike window.
 
@@ -634,16 +742,14 @@ def run_once(
 
     try:
         # -- 1. reconcile -------------------------------------------------
-        try:
-            report.reconciliation = store.reconcile_against_broker(
-                broker.positions(), checked_at=now
-            )
-        except Exception as exc:  # noqa: BLE001 - adapter boundary
-            report.errors.append(f"reconciliation failed: {type(exc).__name__}: {exc}")
+        _reconcile(broker, store, now=now, report=report)
 
         # -- 2. manage what is already open --------------------------------
-        # Runs even when reconciliation disagrees: the disagreement may be
-        # exactly the position that needs closing.
+        # Runs under EVERY reconciliation outcome, not just the good one: the
+        # disagreement may be exactly the position that needs closing, and a
+        # broker that could not answer a positions query can still accept a
+        # closing order. Blocking exits here would turn a bookkeeping problem
+        # into a market problem and trap the position.
         for position in store.open_positions():
             _manage_one(
                 position,
@@ -676,11 +782,13 @@ def run_once(
             report.refusal_codes.append("RUNNER_UNRESOLVED_ORDER")
             return report
 
-        if report.reconciliation is not None and not report.reconciliation.agrees:
-            report.blockers.append(
-                "the position store and the broker disagree; refusing to open new "
-                "risk until the book is understood"
-            )
+        # Only RECONCILED authorises an entry. DISAGREEMENT, UNAVAILABLE and
+        # CORRUPT all refuse -- and all three reach this line *after* management
+        # has run, which is the asymmetry the module docstring describes.
+        outcome = report.reconciliation_outcome
+        if not outcome.may_open_new_risk:
+            report.blockers.append(_RECONCILIATION_BLOCKERS[outcome])
+            report.refusal_codes.append(f"RUNNER_RECONCILIATION_{outcome.value}")
             return report
 
         candidate, snapshot = _build_candidate(

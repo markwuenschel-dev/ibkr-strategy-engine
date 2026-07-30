@@ -37,6 +37,7 @@ from engine.options.positions import (
     PositionEvent,
     PositionState,
     PositionStore,
+    ReconciliationOutcome,
     ReconciliationReport,
 )
 
@@ -781,3 +782,62 @@ class TestWriteFailureIsFatal:
             store.record_close_failed(strategy_id, at=NOW, reason="no fill")
         with pytest.raises(JournalError):
             store.record_rolled(strategy_id, into=uuid4(), at=NOW)
+
+
+class TestReconciliationOutcomeClassification:
+    """Turning a report into the one thing the entry gate reads.
+
+    The runner used to hold this as ``ReconciliationReport | None`` and treat the
+    ``None`` -- the broker could not be asked at all -- as though it were an
+    answer of "you hold nothing". These tests pin the replacement: four named
+    outcomes, exactly one of which opens risk.
+    """
+
+    def test_a_matched_report_reconciles(self) -> None:
+        report = ReconciliationReport(checked_at=NOW)
+        assert report.agrees is True
+        assert ReconciliationOutcome.for_report(report) is ReconciliationOutcome.RECONCILED
+
+    def test_a_mismatch_is_a_disagreement(self) -> None:
+        report = ReconciliationReport(checked_at=NOW, missing_at_broker=(uuid4(),))
+        assert ReconciliationOutcome.for_report(report) is ReconciliationOutcome.DISAGREEMENT
+
+    def test_replay_errors_outrank_the_comparison(self) -> None:
+        """CORRUPT, not DISAGREEMENT. Both refuse an entry, but only one of them
+        sends the operator to the log on disk rather than to TWS -- and a book
+        that could not be replayed is not a book whose agreement means anything.
+        """
+        report = ReconciliationReport(
+            checked_at=NOW, replay_errors=("unreadable CLOSE_FILLED",)
+        )
+        assert ReconciliationOutcome.for_report(report) is ReconciliationOutcome.CORRUPT
+
+    def test_replay_errors_win_even_beside_a_real_mismatch(self) -> None:
+        report = ReconciliationReport(
+            checked_at=NOW,
+            replay_errors=("unreadable CLOSE_FILLED",),
+            missing_at_broker=(uuid4(),),
+        )
+        assert ReconciliationOutcome.for_report(report) is ReconciliationOutcome.CORRUPT
+
+    def test_exactly_one_outcome_may_open_new_risk(self) -> None:
+        """Enumerated over the enum, so a fifth state has to be classified
+        deliberately instead of defaulting into whichever branch it falls in."""
+        opening = [o for o in ReconciliationOutcome if o.may_open_new_risk]
+        assert opening == [ReconciliationOutcome.RECONCILED]
+
+    def test_an_unavailable_reconciliation_is_never_produced_from_a_report(
+        self,
+    ) -> None:
+        """UNAVAILABLE means the broker was never successfully asked, so no
+        report exists to classify. If this classifier could ever return it, the
+        two meanings would have merged again."""
+        produced = {
+            ReconciliationOutcome.for_report(r)
+            for r in (
+                ReconciliationReport(checked_at=NOW),
+                ReconciliationReport(checked_at=NOW, missing_at_broker=(uuid4(),)),
+                ReconciliationReport(checked_at=NOW, replay_errors=("bad line",)),
+            )
+        }
+        assert ReconciliationOutcome.UNAVAILABLE not in produced
