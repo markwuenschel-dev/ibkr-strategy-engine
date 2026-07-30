@@ -38,6 +38,7 @@ token this module obtains from the real gates or not at all.
 from __future__ import annotations
 
 import datetime as dt
+from enum import Enum
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Callable
@@ -96,7 +97,20 @@ __all__ = [
     "mark_from_snapshot",
     "CONFIG_VERSION",
     "EntryPreflight",
+    "EntryPricing",
 ]
+
+class EntryPricing(str, Enum):
+    """Where on the book an opening credit is asked for.
+
+    MIDPOINT is fair value and the strategy's default. NATURAL is what the book
+    pays now, and is for a bounded execution experiment that wants a fill rather
+    than a good price.
+    """
+
+    MIDPOINT = "MIDPOINT"
+    NATURAL = "NATURAL"
+
 
 CONFIG_VERSION = "options-runner/1"
 
@@ -660,6 +674,7 @@ def _build_candidate(
     maximum_dte: int,
     strike_window: int,
     configuration_version: str,
+    entry_pricing: EntryPricing = EntryPricing.MIDPOINT,
     report: RunReport,
 ) -> tuple[OptionStrategyIntent | None, StrategyQuoteSnapshot | None]:
     """Chain -> quotes -> delta selection -> a validated opening intent."""
@@ -766,13 +781,35 @@ def _build_candidate(
         return None, snapshot
 
     # Price the structure from the book rather than a fraction of the width.
+    #
+    # MIDPOINT is what the strategy uses: it is the fair value of the structure
+    # and the price worth asking for when there is time to wait. NATURAL is what
+    # the book will pay *right now* -- each short sold at its bid, each long
+    # bought at its ask -- and it exists because the engine's first real order
+    # asked the midpoint (0.20) against a natural of 0.18 and rested unfilled for
+    # 160 minutes. Two cents, and it never traded.
+    #
+    # The choice belongs to the caller, not to this function: a strategy entry
+    # and a bounded execution experiment want opposite answers, and hard-coding
+    # either one makes the other unreachable.
     quotes = {q.con_id: q for q in snapshot.legs}
-    short_mid = quotes[selection.short.con_id].mid if selection.short.con_id in quotes else None
-    long_mid = quotes[selection.long.con_id].mid if selection.long.con_id in quotes else None
-    if short_mid is None or long_mid is None:
-        report.blockers.append("no two-sided market on the selected strikes")
+    short_quote = quotes.get(selection.short.con_id)
+    long_quote = quotes.get(selection.long.con_id)
+    if entry_pricing is EntryPricing.NATURAL:
+        short_side = short_quote.bid if short_quote else None
+        long_side = long_quote.ask if long_quote else None
+    else:
+        short_side = short_quote.mid if short_quote else None
+        long_side = long_quote.mid if long_quote else None
+    if short_side is None or long_side is None:
+        report.blockers.append(
+            "no two-sided market on the selected strikes"
+            if entry_pricing is EntryPricing.MIDPOINT
+            else "no bid on the short leg or no ask on the long leg, so the "
+            "natural price cannot be computed"
+        )
         return None, snapshot
-    credit = (short_mid - long_mid).quantize(Decimal("0.01"))
+    credit = (short_side - long_side).quantize(Decimal("0.01"))
     if credit <= ZERO or credit >= selection.width:
         report.blockers.append(
             f"credit {credit} is not a usable price for a {selection.width}-wide spread"
@@ -812,6 +849,7 @@ def run_once(
     maximum_dte: int = 55,
     minimum_iv_rank: Decimal = Decimal("50"),
     strike_window: int = 24,
+    entry_pricing: EntryPricing = EntryPricing.MIDPOINT,
     account: str = "",
     configuration_version: str = CONFIG_VERSION,
     enforce_iv_rank: bool = True,
@@ -928,6 +966,7 @@ def run_once(
             maximum_dte=maximum_dte,
             strike_window=strike_window,
             configuration_version=configuration_version,
+            entry_pricing=entry_pricing,
             report=report,
         )
         report.candidate = candidate

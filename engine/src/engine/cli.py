@@ -243,6 +243,17 @@ def build_parser() -> argparse.ArgumentParser:
     # but a bound you can ask for and be refused is weaker than one you cannot
     # express. IV Rank is carried only because the shared runner signature takes
     # it; the proof does not enforce it.
+    proof.add_argument(
+        "--price-at",
+        default="midpoint",
+        choices=["midpoint", "natural"],
+        help=(
+            "where on the book to ask. midpoint is fair value and the strategy "
+            "default; natural is what the book pays now (short bid minus long "
+            "ask) and is for an execution experiment that wants a fill rather "
+            "than a good price. Every risk bound is re-run at whichever is used."
+        ),
+    )
     proof.set_defaults(
         execution_proof=True,
         bias="BULLISH",
@@ -494,7 +505,7 @@ def cmd_options_run(args: argparse.Namespace, broker_factory: Any = Broker) -> i
     from .options.adapters import IBKRLiveMarketDataAdapter, IBKRPortfolioStateAdapter
     from .options.policy import RiskPolicy
     from .options.positions import PositionStore
-    from .options.runner import run_once
+    from .options.runner import EntryPricing, run_once
     from .options.selection import Bias
 
     config = config_from(args)
@@ -711,7 +722,7 @@ def cmd_options_verify_execution(
     from .options.adapters import IBKRLiveMarketDataAdapter, IBKRPortfolioStateAdapter
     from .options.policy import RiskPolicy
     from .options.positions import PositionStore
-    from .options.runner import run_once
+    from .options.runner import EntryPricing, run_once
     from .options.selection import Bias
 
     config = config_from(args)
@@ -826,7 +837,7 @@ def cmd_options_execution_proof(
         RecordingLifecycleSink,
         new_proof_session_id,
     )
-    from .options.runner import run_once
+    from .options.runner import EntryPricing, run_once
     from .options.selection import Bias
     from .options.sink import LifecycleRecorder
 
@@ -885,6 +896,9 @@ def cmd_options_execution_proof(
             account=config.account_id,
             configuration_version=PROOF_CONFIGURATION_VERSION,
             enforce_iv_rank=False,
+            entry_pricing=EntryPricing(
+                str(getattr(args, "price_at", "midpoint")).upper()
+            ),
             entry_preflight=preflight,
             sink=capture,
         )
