@@ -301,6 +301,11 @@ SCRIPT_STALE_SMALLER_FILL: tuple[Callback, ...] = (
 )
 
 
+#: Accepted and worked, forever. The last callback repeats, so this order never
+#: fills and never dies -- which is exactly what the first real order did.
+SCRIPT_WORKING_FOREVER: tuple[Callback, ...] = (SUBMITTED, ACKNOWLEDGED)
+
+
 def cancelled_empty(*, done: bool) -> Callback:
     """Cancelled with nothing filled -- a terminal refusal, still being polled."""
     return Callback(status="Cancelled", filled=0.0, done=done)
@@ -339,9 +344,13 @@ class _LogEntry:
 
 
 class _Order:
-    def __init__(self, *, order_id: int, perm_id: int) -> None:
+    def __init__(
+        self, *, order_id: int, perm_id: int, order_ref: str = "", limit_price: float = 0.0
+    ) -> None:
         self.orderId = order_id  # noqa: N815
         self.permId = perm_id  # noqa: N815
+        self.orderRef = order_ref  # noqa: N815
+        self.lmtPrice = limit_price  # noqa: N815
 
 
 class ScriptedTrade:
@@ -361,11 +370,19 @@ class ScriptedTrade:
         perm_id: int,
         total_quantity: float,
         limit_price: float,
+        order_ref: str = "",
         observer: Callable[[int], None] | None = None,
     ) -> None:
         if not script:
             raise ValueError("a scripted trade needs at least one callback")
-        self.order = _Order(order_id=order_id, perm_id=perm_id)
+        self.order = _Order(
+            order_id=order_id,
+            perm_id=perm_id,
+            order_ref=order_ref,
+            limit_price=limit_price,
+        )
+        self.limit_price = limit_price
+        self.total_quantity = total_quantity
         self.polls = 0
         self._index = 0
         self._observer = observer
@@ -373,6 +390,22 @@ class ScriptedTrade:
             _resolve(callback, total=total_quantity, limit=limit_price)
             for callback in script
         )
+
+    def accept_cancel(self, script: tuple[Callback, ...], *, total: float) -> None:
+        """What the broker does when ``cancelOrder`` reaches a working order.
+
+        The trade keeps its identity -- same ``Order`` object, same ids -- and
+        starts walking a new script from the beginning. That is what a real
+        cancellation does: the same order transitions, it is not replaced by a
+        different one, and a fake that handed back a fresh trade would let the
+        ladder appear to work while losing the identifiers reconciliation
+        matches on.
+        """
+        self._script = tuple(
+            _resolve(callback, total=total, limit=self.limit_price)
+            for callback in script
+        )
+        self._index = 0
 
     @property
     def current(self) -> Callback:
@@ -480,6 +513,9 @@ class ScriptedIB:
         connected_polls: int | None = None,
         place_error: str | None = None,
         observer: Callable[[int], None] | None = None,
+        cancel_script: tuple[Callback, ...] = (),
+        cancel_error: str | None = None,
+        working_orders: tuple[Any, ...] | None = None,
     ) -> None:
         if not scripts:
             raise ValueError("ScriptedIB needs at least one script")
@@ -487,9 +523,18 @@ class ScriptedIB:
         self.scripts = scripts
         self.connected_polls = connected_polls
         self.place_error = place_error
+        #: What a cancelled order does next. Defaults to a clean terminal
+        #: cancellation with nothing filled -- the ordinary case.
+        self.cancel_script = cancel_script or (cancelled_empty(done=True),)
+        self.cancel_error = cancel_error
+        #: What ``openTrades()`` reports. ``None`` means the method answers with
+        #: whatever this fake has placed and not yet seen finish, which is what
+        #: a real broker does.
+        self.working_orders = working_orders
         #: Called once per poll, before that poll's observation is persisted.
         self.observer = observer
         self.placed: list[tuple[Any, Any]] = []
+        self.cancelled: list[Any] = []
         self.trades: list[ScriptedTrade] = []
         self.slept = 0.0
         self.connection_checks = 0
@@ -540,10 +585,34 @@ class ScriptedIB:
             perm_id=8800 + len(self.trades),
             total_quantity=float(getattr(order, "totalQuantity", 1)),
             limit_price=float(getattr(order, "lmtPrice", 0.0)),
+            order_ref=str(getattr(order, "orderRef", "") or ""),
             observer=self.observer,
         )
         self.trades.append(trade)
         return trade
+
+    def cancelOrder(self, order: Any) -> Any:  # noqa: N802
+        """Retract a working order, by walking its trade onto the cancel script.
+
+        Implemented rather than omitted, for the reason ``RecordingIB`` gives
+        about ``placeOrder``: a test that passes because the fake raised
+        ``AttributeError`` proves the fake is incomplete, not that the code is
+        right.
+        """
+        self.cancelled.append(order)
+        if self.cancel_error is not None:
+            raise RuntimeError(self.cancel_error)
+        for trade in self.trades:
+            if trade.order is order:
+                trade.accept_cancel(self.cancel_script, total=trade.total_quantity)
+                return trade
+        return None
+
+    def openTrades(self) -> tuple[Any, ...]:  # noqa: N802
+        """What the broker is still working. See ``working_orders``."""
+        if self.working_orders is not None:
+            return self.working_orders
+        return tuple(trade for trade in self.trades if not trade.current.done)
 
     def sleep(self, seconds: float) -> None:
         self.slept += seconds
@@ -572,14 +641,38 @@ class FakeBroker:
 class BrokerOrder:
     """The shape ``reconcile_against_broker`` accepts for a live broker order.
 
-    Deliberately a bare object with ``orderId``/``permId`` rather than an
-    ``ib_async`` type: that is the whole contract ``_reconcile_orders`` documents,
-    and matching it here proves the reconciler needs no adapter in between.
+    Deliberately a bare object with ``orderId``/``permId``/``orderRef`` rather
+    than an ``ib_async`` type: that is the whole contract ``_reconcile_orders``
+    documents, and matching it here proves the reconciler needs no adapter in
+    between.
+
+    ``order_ref`` is what ``build_combo`` stamps with the strategy id, and it is
+    the only field that says whose order this is.
     """
 
-    def __init__(self, *, order_id: int | None, perm_id: int | None) -> None:
+    def __init__(
+        self,
+        *,
+        order_id: int | None,
+        perm_id: int | None,
+        order_ref: str | None = None,
+    ) -> None:
         self.orderId = order_id  # noqa: N815
         self.permId = perm_id  # noqa: N815
+        self.orderRef = order_ref  # noqa: N815
+
+
+class BrokerTrade:
+    """An ``ib_async`` ``Trade``: the identifiers live on ``.order``, not on it.
+
+    ``ib.openTrades()`` returns these, and a reconciler that read ``orderId``
+    off the wrapper would see ``None`` on every entry -- indistinguishable from
+    an account with nothing working, which is the exact false negative this
+    lane exists to remove.
+    """
+
+    def __init__(self, order: BrokerOrder) -> None:
+        self.order = order
 
 
 class FakeMarketDataPort:
@@ -1442,27 +1535,80 @@ class TestDuplicateAndOutOfOrderCallbacks:
 
 
 class TestOrderLevelReconciliation:
-    def test_a_broker_order_the_store_never_sent_is_surfaced(
+    def test_an_unrelated_resting_order_on_the_account_is_ignored(
         self, tmp_path: Path
     ) -> None:
-        """An order live at the broker with no record of this engine sending it.
+        """The trap this scoping exists to avoid.
 
-        Either something else is trading this account or a record was lost, and
-        both are reasons to stop rather than to assume.
+        A paper account is shared with whatever the operator has typed into TWS
+        by hand. An order with no ``orderRef`` of ours and no ``permId`` we ever
+        recorded is not this engine's, and flagging it would produce a
+        DISAGREEMENT that blocks every entry for as long as it rests -- a
+        condition no amount of correct engine behaviour could clear.
         """
         store = store_for(tmp_path)
-        seed_open_position(store, dte=40)
+        seed_open_position(store, dte=40, order_id=42, perm_id=8042)
 
         report = store.reconcile_against_broker(
             (("SPY", -1, 100.0),),
             checked_at=NOW,
-            broker_orders=(BrokerOrder(order_id=901, perm_id=5501),),
+            broker_orders=(
+                BrokerOrder(order_id=901, perm_id=5501),
+                BrokerOrder(order_id=902, perm_id=5502, order_ref="MANUAL-TICKET"),
+            ),
         )
 
-        # One unknown order, reported once, by its durable identifier -- the one
-        # that can still be looked up in TWS after a reconnect. Reporting both
-        # ids would read as two separate unknown orders.
-        assert report.orders_unknown_to_store == (5501,)
+        assert report.orders_unknown_to_store == ()
+        assert report.agrees is True, report.describe()
+
+    def test_a_foreign_order_reusing_one_of_our_order_ids_is_still_ignored(
+        self, tmp_path: Path
+    ) -> None:
+        """``orderId`` is not ownership evidence, and this is why.
+
+        It is client-assigned and reused across sessions, so a stranger's order
+        can carry one of ours by coincidence -- the C22 defect pointed the other
+        way. Claiming it would put a foreign order into this engine's
+        bookkeeping.
+        """
+        store = store_for(tmp_path)
+        seed_open_position(store, dte=40, order_id=42, perm_id=8042)
+
+        report = store.reconcile_against_broker(
+            (("SPY", -1, 100.0),),
+            checked_at=NOW,
+            broker_orders=(BrokerOrder(order_id=42, perm_id=999_111),),
+        )
+
+        assert report.orders_unknown_to_store == ()
+        assert report.agrees is True, report.describe()
+
+    def test_our_own_order_with_no_live_position_to_account_for_it_is_surfaced(
+        self, tmp_path: Path
+    ) -> None:
+        """The signal the scoping must not throw away.
+
+        An order carrying a strategy id this store minted, still working at the
+        broker, for a position the book says is finished. That is this engine
+        having lost track of its own order, and it is exactly what
+        ``orders_unknown_to_store`` is for.
+        """
+        store = store_for(tmp_path)
+        intent = seed_open_position(store, dte=40, order_id=42, perm_id=8042)
+        store.record_close_submitted(intent.strategy_id, at=NOW, target_debit=D("0.50"))
+        store.record_close_filled(intent.strategy_id, at=NOW, closing_debit=D("0.50"))
+
+        report = store.reconcile_against_broker(
+            (),
+            checked_at=NOW,
+            broker_orders=(
+                BrokerOrder(order_id=77, perm_id=9077, order_ref=str(intent.strategy_id)),
+            ),
+        )
+
+        # Reported once, by the durable identifier -- the one that can still be
+        # looked up in TWS after a reconnect.
+        assert report.orders_unknown_to_store == (9077,)
         assert report.agrees is False
 
     def test_a_mid_transition_order_the_broker_is_not_working_is_surfaced(
@@ -1470,7 +1616,11 @@ class TestOrderLevelReconciliation:
     ) -> None:
         """The dangerous shape: it either filled while we were not looking or was
         never accepted, and those demand opposite fixes. Reported, never
-        guessed at."""
+        guessed at.
+
+        ``broker_orders=()`` is load-bearing: it means the broker WAS asked and
+        is working nothing.
+        """
         store = store_for(tmp_path)
         intent = seed_in_flight_position(store, order_id=41, perm_id=880)
 
@@ -1479,7 +1629,110 @@ class TestOrderLevelReconciliation:
         )
 
         assert report.orders_absent_at_broker == (intent.strategy_id,)
+        assert report.orders_working_at_broker == ()
         assert report.agrees is False
+        assert "the broker was asked" in report.describe()
+
+    def test_a_working_order_is_reported_as_working_and_not_as_absent(
+        self, tmp_path: Path
+    ) -> None:
+        """The false claim this lane exists to remove.
+
+        The live run reported ``ORDERS ABSENT -- transmitted, and the broker is
+        not working them``. The broker *was* working it. The conservative
+        outcome was right and the stated reason was wrong, and an operator
+        acting on that sentence would go looking for a fill that never happened.
+        """
+        store = store_for(tmp_path)
+        intent = seed_in_flight_position(store, order_id=896, perm_id=1_151_642_162)
+
+        report = store.reconcile_against_broker(
+            (("SPY", -1, 100.0),),
+            checked_at=NOW,
+            broker_orders=(
+                BrokerTrade(
+                    BrokerOrder(
+                        order_id=896,
+                        perm_id=1_151_642_162,
+                        order_ref=str(intent.strategy_id),
+                    )
+                ),
+            ),
+        )
+
+        assert report.orders_working_at_broker == (intent.strategy_id,)
+        assert report.orders_absent_at_broker == ()
+        assert report.orders_unverified_at_broker == ()
+        assert "the broker IS working them" in report.describe()
+        assert "is not working them" not in report.describe()
+
+    def test_a_working_order_survives_a_restart_that_reassigned_the_order_id(
+        self, tmp_path: Path
+    ) -> None:
+        """Matched by ``permId`` when ``orderId`` no longer means anything.
+
+        A reconnect renumbers ``orderId`` from scratch. The store still holds
+        the old one, and the only identifier that connects the two sessions is
+        ``permId`` -- which is why the precedence is permId, then orderRef, then
+        orderId, and why a match on the first is enough on its own.
+        """
+        store = store_for(tmp_path)
+        intent = seed_in_flight_position(store, order_id=3, perm_id=1_151_642_162)
+
+        report = store.reconcile_against_broker(
+            (("SPY", -1, 100.0),),
+            checked_at=NOW,
+            broker_orders=(BrokerOrder(order_id=814, perm_id=1_151_642_162),),
+        )
+
+        assert report.orders_working_at_broker == (intent.strategy_id,)
+        assert report.orders_absent_at_broker == ()
+        assert report.orders_unknown_to_store == ()
+
+    def test_a_working_order_matches_on_order_ref_before_any_perm_id_exists(
+        self, tmp_path: Path
+    ) -> None:
+        """The middle rung of the precedence, exercised on its own.
+
+        Between submission and the broker assigning a ``permId`` there is a
+        window where ``orderRef`` is the only durable identity the order has --
+        and it is durable because we chose it. Without this rung, an order in
+        that window reconciles as absent.
+        """
+        store = store_for(tmp_path)
+        intent = seed_in_flight_position(store, order_id=41, perm_id=None)
+
+        report = store.reconcile_against_broker(
+            (("SPY", -1, 100.0),),
+            checked_at=NOW,
+            broker_orders=(
+                BrokerOrder(order_id=812, perm_id=770, order_ref=str(intent.strategy_id)),
+            ),
+        )
+
+        assert report.orders_working_at_broker == (intent.strategy_id,)
+        assert report.orders_absent_at_broker == ()
+        assert report.orders_unknown_to_store == ()
+
+    def test_not_asking_is_not_the_same_as_asking_and_finding_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        """``None`` and ``()`` are different answers, and the report says so.
+
+        This is the defect at the root of the false claim. The old default was
+        ``()``, so a caller that never enumerated open orders got a report
+        asserting the broker was not working them -- an assertion about a
+        question nobody asked.
+        """
+        store = store_for(tmp_path)
+        intent = seed_in_flight_position(store, order_id=41, perm_id=880)
+
+        report = store.reconcile_against_broker((("SPY", -1, 100.0),), checked_at=NOW)
+
+        assert report.orders_unverified_at_broker == (intent.strategy_id,)
+        assert report.orders_absent_at_broker == ()
+        assert report.agrees is False
+        assert "never enumerated" in report.describe()
 
     def test_a_reassigned_order_id_still_matches_on_perm_id(
         self, tmp_path: Path
@@ -2103,3 +2356,161 @@ class TestTheClosingFillIsPersistedToo:
 
         assert wrote is False
         assert len(event_names(restarted)) == before
+
+
+# ===========================================================================
+# K. Order control, end to end through run_once
+# ===========================================================================
+
+
+class TestAWorkingEntryIsNotLeftResting:
+    """The whole lane, exercised the way the failure actually happened.
+
+    ``run_once`` sends an entry, the broker accepts it and works it, and nothing
+    fills. Before this lane that ended the pass with an unresolved order resting
+    in the book and every later entry refused, permanently, with no process able
+    to clear it.
+    """
+
+    def test_the_entry_is_worked_and_then_cancelled(self, tmp_path: Path) -> None:
+        ib = ScriptedIB(scripts=(SCRIPT_WORKING_FOREVER,))
+        store = store_for(tmp_path)
+
+        report = run_pass(FakeBroker(ib=ib), gate_for(tmp_path), store, armed=True)
+
+        assert report.reprice is not None, report.describe()
+        assert report.reprice.stop.value == "REPRICE_EXHAUSTED"
+        assert report.reprice.attempts == 4
+        assert report.reprice.cancelled is True
+        # Five orders, five cancels, and nothing left working at the broker.
+        assert len(ib.placed) == 5
+        assert len(ib.cancelled) == 5
+        assert ib.openTrades() == ()
+        # Each rung asked for less credit than the one before it. The limits are
+        # negative -- ``build_combo``'s credit convention -- so ascending order
+        # is a shrinking credit.
+        limits = [order.lmtPrice for _contract, order in ib.placed]
+        assert limits == sorted(limits), limits
+        # Nothing filled, so nothing is open -- and the log still replays.
+        assert store.open_positions() == []
+        assert store.integrity_errors() == ()
+
+    def test_the_pass_says_so_rather_than_reporting_an_unknown_outcome(
+        self, tmp_path: Path
+    ) -> None:
+        """What the operator is told.
+
+        The old report said the order's outcome was unknown, which was true and
+        useless. The new one names what was done about it.
+        """
+        ib = ScriptedIB(scripts=(SCRIPT_WORKING_FOREVER,))
+        report = run_pass(
+            FakeBroker(ib=ib), gate_for(tmp_path), store_for(tmp_path), armed=True
+        )
+
+        assert any("entry order worked" in blocker for blocker in report.blockers), (
+            report.blockers
+        )
+        assert report.entered is False
+        assert "REPRICE_EXHAUSTED" in report.describe()
+
+    def test_the_ladder_can_be_switched_off_and_the_old_behaviour_returns(
+        self, tmp_path: Path
+    ) -> None:
+        """The mutation half. One argument different, and the order rests.
+
+        This is what proves the ladder above is what cancelled the order -- not
+        the fake, and not the runner doing it anyway.
+        """
+        ib = ScriptedIB(scripts=(SCRIPT_WORKING_FOREVER,))
+        gate = gate_for(tmp_path)
+        store = store_for(tmp_path)
+
+        report = run_once(
+            FakeBroker(ib=ib),
+            gate=gate,
+            journal=gate.journal,
+            store=store,
+            policy=RiskPolicy(),
+            armed=True,
+            symbol="SPY",
+            bias=Bias.BULLISH,
+            market_data=FakeMarketDataPort(),
+            portfolio=FakePortfolioPort(),
+            now=NOW,
+            today=TODAY,
+            account="DU1234567",
+            reprice=None,
+        )
+
+        assert report.reprice is None
+        assert len(ib.placed) == 1
+        assert ib.cancelled == []
+        assert ib.openTrades() != (), "the order is still resting at the broker"
+
+
+class TestTheNextPassSeesTheWorkingOrder:
+    def test_reconciliation_reads_open_trades_and_reports_the_order_as_working(
+        self, tmp_path: Path
+    ) -> None:
+        """A restart, with the order still live at the broker.
+
+        The store holds an ``OPENING`` position whose ``orderId`` was assigned
+        in the previous session. The broker reports the same order under a
+        renumbered ``orderId`` and the durable ``permId``, and the pass must say
+        the broker IS working it.
+        """
+        store = store_for(tmp_path)
+        intent = seed_in_flight_position(store, order_id=3, perm_id=1_151_642_162)
+        ib = ScriptedIB(
+            working_orders=(
+                BrokerTrade(
+                    BrokerOrder(
+                        order_id=814,
+                        perm_id=1_151_642_162,
+                        order_ref=str(intent.strategy_id),
+                    )
+                ),
+            )
+        )
+
+        report = run_pass(
+            FakeBroker(ib=ib, positions=(("SPY", -1, 100.0),)),
+            gate_for(tmp_path),
+            store,
+            armed=True,
+        )
+
+        assert report.reconciliation is not None
+        assert report.reconciliation.orders_working_at_broker == (intent.strategy_id,)
+        assert report.reconciliation.orders_absent_at_broker == ()
+        assert report.reconciliation.orders_unverified_at_broker == ()
+        assert "is not working them" not in report.describe()
+        # Still no new risk: a stranded OPENING is a disagreement whatever the
+        # reason. The conservative outcome was always right; only the stated
+        # reason was wrong.
+        assert report.entered is False
+        assert report.reconciliation_outcome.may_open_new_risk is False
+
+    def test_an_unrelated_resting_order_does_not_block_the_pass(
+        self, tmp_path: Path
+    ) -> None:
+        """The trap, end to end.
+
+        A manual ticket sitting on the same paper account must not turn every
+        subsequent pass into a DISAGREEMENT. Nothing about it is ours, so the
+        reconciler ignores it and the pass proceeds to its ordinary entry.
+        """
+        ib = ScriptedIB(
+            scripts=(SCRIPT_CLEAN_FILL,),
+            working_orders=(BrokerOrder(order_id=77, perm_id=4242, order_ref="MANUAL"),),
+        )
+
+        report = run_pass(
+            FakeBroker(ib=ib), gate_for(tmp_path), store_for(tmp_path), armed=True
+        )
+
+        assert report.reconciliation is not None
+        assert report.reconciliation.orders_unknown_to_store == ()
+        assert report.reconciliation_outcome.may_open_new_risk is True
+        assert report.entered is True, report.describe()

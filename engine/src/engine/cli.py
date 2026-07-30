@@ -48,6 +48,23 @@ def note(message: str) -> None:
     print(message, file=sys.stderr)
 
 
+def _open_orders_or_none(broker: Any) -> Any:
+    """What the broker is working, or ``None`` when it could not be asked.
+
+    ``None`` and ``()`` are different answers to the reconciler: the first is
+    "nobody asked", the second is "asked, nothing working". Collapsing them is
+    how a report came to state, of a live working order, that the broker was
+    not working it. A broker that raises or has no such method is the first
+    case, never the second.
+    """
+    from .options.adapters import read_open_orders  # noqa: PLC0415 - optional path
+
+    try:
+        return read_open_orders(getattr(broker, "ib", broker))
+    except Exception:  # noqa: BLE001 - an unanswered question is not an answer of no
+        return None
+
+
 # ==========================================================================
 # argument parsing
 # ==========================================================================
@@ -520,8 +537,13 @@ def cmd_options_positions(args: argparse.Namespace, broker_factory: Any = Broker
 
     journal = OrderJournal(config.journal_path)
     with broker_factory(config, journal) as broker:
+        # Positions AND working orders. A working order is not a position, so
+        # asking only the first reported an order the broker was demonstrably
+        # working as one it was not.
         report = store.reconcile_against_broker(
-            broker.positions(), checked_at=utc_now()
+            broker.positions(),
+            checked_at=utc_now(),
+            broker_orders=_open_orders_or_none(broker),
         )
     out("")
     out(report.describe())
@@ -746,7 +768,9 @@ def cmd_options_execution_proof(
         replayed = PositionStore(config.state_dir / "positions.jsonl")
         try:
             restart = replayed.reconcile_against_broker(
-                broker.positions(), checked_at=utc_now()
+                broker.positions(),
+                checked_at=utc_now(),
+                broker_orders=_open_orders_or_none(broker),
             )
         except Exception as exc:  # noqa: BLE001 - reporting must not crash the proof
             restart = None

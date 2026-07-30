@@ -28,6 +28,7 @@ from .policy import RiskPolicy
 from .portfolio import PortfolioSnapshot, PositionExposure
 from .positions import OpenPosition, PositionState, PositionStore
 from .proof import ExecutionProofProfile, PriceEnvelope
+from .reprice import RepriceLadder, RepriceOutcome, RepriceStop, tick_size, work_order
 from .risk import (
     CandidateRiskAssessment,
     CheckResult,
@@ -35,10 +36,14 @@ from .risk import (
     assess_candidate,
 )
 from .transmit import (
+    CancelAuthorization,
     TransmitAuthorization,
     TransmitResult,
+    authorize_cancel,
     authorize_close,
     authorize_open,
+    authorize_reprice,
+    cancel_combo,
     place_combo,
 )
 
@@ -66,9 +71,18 @@ __all__ = [
     "PositionStore",
     "ExecutionProofProfile",
     "PriceEnvelope",
+    "RepriceLadder",
+    "RepriceOutcome",
+    "RepriceStop",
+    "tick_size",
+    "work_order",
+    "CancelAuthorization",
     "TransmitAuthorization",
     "TransmitResult",
     "authorize_open",
     "authorize_close",
+    "authorize_cancel",
+    "authorize_reprice",
+    "cancel_combo",
     "place_combo",
 ]
