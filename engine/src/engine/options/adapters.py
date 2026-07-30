@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+import time
 from collections.abc import Sequence
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -223,11 +224,23 @@ class IBKRLiveMarketDataAdapter:
         ib: Any,
         *,
         requested_type: int = int(MarketDataType.LIVE),
-        settle_seconds: float = 6.0,
+        settle_seconds: float = 20.0,
+        underlying_lead_seconds: float = 2.0,
+        poll_seconds: float = 0.25,
+        clock: Any = time.monotonic,
     ) -> None:
         self.ib = ib
+        # A seam, so the deadline can be exercised without a test spending the
+        # real seconds. ``ib.sleep`` is the only thing that yields to the event
+        # loop; this only measures.
+        self.clock = clock
         self.requested_type = requested_type
+        # A ceiling, not a duration: the wait below exits as soon as every leg
+        # has greeks, so raising this costs nothing on a healthy run and buys
+        # patience on a slow one.
         self.settle_seconds = settle_seconds
+        self.underlying_lead_seconds = underlying_lead_seconds
+        self.poll_seconds = poll_seconds
 
     def strategy_quotes(
         self,
@@ -271,17 +284,40 @@ class IBKRLiveMarketDataAdapter:
 
         try:
             self.ib.reqMarketDataType(self.requested_type)
-            for con_id, contract in contracts.items():
-                # Generic tick 106 asks for option implied volatility; without it
-                # IBKR sends no model computation for an option at all.
-                tickers[con_id] = self.ib.reqMktData(contract, "106", False, False)
-            self.ib.sleep(self.settle_seconds)
+            # The underlying goes first and is given a head start. IBKR computes
+            # option model greeks from the underlying price, so subscribing the
+            # whole chain in one burst asks for computations whose input has not
+            # arrived yet.
+            tickers[underlying_con_id] = self.ib.reqMktData(
+                underlying_contract, "", False, False
+            )
+            self.ib.sleep(min(self.underlying_lead_seconds, self.settle_seconds))
+            option_ids = [c for c in contracts if c != underlying_con_id]
+            for con_id in option_ids:
+                tickers[con_id] = self.ib.reqMktData(contracts[con_id], "", False, False)
+
+            # Wait for the greeks themselves rather than for a fixed number of
+            # seconds. A flat sleep is a bet that every model computation lands
+            # inside it, and the size of that bet scales with the number of legs
+            # -- so the same command produces a different subset of the chain on
+            # each run, and strike selection becomes a race. Polling the
+            # recorder (rather than ``waitOnUpdate``, which drops ticks) lets a
+            # good run finish early and a slow one keep waiting.
+            deadline = self.clock() + self.settle_seconds
+            while self.clock() < deadline:
+                self.ib.sleep(self.poll_seconds)
+                if all(recorder.latest_greeks.get(c) is not None for c in option_ids):
+                    break
 
             observed_at = _utcnow()
             for con_id, subscription in subscriptions.items():
                 for reported in recorder.data_types.get(con_id, []):
                     subscription.record_data_type(reported, at=observed_at)
-                greeks = recorder.latest_greeks.get(con_id)
+                # The recorder maps callbacks by reqId; if that mapping missed,
+                # the ticker still carries the computation ib_async wrote to it.
+                greeks = recorder.latest_greeks.get(con_id) or getattr(
+                    tickers.get(con_id), "modelGreeks", None
+                )
                 if greeks is not None:
                     subscription.record_greeks(
                         greeks, at=observed_at, generation=subscription.generation

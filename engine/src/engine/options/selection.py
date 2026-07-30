@@ -438,6 +438,7 @@ def _select_protective_strike(
     short: QualifiedOption,
     right: OptionRight,
     target_width: Decimal,
+    maximum_width: Decimal | None = None,
 ) -> QualifiedOption | None:
     """The listed strike nearest ``target_width`` further out than the short.
 
@@ -457,6 +458,15 @@ def _select_protective_strike(
     lower. On a chain with 1-wide strikes and a 5-wide target there is no tie; on
     a chain listing only 2.5 and 7.5 away from a 5-wide target there is, and the
     2.5-wide is the one that risks less.
+
+    ``maximum_width`` bounds "nearest". Nearest is a comparison among whatever
+    was listed, and on a sparse chain the nearest strike below the short can be
+    an outlier far beyond anything intended -- observed live on 2026-07-30, where
+    a ladder running 672 then 722..750 offered a 722 short a single protective
+    strike **50 wide** against a target of 5. Ten times the intended risk is not
+    a near miss, and "the only one available" is a reason to build nothing rather
+    than a reason to accept it. The defined-loss gate would refuse it downstream;
+    this refuses it where the width is chosen, so the refusal names the cause.
     """
     best: tuple[Decimal, Decimal, QualifiedOption] | None = None
     for candidate in candidates:
@@ -479,10 +489,40 @@ def _select_protective_strike(
             if contract.strike <= short.strike:
                 continue
             width = contract.strike - short.strike
+        if maximum_width is not None and width > maximum_width:
+            continue
         key = (abs(width - target_width), width, contract)
         if best is None or (key[0], key[1]) < (best[0], best[1]):
             best = key
     return None if best is None else best[2]
+
+
+def _strike_increment(
+    candidates: Iterable[DeltaCandidate], *, right: OptionRight
+) -> Decimal:
+    """The chain's typical gap between adjacent listed strikes.
+
+    The **median** gap, not the smallest or the largest. A real ladder is dense
+    near the money and sparse in the wings, so the smallest gap understates what
+    a wing can legitimately need and the largest is exactly the outlier this
+    exists to catch. The median describes the ladder the structure is actually
+    being built in.
+
+    Falls back to ``ZERO`` for a chain too small to have a gap, which makes the
+    caller's bound simply ``target_width`` -- correct, because a one-strike chain
+    offers no choice to bound.
+    """
+    strikes = sorted(
+        {c.contract.strike for c in candidates if c.right is right}
+    )
+    gaps = [b - a for a, b in zip(strikes, strikes[1:]) if b > a]
+    if not gaps:
+        return ZERO
+    gaps.sort()
+    middle = len(gaps) // 2
+    if len(gaps) % 2:
+        return gaps[middle]
+    return (gaps[middle - 1] + gaps[middle]) / Decimal("2")
 
 
 def select_vertical(
@@ -491,6 +531,7 @@ def select_vertical(
     target_delta: Decimal,
     right: OptionRight,
     target_width: Decimal,
+    maximum_width: Decimal | None = None,
 ) -> StrikeSelection | None:
     """A short strike by delta, plus the protective leg that bounds it.
 
@@ -498,6 +539,14 @@ def select_vertical(
     a usable delta, or the chain lists nothing further out of the money to buy as
     protection. Both are ordinary conditions in a thin chain, and neither is
     something a caller should be able to proceed past by forgetting to check.
+
+    ``maximum_width`` defaults to ``target_width`` plus one strike increment,
+    measured from the chain itself. A ratio would be wrong in both directions:
+    a coarse chain listing strikes every 5 legitimately cannot do better than 5
+    against a 2-wide target, while a chain listing strikes every 1 has no excuse
+    for handing back 50 against a 5-wide target. One increment past the target
+    is precisely the worst a *complete* ladder can do; anything beyond it means
+    the ladder has a hole, and a hole is not a rounding error.
     """
     if not isinstance(target_width, Decimal) or not target_width.is_finite():
         _refuse(
@@ -516,8 +565,14 @@ def select_vertical(
     if short is None:
         return None
 
+    if maximum_width is None:
+        maximum_width = target_width + _strike_increment(candidates, right=right)
     protective = _select_protective_strike(
-        candidates, short=short.contract, right=right, target_width=target_width
+        candidates,
+        short=short.contract,
+        right=right,
+        target_width=target_width,
+        maximum_width=maximum_width,
     )
     if protective is None:
         return None

@@ -70,7 +70,11 @@ None of these are proven against a live broker — see *Runtime capabilities sti
 | T2 | `engine/README.md` documents an equities-only engine with no status or roadmap section. | Will need updating once options ship. Out of scope until the domain lands. |
 | T3 | `Broker.preview`/`place` docstring at `broker.py:15-16` claims the engine requests type 4 outside hours; no code path ever does. | Stale comment. Fix opportunistically in M3. |
 
-## Live broker results — 2026-07-29, paper DUR318607, pre-market (07:25 ET)
+## Live broker results — 2026-07-29, the paper account, pre-market (07:25 ET)
+
+> Account identifiers are deliberately not recorded here. This repository is
+> public, and an account id in a committed file is permanent. It lives in
+> `IBKR_ACCOUNT_ID` in the shell environment and nowhere else.
 
 First options data ever taken from IBKR by repository-owned code.
 
@@ -253,6 +257,118 @@ interlock demonstrated in production rather than only in tests.
 | C22 | **A reconnect blocked all new entries, permanently.** `_reconcile_orders` differenced the `permId` and `orderId` sets independently, so a broker order matched on its durable `permId` was *also* reported as unknown by its reassigned `orderId`. Since IBKR reassigns `orderId` on reconnect — the precise case `permId` exists to survive — any reconnect produced a phantom disagreement that made `agrees` False forever. | Broker orders are kept as `(order_id, perm_id)` pairs; an entry matched by **either** identifier is known. Unknown ones are reported once, by the durable id, so the count equals the number of orders rather than the number of identifiers. |
 | C16 | **A successful credit fill was recorded as a failure.** `build_combo` submits a net credit as a `BUY` at a *negative* limit, so IBKR reports the fill at a negative average price — and `transmit._decimal_or_none` screened negatives, returning `None`. The runner reads that as "did not fill" and writes `OPEN_FAILED`. Net effect: **a spread live in the market, recorded as never opened** — exactly the unrecorded position the whole store exists to prevent, arriving through the one path nobody thought to check the sign on. Found by *running* the armed path end to end against a fake broker, not by any test. | Renamed to `_fill_price`, negatives allowed, zero still rejected (a zero fill is an unpopulated field, not a price). The runner already took `abs()` when storing the credit; the close path now does too, so the sign convention stays inside the broker boundary. |
 | C15 | **One malformed line made the entire book unreadable.** The replay's `try/except` wrapped only the `OPEN_SUBMITTED` branch; a `CLOSE_FILLED` with a naive timestamp raised straight out of `positions()`. An engine that cannot read its book cannot manage what it already holds — worse than any single lost event. | Every branch guarded. A bad line now costs one transition, is **recorded** in `integrity_errors()`, and makes `ReconciliationReport.agrees` False — which stops the runner opening new risk against a partly-understood book while still allowing exits. Degraded, loud, and still able to get out. |
+
+## M8 — the entitlement lifted, and three determinism defects it exposed, 2026-07-30
+
+### The blocker is gone
+
+`engine probe-options-data --symbol SPY`, 09:47 ET, market open:
+
+| What | 2026-07-29 | 2026-07-30 |
+|---|---|---|
+| SPY stock | `reported=NONE`, no prices, error `10089` | **`reported=1` (LIVE)**, bid 737.08 / ask 737.10 |
+| Option legs | `reported=3` (DELAYED) | **`reported=1` (LIVE)**, 10–13 greek callbacks each |
+| Errors | `10089`, `10091`, `10167` | none — only `2104` market data farm OK |
+
+The probe **requested** type 3 and the server **returned** type 1, which is the
+signature of an entitlement upgrade rather than a code change. Every candidate
+this engine ever built refused on this one input, so the transmit path is
+reachable for the first time. This supersedes the *"The gate that is still
+standing"* reading throughout this file and in the state-of-play artifact.
+
+### Three defects that only running it could find
+
+The unit suite was green throughout. Two identical `options-run` invocations
+minutes apart produced two *different* failures — the tell that these were
+races, not thresholds.
+
+| # | What | Root cause | Fix |
+|---|---|---|---|
+| C17 | **The market-data wait was a bet, not a wait.** `adapters.py` fired 26 concurrent subscriptions then slept a flat 6.0s and harvested once — 0.24s of dwell per contract against the probe's 3.0s. Whichever subset of model computations had landed by T+6 became the chain, so strike selection was a race and the same command produced a different answer each run. | `adapters.py:278` (`ib.sleep` is an unconditional `asyncio.sleep`; no deadline loop, no greek check, no retry) | Bounded wait on the actual condition — poll the recorder every 0.25s until every leg has greeks, ceiling raised 6→20s. A healthy run now finishes **faster** (early exit) and a slow one keeps waiting. Plus: underlying subscribed first with a 2s head start (IBKR computes greeks *from* the underlying price), `genericTickList` "106"→"" (106 is implied volatility; `modelGreeks` arrives on a bare request — the probe's proven shape), and a `ticker.modelGreeks` fallback when the reqId mapping misses. |
+| C18 | **The strike window was centred on the middle of the ladder, not on spot.** `narrow_strikes(reference_price=None)` takes the *positional* median of the listed strikes. Those coincide with spot only by accident. `scan.py:347-349` passes a real price; the runner was the only caller in the repo passing `None`. | `runner.py:473` | The runner now reads spot via `broker.quote()` and passes it, recording an explicit error when no price is obtainable rather than silently degrading. |
+| C19 | **A symmetric window cannot reach a one-sided structure's wing.** Even centred on spot, a width-24 window spans ±12 — so on a 1-point ladder the 0.30-delta short strike landed on the window *floor* with no protective strike beneath it. Half the budget was spent on call-side strikes a put spread never selects. | `chain.py:170-171` | `narrow_strikes` takes an optional `right` and shapes the window one-sided: `width` below spot, a `width//8` cushion above. The symmetric default is unchanged, so the shadow scan is untouched. |
+
+### Self-caught while fixing the above
+
+| # | What | Fix |
+|---|---|---|
+| C23 | **One refusal message covered two unrelated market conditions.** `select_vertical` returns `None` both when no strike carries a usable delta *and* when a short was found but no wing is within reach — and the runner printed the same sentence for both. That is the difference between "the feed is broken" and "this expiry cannot build the structure", and the soak's acceptance condition asks for a *specific* refusal. | `runner.py:544-548`. The runner now re-runs `select_short_strike` — pure and cheap — and names which branch fired, including the short strike it settled on. |
+| C20 | **The protective leg had no upper width bound.** `_select_protective_strike` scores by `abs(width - target_width)` and takes the nearest — "nearest" among whatever is listed. On the sparse weekly ladder observed live (`672`, then `722..750`) a 722 short had exactly one strike beneath it: **50 wide against a target of 5**. Ten times the intended risk. Two downstream gates would have refused it (defined-loss cap; no two-sided market on a strike nobody quotes) — but neither names the cause. | `selection.py:482-484`. Bounded to `target_width` + one **median** strike increment measured from the chain itself. A ratio would be wrong both ways: a coarse ladder listing strikes every 5 legitimately cannot beat 5 against a 2-wide target, while a 1-point ladder has no excuse for 50 against 5. One increment past target is precisely the worst a *complete* ladder can do. |
+
+**All four properties are mutation-verified**, not merely tested: removing the
+bounded wait fails 2 tests, flattening the window to symmetric fails 2, deleting
+the width bound fails 2, and subscribing the underlying last fails 1. New file
+`tests/test_options_adapters.py`, 16 tests. Full suite green, exit 0.
+
+### The determinism soak — the acceptance gate for the above
+
+**20 consecutive live unarmed passes, frozen tree, market open: PASS.** [verified]
+
+```
+distinct outcomes across 20 passes: 1
+   20x  no protective strike within reach of the # short: the chain lists
+        nothing between it and # away
+distinct widths seen: none (no candidate built)
+passes NOT confirming 0 transmitted: 0
+```
+
+The acceptance condition is **stability, not a verdict**: a refusal repeated
+20/20 is the engine being deterministic, whereas the same command splitting
+across two outcomes is the race C17 existed to kill. Before the fixes, two
+consecutive passes produced two *different* failures.
+
+A methodology note worth keeping: the first soak attempt was contaminated — a
+source edit landed at pass 19 and the outcome changed under it. A soak measures
+a *frozen* tree or it measures nothing. It was re-run clean.
+
+### The next thing in the way — and it is not a defect
+
+The single refusal is market-driven, and the exact text names it: [verified]
+
+```
+blocked by  no protective strike within reach of the 722.0 short: the chain
+            lists nothing between it and 5 away
+```
+
+`select_expiration` chose **2026-09-11 at 43 DTE** over 2026-09-18 at 50 DTE,
+because it optimises `abs(dte - 45)` alone. 09-11 is a *weekly*: its ladder is
+`672` then `722..750`, 30 strikes. At spot ~738 the 0.30-delta put sits below
+722, which that chain does not list — so the short pins to the band floor at
+**722** and the only strike beneath it is the 50-wide `672` outlier, which C20
+now refuses. The short is found; the wing is not. That is a chain that cannot
+build this structure, stated precisely.
+
+| # | Gap | Status |
+|---|---|---|
+| G9 | **Expiry selection cannot see whether the chain it picked can build the structure.** It ranks by DTE proximity only, so a thin weekly beats a rich monthly by two days and then cannot supply a wing. The fix is a fallback — try the next expiry in the window when the chosen one yields no valid structure — which preserves the DTE-proximity rule rather than replacing it with a monthly preference. | Open. Not a strategy change; the strategy still wants ~45 DTE. |
+
+> Numbered **G9**, not G8: G8 is already in use for callback-driven persistence,
+> which is not in the committed gap list (it stops at G7) and was easy to
+> collide with. See below — G8 turned out to be already closed.
+
+### G8 was already closed, and looking for it found a real defect on the other side
+
+A lane dispatched to "continue G8" reported back that it was built at `a373063`
+and the brief describing it as open was wrong. Verified directly rather than
+taken on the lane's word: `transmit.py:380` emits to the sink **before** the poll
+loop and `:393` on **every** iteration, and `runner.py:633` constructs the
+`LifecycleRecorder` and passes it into both the exit path (`:330`) and the entry
+path (`:790`). Opening-side identity and partial fills already reach disk as
+observed, not from a final snapshot.
+
+| # | What | Fix |
+|---|---|---|
+| C24 | **The closing side was the broken one.** `record_partial_fill(closing=True)` wrote the fill quantity to the journal (`positions.py:659`) and the replay **discarded** it — `CLOSE_PARTIAL` set only the state, because `OpenPosition` had no field to hold it. A cancelled-after-partial exit reloaded as "closing, amount unknown": the contracts that got out and the ones still held were indistinguishable on disk. The mirror of C21, on the retiring side. | `close_filled_quantity` field with invariants bounded by the *ordered* quantity rather than `filled_quantity`, so a `CLOSE_PARTIAL` replayed before an `OPEN_FILLED` cannot raise inside `_replace` and get silently dropped. Also `sink.py:160-173`: `_seed` seeded only the opening order, so a restart mid-close came back believing nothing had filled on the exit. |
+
+**This could not have re-sent an oversized exit** — `lifecycle.py:337-348` holds
+any position that is not `OPEN`, so a `CLOSING` position is never re-decided. The
+consequence was lost information, not a duplicate order. Worth stating precisely,
+because "the store forgot how much got out" and "the engine sold it twice" are
+very different findings and the first should not be reported as the second.
+
+Landed on branch `lane4-callback-persistence`, **not yet merged**. Suite there:
+1166 passed, exit 0 (against 1153 at `a373063`). `transmit.py` untouched, single
+`placeOrder` call site unchanged, AST guard green.
 
 ## Runtime capabilities still unverified
 

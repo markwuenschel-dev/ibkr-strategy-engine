@@ -154,12 +154,26 @@ def narrow_strikes(
     *,
     reference_price: Decimal | None,
     width: int,
+    right: str | None = None,
 ) -> list[Decimal]:
     """Cut the universe down before subscribing to quotes.
 
     The reference price is used **only** to choose which strikes to look at.
     Final selection is delta-based; picking strikes by distance from spot would
     be a different strategy wearing this one's name.
+
+    ``reference_price=None`` falls back to the *positional* median of the listed
+    ladder, which is a different thing from spot and is only defensible when no
+    price is obtainable. A ladder is rarely centred on spot, so the fallback
+    window can sit anywhere; callers that can get a price must pass one.
+
+    ``right`` shapes the window around spot. A one-sided structure needs strikes
+    on one side and barely any on the other: a put spread sells below spot and
+    buys further below still, so a symmetric window spends half its budget on
+    calls-side strikes it will never select, and reaches down only half as far
+    as ``width`` suggests. That shortfall is not cosmetic -- if the window floor
+    lands on the short strike, there is no protective strike beneath it and the
+    structure cannot be built at all.
     """
     if not strikes:
         return []
@@ -167,8 +181,16 @@ def narrow_strikes(
         middle = len(strikes) // 2
     else:
         middle = min(range(len(strikes)), key=lambda i: abs(strikes[i] - reference_price))
-    half = max(1, width // 2)
-    return list(strikes[max(0, middle - half) : middle + half + 1])
+    if right is None:
+        half = max(1, width // 2)
+        low, high = middle - half, middle + half
+    else:
+        # A small cushion on the unused side, so the short strike still has
+        # somewhere to move if spot sits between two listed strikes.
+        cushion = max(1, width // 8)
+        near, far = (cushion, width) if right.upper().startswith("C") else (width, cushion)
+        low, high = middle - near, middle + far
+    return list(strikes[max(0, low) : high + 1])
 
 
 def qualify_strikes(

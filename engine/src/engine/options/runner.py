@@ -71,6 +71,7 @@ from .selection import (
     build_vertical,
     candidates_from_snapshot,
     rights_for,
+    select_short_strike,
     select_vertical,
     target_delta_for,
 )
@@ -420,9 +421,35 @@ def _record_open_outcome(
     report.blockers.append(f"order did not fill: {result.state.value}")
 
 
+def _underlying_reference_price(broker: Any, symbol: str) -> Decimal | None:
+    """Spot, used only to centre the strike window.
+
+    Deliberately forgiving: a broker without a ``quote`` method, a refused
+    subscription, or a quote carrying no price all mean the same thing to the
+    caller -- no reference -- and none of them should abort a pass, because the
+    window has a (worse) fallback. What must not happen is this failing
+    *silently*, so the caller records it rather than this returning a guess.
+    """
+    quote = getattr(broker, "quote", None)
+    if not callable(quote):
+        return None
+    try:
+        price = getattr(quote(symbol), "price", None)
+    except Exception:  # noqa: BLE001 - a reference price is an optimisation
+        return None
+    if price is None:
+        return None
+    try:
+        value = Decimal(str(price))
+    except (ArithmeticError, ValueError):
+        return None
+    return value if value.is_finite() and value > ZERO else None
+
+
 def _build_candidate(
     *,
     ib: Any,
+    broker: Any,
     symbol: str,
     bias: Bias,
     policy: RiskPolicy,
@@ -470,7 +497,25 @@ def _build_candidate(
 
     right = rights_for(bias)[0]
     listed = enumerate_strikes(ib, symbol, expiry.expiry, right.value)
-    window = narrow_strikes(listed, reference_price=None, width=strike_window)
+    # The window must be centred on spot, not on the middle of the listed
+    # ladder. Those coincide only by accident, and when they diverge the engine
+    # subscribes to a band of strikes that has no relationship to the ones it
+    # intends to sell. Only narrowing depends on this price; selection stays
+    # delta-based, so an approximate figure is fine and a missing one is
+    # survivable -- but it is recorded, because a positional window is a
+    # degraded window and a silent fallback would hide that.
+    reference_price = _underlying_reference_price(broker, symbol)
+    if reference_price is None:
+        report.errors.append(
+            f"no reference price for {symbol}; the strike window fell back to the "
+            "middle of the listed ladder, which need not be near spot"
+        )
+    window = narrow_strikes(
+        listed,
+        reference_price=reference_price,
+        width=strike_window,
+        right=right.value,
+    )
     contracts: list[QualifiedOption] = list(
         qualify_strikes(ib, symbol, expiry.expiry, window, right.value)
     )
@@ -491,16 +536,33 @@ def _build_candidate(
         )
         return None, None
 
+    universe = candidates_from_snapshot(contracts, snapshot)
     selection = select_vertical(
-        candidates_from_snapshot(contracts, snapshot),
+        universe,
         target_delta=target_delta_for(bias, policy),
         right=right,
         target_width=policy.target_width,
     )
     if selection is None:
-        report.blockers.append(
-            "no strike pair with a usable delta and a protective leg was available"
+        # Two very different market conditions reach this branch, and a single
+        # message for both is the difference between "the feed is broken" and
+        # "this expiry cannot build the structure". Re-running the first half of
+        # the selection is cheap and pure, and it names which one happened.
+        short = select_short_strike(
+            universe, target_delta=target_delta_for(bias, policy), right=right
         )
+        if short is None:
+            report.blockers.append(
+                f"no {right.value} strike in the window carries a usable delta "
+                f"({len(universe)} contracts considered)"
+            )
+        else:
+            report.blockers.append(
+                f"no protective strike within reach of the {short.contract.strike} "
+                f"short: the chain lists nothing between it and "
+                f"{policy.target_width} away, so the only wing available would "
+                "risk far more than the target width"
+            )
         return None, snapshot
 
     # Price the structure from the book rather than a fraction of the width.
@@ -623,6 +685,7 @@ def run_once(
 
         candidate, snapshot = _build_candidate(
             ib=ib,
+            broker=broker,
             symbol=symbol,
             bias=bias,
             policy=policy,
