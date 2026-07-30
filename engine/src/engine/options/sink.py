@@ -157,6 +157,20 @@ class LifecycleRecorder:
                 commission=position.commission,
                 priced=position.filled_quantity > ZERO,
             )
+            # The closing order is a different order with an independent fill
+            # count, and it needs its own seed. Seeding only the opening key
+            # meant a restart mid-close came back believing nothing had filled
+            # on the exit, so the first callback after recovery re-appended a
+            # fill the store already held -- the monotonic guard the opening
+            # side has, absent on the side where the position is being retired.
+            self._known[(strategy_id, True)] = _Known(
+                state=None,
+                filled=position.close_filled_quantity,
+                order_id=position.close_order_id,
+                perm_id=position.close_perm_id,
+                commission=None,
+                priced=position.closing_debit is not None,
+            )
 
     # -- the sink ---------------------------------------------------------
 
