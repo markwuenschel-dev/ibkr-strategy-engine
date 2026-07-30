@@ -48,7 +48,20 @@ TRANSMITTING_ATTRIBUTES = frozenset({"placeOrder", "place", "transmit"})
 
 
 def options_modules() -> list[Path]:
-    return sorted(PACKAGE_DIR.glob("*.py"))
+    """Every module in the package, **recursively**.
+
+    This was ``glob("*.py")``, which walks one directory. A subpackage --
+    ``engine/options/strategies/`` say -- would have been invisible to every
+    static check in this file, and the checks would have kept passing while
+    saying nothing about the new code. ``rglob`` costs nothing today (the
+    package is flat, pinned by ``test_the_package_is_flat_or_the_walk_is_deep``)
+    and is what makes the checks survive the directory that gets added later.
+    """
+    return sorted(
+        path
+        for path in PACKAGE_DIR.rglob("*.py")
+        if "__pycache__" not in path.parts
+    )
 
 
 def spread_for_combo() -> Any:
@@ -186,6 +199,126 @@ class TestNoTransmittingCallSites:
                 if node.value in TRANSMITTING_ATTRIBUTES:
                     offenders.append(f"{path.name}:{node.lineno} {node.value!r}")
         assert offenders == [], f"a transmitting name appears as a string: {offenders}"
+
+    def test_the_package_is_flat_or_the_walk_is_deep(self) -> None:
+        """Pins the fact that made the old one-level glob adequate.
+
+        The static checks now recurse, so this is no longer load-bearing for
+        their correctness -- it is here to fail loudly the day a subpackage
+        appears, as the review prompt to confirm the deep walk really reached
+        it rather than to forbid the directory.
+        """
+        flat = {path for path in PACKAGE_DIR.glob("*.py")}
+        deep = set(options_modules())
+        assert flat <= deep, "the recursive walk lost a top-level module"
+        subpackaged = sorted(str(p.relative_to(PACKAGE_DIR)) for p in deep - flat)
+        assert subpackaged == [], (
+            "engine.options grew a subpackage; the static checks below now cover "
+            f"it via rglob -- confirm they still pass meaningfully for {subpackaged}"
+        )
+
+    def test_no_module_except_transmit_names_a_transmitting_attribute_at_all(
+        self,
+    ) -> None:
+        """Not just in call position. ``send = ib.placeOrder`` then ``send(...)``.
+
+        The sibling check above inspects ``Call.func``, so it sees
+        ``ib.placeOrder(...)`` and nothing else. A bound method stashed in a
+        variable, a dict value, a ``functools.partial`` or a decorator argument
+        is an ``ast.Attribute`` in *load* position, which that check walks past.
+        This one flags the name wherever it appears in real syntax -- the
+        binding is the thing worth forbidding, because a name that is never
+        bound can never be called.
+        """
+        offenders: list[str] = []
+        for path in options_modules():
+            if path.name == "transmit.py":
+                continue
+            for node in ast.walk(parse(path)):
+                if isinstance(node, ast.Attribute) and node.attr in TRANSMITTING_ATTRIBUTES:
+                    offenders.append(f"{path.name}:{node.lineno} .{node.attr}")
+                elif isinstance(node, ast.Name) and node.id in TRANSMITTING_ATTRIBUTES:
+                    offenders.append(f"{path.name}:{node.lineno} {node.id}")
+        assert offenders == [], f"a transmitting name is bound outside the chokepoint: {offenders}"
+
+    def test_exactly_one_transmitting_call_in_the_package_and_it_is_in_place_combo(
+        self,
+    ) -> None:
+        """The whole claim, as one assertion: one sender, and it is the one we
+        think it is. A second ``placeOrder`` inside ``transmit.py`` -- a retry
+        path, a cancel-replace -- would satisfy every other check in this file
+        and would be a second door."""
+        from engine.options import transmit as transmit_module
+
+        tree = parse(Path(transmit_module.__file__).resolve())
+        sends = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "placeOrder"
+        ]
+        assert len(sends) == 1, f"transmit.py has {len(sends)} placeOrder calls"
+
+        owners = [
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and any(inner is sends[0] for inner in ast.walk(node))
+        ]
+        assert owners == ["place_combo"], f"the send lives in {owners}"
+
+    def test_the_structure_digest_is_checked_before_the_send(self) -> None:
+        """Ordering, not merely presence.
+
+        ``place_combo`` compares the digest of the intent it is about to send
+        against the digest the authorization carries. A digest checked *after*
+        ``placeOrder`` returned would still pass a test that only asserted the
+        comparison exists, while the order was already at the broker.
+        """
+        from engine.options import transmit as transmit_module
+
+        tree = parse(Path(transmit_module.__file__).resolve())
+        combo = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "place_combo"
+        )
+        send_line = next(
+            node.lineno
+            for node in ast.walk(combo)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "placeOrder"
+        )
+        digest_guards = [
+            node.lineno
+            for node in ast.walk(combo)
+            if isinstance(node, ast.If)
+            for cmp_node in ast.walk(node.test)
+            if isinstance(cmp_node, ast.Attribute) and cmp_node.attr == "digest"
+        ]
+        assert digest_guards, "place_combo does not compare the authorization digest"
+        assert max(digest_guards) < send_line, (
+            f"the digest guard at {digest_guards} does not precede the send at "
+            f"{send_line} -- an order can be transmitted before it is matched "
+            "against what was authorized"
+        )
+
+    def test_no_module_forwards_arbitrary_attributes(self) -> None:
+        """``__getattr__`` on a class holding a raw ib client re-exposes every
+        method the client has, ``placeOrder`` included, under a name no static
+        check in this file would recognise. There is no such wrapper today and
+        this is what keeps it that way."""
+        offenders: list[str] = []
+        for path in options_modules():
+            for node in ast.walk(parse(path)):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in {
+                    "__getattr__",
+                    "__getattribute__",
+                }:
+                    offenders.append(f"{path.name}:{node.lineno} {node.name}")
+        assert offenders == [], f"an attribute-forwarding wrapper exists: {offenders}"
 
     def test_no_module_imports_the_equity_broker(self) -> None:
         """engine.broker owns the only placeOrder in the tree. The options
