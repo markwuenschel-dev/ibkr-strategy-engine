@@ -470,13 +470,21 @@ and then described with a claim the code has no evidence for. The refusal was
 conservative and correct; the stated reason was wrong. Being blocked for a false
 reason is its own defect: it trains the operator to distrust the message.
 
-### C26 — a mid-price limit on a 1-wide spread does not fill
+### C26 — a mid-price limit on a 1-wide spread did not fill in ~90 minutes
 
 The order priced at the mid (short mid − long mid = 0.20) and sat working,
-unfilled, for over three hours of liquid regular-session trading. This is not a
-plumbing failure — it is the pricing rule meeting the real book. `_build_candidate`
-prices from the mid, which on a 1-wide SPY vertical is frequently outside where
-the spread actually trades.
+unfilled, from **11:16 ET to 12:44 ET — 88 minutes** of liquid regular-session
+trading (still working at 12:57, 101 minutes).
+
+> Corrected: this entry first read "over three hours", which conflated the time
+> *remaining until the close* with the time the order had been *working*. The
+> submission was 15:16 UTC = 11:16 ET. The duration is the evidence here, so
+> getting it wrong hollowed out the claim it was supporting.
+
+What the evidence supports is "a mid-priced 1-wide spread went unfilled for
+roughly 90 minutes", not yet a general claim about mid-pricing. `_build_candidate`
+prices from the mid, which on a 1-wide SPY vertical is plausibly outside where
+the spread actually trades — plausible, and not yet demonstrated.
 
 **Consequence for the multi-position target:** the bottleneck on gathering fill,
 partial-fill and commission evidence is *pricing*, not concurrency. Three
