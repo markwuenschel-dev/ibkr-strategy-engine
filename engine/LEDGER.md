@@ -428,6 +428,68 @@ on all six named conditions, with a control proving the checks are not vacuous;
 C21 partial-fill exit sizing; and three forgery attempts stopped by domain
 invariants before reaching the target.
 
+## M10 — the first order this engine has ever sent, 2026-07-30 15:16 UTC
+
+`engine options-execution-proof --symbol SPY --dte 50 --arm`, exit 0.
+
+```
+orderId 896   permId 1151642162   orderRef 13e95292-dbbd-4846-94ab-dcdddaa5f77e
+BAG SPY  BUY 1  LMT -0.20 (net credit 0.20)  TIF=DAY
+SELL 1x SPY 2026-09-18 713.0 P | BUY 1x SPY 2026-09-18 712.0 P   max loss $80
+PreSubmitted -> Submitted,  filled 0.0,  remaining 1.0
+```
+
+**G7 is closed on acceptance, open on fill.** `place_combo` reached IBKR, IBKR
+accepted the combo, and the identifiers came back. What remains unproven is
+everything downstream of a fill: partial fills, commissions, the close path.
+
+**Persistence worked as designed.** `OPEN_SUBMITTED` was written *before* the
+send, then `OPEN_ACKNOWLEDGED order=896`, then again with `perm=1151642162` as
+the permId arrived. Identity reached disk from live observation, not from a
+final snapshot.
+
+**The restart gate held, and D2 is why.** A fresh process replayed from disk and
+refused a second entry with `RUNNER_RECONCILIATION_DISAGREEMENT`, transmitting
+nothing. Worth recording precisely: the session budget printed `opening orders
+0 of 1 used` — it is per-process and **reset on restart**. The only thing that
+stopped a duplicate was the reconciliation outcome gate merged forty minutes
+earlier. Without D2 this restart is the duplicate send D2 was written to
+describe.
+
+### C25 — the reconciler asserts something it cannot know
+
+The run reported:
+
+> `ORDERS ABSENT  ... transmitted, and the broker is not working them; either
+> they filled unobserved or were never accepted`
+
+**False.** A direct read-only query returned `status=Submitted, remaining=1.0` —
+the broker *was* working it. `run_once` asks only `broker.positions()`, and a
+working unfilled order is not a position, so it is invisible to reconciliation
+and then described with a claim the code has no evidence for. The refusal was
+conservative and correct; the stated reason was wrong. Being blocked for a false
+reason is its own defect: it trains the operator to distrust the message.
+
+### C26 — a mid-price limit on a 1-wide spread does not fill
+
+The order priced at the mid (short mid − long mid = 0.20) and sat working,
+unfilled, for over three hours of liquid regular-session trading. This is not a
+plumbing failure — it is the pricing rule meeting the real book. `_build_candidate`
+prices from the mid, which on a 1-wide SPY vertical is frequently outside where
+the spread actually trades.
+
+**Consequence for the multi-position target:** the bottleneck on gathering fill,
+partial-fill and commission evidence is *pricing*, not concurrency. Three
+concurrent mid-priced orders produce three working orders and no fills. Cancel /
+replace with a bounded walk toward the natural price is what converts a working
+order into evidence.
+
+| # | Gap | Status |
+|---|---|---|
+| G10 | No `cancelOrder` anywhere in `engine/src` — a working order cannot be pulled or repriced programmatically, only by hand in TWS. | Open; lane in flight. |
+| G11 | Reconciliation never queries open orders, so a working order is invisible (C25). | Open; lane in flight. |
+| G12 | Entry pricing is the mid with no walk toward the natural (C26). | Open. |
+
 ## Runtime capabilities still unverified
 
 Everything below is unproven against a live broker and must not be described as working:
