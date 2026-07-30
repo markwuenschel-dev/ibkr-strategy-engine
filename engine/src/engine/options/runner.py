@@ -46,7 +46,7 @@ from uuid import uuid4
 from ..errors import EngineError, RefusedError
 from ..journal import OrderJournal
 from ..safety import SafetyGate
-from .adapters import IBKRWhatIfAdapter
+from .adapters import IBKRWhatIfAdapter, read_open_orders
 from .chain import (
     QualifiedOption,
     discover_expirations,
@@ -75,6 +75,8 @@ from .positions import (
     ReconciliationOutcome,
     ReconciliationReport,
 )
+from .proof import envelope_for
+from .reprice import DEFAULT_LADDER, RepriceLadder, RepriceOutcome, work_order
 from .risk import CandidateRiskAssessment, assess_candidate
 from .sink import LifecycleRecorder
 from .selection import (
@@ -134,6 +136,9 @@ class RunReport:
     risk: CandidateRiskAssessment | None = None
     governor: GovernorVerdict | None = None
     portfolio: PortfolioSnapshot | None = None
+    #: What the cancel/replace ladder did with an entry that would not fill.
+    #: Absent on every pass where the order resolved on its own.
+    reprice: RepriceOutcome | None = None
     entered: bool = False
     blockers: list[str] = field(default_factory=list)
     refusal_codes: list[str] = field(default_factory=list)
@@ -171,6 +176,8 @@ class RunReport:
         lines.append(f"TRANSMITTED      {len(self.transmissions)} order(s)")
         for result in self.transmissions:
             lines.append(f"  {result.describe()}")
+        if self.reprice is not None:
+            lines.append(f"  worked           {self.reprice.describe()}")
         lines.append("")
         lines.append(f"ENTERED          {'YES' if self.entered else 'NO'}")
         for blocker in self.blockers:
@@ -198,6 +205,7 @@ class RunReport:
             "candidate": self.candidate.describe() if self.candidate else None,
             "risk": self.risk.to_record() if self.risk else None,
             "governor": self.governor.to_record() if self.governor else None,
+            "reprice": self.reprice.to_record() if self.reprice else None,
             "entered": self.entered,
             "blockers": list(self.blockers),
             "refusal_codes": list(self.refusal_codes),
@@ -391,6 +399,46 @@ def _manage_one(
         )
 
 
+def _wall_clock() -> dt.datetime:
+    """Real elapsed time, for the one bound that is about real elapsed time.
+
+    Everything else in a pass is timestamped from the injected ``now``, which
+    is a *logical* clock a caller may set to any instant. The reprice ladder's
+    time-to-live is not a logical duration -- it is two minutes of an order
+    resting in a live book -- so it is measured here and compared against
+    itself.
+    """
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _still_working(result: TransmitResult) -> bool:
+    """Whether there is a live order left to work.
+
+    Exactly the three states in which the broker has told us it holds the order
+    and may still fill it. This is the state the live run ended in: ``Submitted``
+    -> ACKNOWLEDGED, working, unfilled, and nothing able to retract it.
+
+    ``TIMED_OUT`` and ``UNKNOWN`` are deliberately excluded even though both
+    mean "not finished". Neither is a statement about the order -- one says we
+    stopped waiting and the other says the socket dropped -- and in both cases
+    the engine has never heard a status at all. Cancelling on that basis is not
+    order management, it is guessing at a broker we have just concluded we
+    cannot hear from. Those two stay where they were: recorded as uncertain,
+    with entries blocked until reconciliation resolves them.
+
+    A **partial fill** is excluded too, and that exclusion is load-bearing.
+    ``PARTIALLY_FILLED`` is a working state, but contracts are already in the
+    book: cancelling the remainder and replacing it at a lower credit would
+    open a second position on top of a real one, at a price the first half was
+    never sized against. A partial is a position to manage, not an order to
+    work.
+    """
+    snapshot = result.snapshot
+    if snapshot is None or result.trade is None:
+        return False
+    return snapshot.is_working and not snapshot.has_position
+
+
 def _record_open_outcome(
     strategy_id: Any,
     result: TransmitResult,
@@ -478,6 +526,22 @@ _RECONCILIATION_BLOCKERS: dict[ReconciliationOutcome, str] = {
 }
 
 
+def _open_orders(ib: Any, *, report: RunReport) -> Any:
+    """:func:`~engine.options.adapters.read_open_orders`, with the failure named.
+
+    A broker that raises is a broker that could not be asked, which is ``None``
+    -- never an empty list. The distinction is the whole point: see the
+    reconciler's ``broker_orders`` contract.
+    """
+    try:
+        return read_open_orders(ib)
+    except Exception as exc:  # noqa: BLE001 - adapter boundary
+        report.errors.append(
+            f"the broker's open orders could not be read: {type(exc).__name__}: {exc}"
+        )
+        return None
+
+
 def _reconcile(
     broker: Any, store: PositionStore, *, now: dt.datetime, report: RunReport
 ) -> None:
@@ -537,8 +601,16 @@ def _reconcile(
         report.reconciliation_outcome = ReconciliationOutcome.UNAVAILABLE
         return
 
+    # A working order is not a position, so ``positions()`` cannot see it -- and
+    # for as long as this was the only question asked, a combo the broker was
+    # demonstrably working was reported as one the broker was not working. The
+    # order-level query is what makes the report's claim true.
     try:
-        result = store.reconcile_against_broker(reported, checked_at=now)
+        result = store.reconcile_against_broker(
+            reported,
+            checked_at=now,
+            broker_orders=_open_orders(getattr(broker, "ib", broker), report=report),
+        )
     except Exception as exc:  # noqa: BLE001 - adapter boundary
         report.errors.append(f"reconciliation failed: {type(exc).__name__}: {exc}")
         report.reconciliation_outcome = ReconciliationOutcome.UNAVAILABLE
@@ -745,6 +817,7 @@ def run_once(
     enforce_iv_rank: bool = True,
     entry_preflight: EntryPreflight | None = None,
     sink: Any = None,
+    reprice: RepriceLadder | None = DEFAULT_LADDER,
 ) -> RunReport:
     """Reconcile, manage every open position, then consider one new entry.
 
@@ -767,6 +840,15 @@ def run_once(
     replaces the default :class:`~engine.options.sink.LifecycleRecorder` -- a
     caller that supplies one is responsible for it still reaching the store,
     which is why the proof wraps rather than replaces the recorder.
+
+    ``reprice`` bounds what happens to an entry the broker accepts and does not
+    fill. It defaults to :data:`engine.options.reprice.DEFAULT_LADDER` because
+    the alternative is what the first live order actually did: rest in the book
+    unfilled, with the pass reporting it as unresolved and refusing every later
+    entry, and nothing in the process able to clear it. Passing ``None``
+    restores that behaviour exactly and is not recommended for an unattended
+    run. The ladder can only lower the credit, only inside the envelope the
+    risk gates approved, at most four times, and it ends by cancelling.
     """
     now = now or dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
     today = today or now.date()
@@ -974,6 +1056,64 @@ def run_once(
 
         report.transmissions.append(result)
         journal.record("order_placed", **result.to_record())
+
+        # -- 5. work the order, if the broker took it and did not fill it ----
+        # Runs before the outcome is judged, because until the ladder has
+        # finished there is no final outcome to judge: an order still working
+        # is not an order whose result is known, and the previous code called
+        # that "unknown" and stopped -- leaving the order resting.
+        if reprice is not None and _still_working(result):
+            outcome = work_order(
+                ib,
+                candidate,
+                result,
+                authorization=authorization,
+                gate=gate,
+                armed=armed,
+                # Both ends of the deadline come from the same clock. ``now``
+                # is the pass's *logical* time and may be injected -- measuring
+                # a two-minute wall-clock deadline from it made the ladder
+                # expire before its first rung whenever the two disagreed.
+                started_at=_wall_clock(),
+                clock=_wall_clock,
+                # A cancelled rung is a real OPEN_FAILED -- nothing is in the
+                # market -- and replaying that retires the position AND releases
+                # its buying-power reservation. So the replacement needs its own
+                # submission record, carrying the same reservation, written
+                # before it is sent, exactly as the first one was above.
+                # Without it the governor would size the next decision against a
+                # book that believes this capital is free while a real order
+                # rests in the market.
+                record_submission=lambda replacement: store.record_open_submitted(
+                    replacement,
+                    at=dt.datetime.now(dt.timezone.utc),
+                    buying_power_reserved=bpr,
+                ),
+                # And the order journal, because gate_daily_count() counts
+                # ``order_placed`` records. Every real transmission is one.
+                record_transmission=lambda sent: journal.record(
+                    "order_placed", **sent.to_record()
+                ),
+                ladder=reprice,
+                envelope=envelope_for(candidate),
+                account=account,
+                sink=recorder,
+            )
+            report.reprice = outcome
+            # A summary of the ladder, under its own event name. The individual
+            # sends were already journalled as ``order_placed`` by
+            # ``record_transmission`` above -- this must NOT be another one, or
+            # the daily count would double-count every rung.
+            journal.record("order_worked", **outcome.to_record())
+            if outcome.final is not None and outcome.final is not result:
+                # Only a *different* order is a second transmission. A ladder
+                # that refused before it sent anything hands back the same
+                # result it was given, and reporting that twice would make the
+                # pass look like it placed two orders.
+                report.transmissions.append(outcome.final)
+                result = outcome.final
+            if outcome.detail:
+                report.blockers.append(f"entry order worked: {outcome.describe()}")
 
         _record_open_outcome(candidate.strategy_id, result, store=store, now=now, report=report)
 

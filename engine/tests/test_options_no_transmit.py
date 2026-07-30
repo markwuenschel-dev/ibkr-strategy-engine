@@ -46,6 +46,18 @@ PACKAGE_DIR = Path(options_package.__file__).resolve().parent
 # the part a refactor is free to change.
 TRANSMITTING_ATTRIBUTES = frozenset({"placeOrder", "place", "transmit"})
 
+# ``cancelOrder`` is the second broker-mutating verb, and it gets the same
+# treatment for the same reason: one call site, inside the chokepoint, behind a
+# required token. It is kept in its own set rather than merged into the one
+# above because the two are pinned to *different* functions -- ``place_combo``
+# and ``cancel_combo`` -- and a single set could not say which.
+#
+# ``cancelMktData`` is deliberately absent. It cancels a subscription, not an
+# order, and the adapters call it on every quote teardown.
+CANCELLING_ATTRIBUTES = frozenset({"cancelOrder", "cancelOrderAsync"})
+
+MUTATING_ATTRIBUTES = TRANSMITTING_ATTRIBUTES | CANCELLING_ATTRIBUTES
+
 
 def options_modules() -> list[Path]:
     """Every module in the package, **recursively**.
@@ -158,9 +170,9 @@ class TestNoTransmittingCallSites:
                 if not isinstance(node, ast.Call):
                     continue
                 func = node.func
-                if isinstance(func, ast.Attribute) and func.attr in TRANSMITTING_ATTRIBUTES:
+                if isinstance(func, ast.Attribute) and func.attr in MUTATING_ATTRIBUTES:
                     offenders.append(f"{path.name}:{node.lineno} .{func.attr}()")
-                elif isinstance(func, ast.Name) and func.id in TRANSMITTING_ATTRIBUTES:
+                elif isinstance(func, ast.Name) and func.id in MUTATING_ATTRIBUTES:
                     offenders.append(f"{path.name}:{node.lineno} {func.id}()")
         assert offenders == [], f"a non-chokepoint module can transmit: {offenders}"
 
@@ -196,7 +208,7 @@ class TestNoTransmittingCallSites:
             for node in ast.walk(parse(path)):
                 if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
                     continue
-                if node.value in TRANSMITTING_ATTRIBUTES:
+                if node.value in MUTATING_ATTRIBUTES:
                     offenders.append(f"{path.name}:{node.lineno} {node.value!r}")
         assert offenders == [], f"a transmitting name appears as a string: {offenders}"
 
@@ -235,9 +247,9 @@ class TestNoTransmittingCallSites:
             if path.name == "transmit.py":
                 continue
             for node in ast.walk(parse(path)):
-                if isinstance(node, ast.Attribute) and node.attr in TRANSMITTING_ATTRIBUTES:
+                if isinstance(node, ast.Attribute) and node.attr in MUTATING_ATTRIBUTES:
                     offenders.append(f"{path.name}:{node.lineno} .{node.attr}")
-                elif isinstance(node, ast.Name) and node.id in TRANSMITTING_ATTRIBUTES:
+                elif isinstance(node, ast.Name) and node.id in MUTATING_ATTRIBUTES:
                     offenders.append(f"{path.name}:{node.lineno} {node.id}")
         assert offenders == [], f"a transmitting name is bound outside the chokepoint: {offenders}"
 
@@ -267,6 +279,101 @@ class TestNoTransmittingCallSites:
             and any(inner is sends[0] for inner in ast.walk(node))
         ]
         assert owners == ["place_combo"], f"the send lives in {owners}"
+
+    def test_exactly_one_cancelling_call_in_the_package_and_it_is_in_cancel_combo(
+        self,
+    ) -> None:
+        """The same claim for the second broker-mutating verb.
+
+        ``cancelOrder`` was added because a working combo that neither filled
+        nor rejected could not be pulled programmatically -- the engine could
+        get into a position it had no way out of. It gets the same shape as the
+        send: one call site, in a named function, behind a token with no public
+        constructor. A cancel appearing inside the reprice ladder, the runner or
+        a retry helper would satisfy every other check in this file and would be
+        a second door.
+        """
+        from engine.options import transmit as transmit_module
+
+        tree = parse(Path(transmit_module.__file__).resolve())
+        cancels = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in CANCELLING_ATTRIBUTES
+        ]
+        assert len(cancels) == 1, f"transmit.py has {len(cancels)} cancelOrder calls"
+
+        owners = [
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and any(inner is cancels[0] for inner in ast.walk(node))
+        ]
+        assert owners == ["cancel_combo"], f"the cancel lives in {owners}"
+
+    def test_the_cancel_token_is_checked_before_the_cancel(self) -> None:
+        """Ordering, as with the digest guard on the send.
+
+        A ``CancelAuthorization`` check written *after* ``cancelOrder`` returned
+        would pass a test that only asserted the check exists, while the request
+        was already at the broker.
+        """
+        from engine.options import transmit as transmit_module
+
+        tree = parse(Path(transmit_module.__file__).resolve())
+        cancel_fn = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "cancel_combo"
+        )
+        cancel_line = next(
+            node.lineno
+            for node in ast.walk(cancel_fn)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in CANCELLING_ATTRIBUTES
+        )
+        guards = [
+            node.lineno
+            for node in ast.walk(cancel_fn)
+            if isinstance(node, ast.If)
+            for inner in ast.walk(node.test)
+            if isinstance(inner, ast.Name) and inner.id == "CancelAuthorization"
+        ]
+        assert guards, "cancel_combo does not check the authorization type"
+        assert max(guards) < cancel_line, (
+            f"the token guard at {guards} does not precede the cancel at "
+            f"{cancel_line}"
+        )
+
+    def test_only_the_two_authorize_functions_hold_the_authorization_key(self) -> None:
+        """The private sentinel is what makes both tokens unforgeable.
+
+        Four functions may name it -- the two that mint a
+        ``TransmitAuthorization``, the one that mints a ``CancelAuthorization``,
+        and the reprice minter -- plus the ``__post_init__`` checks that compare
+        against it. Anything else naming it is a way to mint a token without
+        running a gate.
+        """
+        from engine.options import transmit as transmit_module
+
+        tree = parse(Path(transmit_module.__file__).resolve())
+        holders: set[str] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Name) and inner.id == "_AUTHORIZATION_KEY":
+                    holders.add(node.name)
+        assert holders == {
+            "__post_init__",
+            "authorize_open",
+            "authorize_close",
+            "authorize_cancel",
+            "authorize_reprice",
+        }, holders
 
     def test_the_structure_digest_is_checked_before_the_send(self) -> None:
         """Ordering, not merely presence.
@@ -393,7 +500,7 @@ class TestPortsCannotTransmit:
         offenders: list[str] = []
         for node in ast.walk(parse(Path(sink_module.__file__).resolve())):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-                if node.func.attr in TRANSMITTING_ATTRIBUTES:
+                if node.func.attr in MUTATING_ATTRIBUTES:
                     offenders.append(f"sink.py:{node.lineno} .{node.func.attr}()")
         assert offenders == [], offenders
 
@@ -440,7 +547,7 @@ class TestOptionsCliIsNotArmable:
                 continue
             for inner in ast.walk(node):
                 if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute):
-                    if inner.func.attr in TRANSMITTING_ATTRIBUTES:
+                    if inner.func.attr in MUTATING_ATTRIBUTES:
                         offenders.append(f"{node.name}:{inner.lineno} .{inner.func.attr}()")
         assert offenders == [], f"an options CLI handler transmits: {offenders}"
 

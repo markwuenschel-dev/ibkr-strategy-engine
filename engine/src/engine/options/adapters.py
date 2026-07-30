@@ -50,7 +50,45 @@ from .marketdata import (
 from .portfolio import PortfolioSnapshot, PositionExposure
 from .ports import UNDERLYING_GENERATION_KEY, StrategyQuoteSnapshot
 
+#: How the broker is asked what it is still working, in order of preference.
+#:
+#: ``openTrades`` first, because a ``Trade`` carries the ``Order`` -- and so the
+#: ``orderRef`` this engine stamps with the strategy id, which is the only
+#: identifier that both survives a reconnect and proves the order is ours.
+#: ``openOrders`` is the same information without the wrapper. ``trades`` is
+#: last and is a superset that includes finished orders; the reconciler matches
+#: on identity rather than on liveness, so a completed order in the list can
+#: only make a position look *more* accounted for, never less.
+OPEN_ORDER_READERS = ("openTrades", "openOrders", "trades")
+
+
+def read_open_orders(ib: Any) -> tuple[Any, ...] | None:
+    """What the broker is working, or ``None`` if it could not be asked.
+
+    ``None`` and ``()`` are different answers and
+    :meth:`engine.options.positions.PositionStore.reconcile_against_broker`
+    treats them differently. An engine that cannot enumerate open orders must
+    not be allowed to report, of an order the broker is working, that the broker
+    is not working it -- that false claim is what this function exists to make
+    unrepresentable.
+
+    Raises whatever the client raises. A caller that cannot tolerate that is
+    telling itself the query succeeded, which is the same mistake one layer up.
+    """
+    for name in OPEN_ORDER_READERS:
+        reader = getattr(ib, name, None)
+        if not callable(reader):
+            continue
+        answer = reader()
+        if answer is None:
+            continue
+        return tuple(answer)
+    return None
+
+
 __all__ = [
+    "OPEN_ORDER_READERS",
+    "read_open_orders",
     "IBKRContractDataAdapter",
     "IBKRVolatilityHistoryAdapter",
     "IBKRWhatIfAdapter",

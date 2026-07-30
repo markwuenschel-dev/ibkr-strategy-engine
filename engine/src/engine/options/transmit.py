@@ -33,6 +33,33 @@ exempt from the daily order cap:
 
 The kill switch still blocks both. That is the one case where the operator has
 said "stop", and the engine obeying literally is the whole value of the file.
+
+**Cancelling is the same asymmetry, taken further.** :func:`authorize_cancel`
+consults neither the governor, nor the daily cap, nor any risk assessment, and
+does not even need an intent: a cancel can only ever *reduce* exposure, and the
+worst thing a spurious one can do is leave the engine flat. Requiring a full
+opening authorization to pull a working order would mean the engine could get
+into a position it was not allowed to get out of -- which is how the live run
+that motivated this module ended, with a combo working unfilled and no
+programmatic way to retract it.
+
+What a cancel still needs, and why:
+
+* the kill switch clear -- ``HALT`` means stop, and an engine that keeps
+  touching the broker after a halt is not halted;
+* ``--arm`` -- a dry run must not reach out and cancel a real order;
+* a strategy id -- so the cancellation lands in the same position's history as
+  the send it retracts, rather than as an orphan event.
+
+**A replace is a new send, and is authorized as one.** :func:`authorize_reprice`
+mints an ordinary :class:`TransmitAuthorization`, so the repriced order goes out
+through :func:`place_combo` past the same digest check as any other. It builds
+the repriced intent *itself* from the structure that was originally approved,
+so the only thing a caller can vary is a single price -- and that price must
+land inside the :class:`~engine.options.proof.PriceEnvelope` the risk gates were
+run against. Everything else about the order is carried over rather than
+supplied, which is what makes "a replace cannot become a different order" a
+property of the code rather than a promise in a comment.
 """
 
 from __future__ import annotations
@@ -47,26 +74,100 @@ from uuid import UUID
 
 from ..errors import RefusedError
 from ..safety import SafetyGate
-from .domain import OptionStrategyIntent, PriceEffect, StrategyAction
+from .domain import (
+    OptionStrategyIntent,
+    PriceEffect,
+    StrategyAction,
+    compute_maximum_loss_per_contract,
+)
 from .execution import build_combo
 from .governor import GovernorVerdict
 from .orderstate import BrokerOrderSnapshot, OrderLifecycleState, snapshot_from_trade
+from .proof import PriceEnvelope
 from .risk import CandidateRiskAssessment
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle avoidance only
     from .sink import OrderLifecycleSink
 
 __all__ = [
+    "CancelAuthorization",
+    "RepricedOrder",
     "TransmitAuthorization",
     "TransmitResult",
-    "authorize_open",
+    "authorize_cancel",
     "authorize_close",
+    "authorize_open",
+    "authorize_reprice",
+    "cancel_combo",
     "place_combo",
+    "repricing_digest",
+    "structure_digest",
 ]
 
 # The only object that makes a TransmitAuthorization constructible. Module
 # private, never exported, and held solely by the two authorize_* functions.
 _AUTHORIZATION_KEY = object()
+
+
+def _digest_payload(intent: OptionStrategyIntent) -> dict[str, Any]:
+    legs = sorted(
+        (
+            leg.con_id,
+            leg.action.value,
+            leg.ratio,
+            leg.multiplier,
+            str(leg.strike),
+            leg.right.value,
+        )
+        for leg in intent.legs
+    )
+    return {
+        "strategy_id": str(intent.strategy_id),
+        "action": intent.strategy_action.value,
+        "type": intent.strategy_type.value,
+        "underlying": intent.underlying.strip().upper(),
+        "quantity": intent.quantity,
+        "expiration": intent.expiration.isoformat(),
+        "limit_price": str(intent.limit_price),
+        "price_effect": intent.price_effect.value,
+        "maximum_loss_per_contract": str(intent.maximum_loss_per_contract),
+        "legs": legs,
+    }
+
+
+def _sha(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def repricing_digest(intent: OptionStrategyIntent) -> str:
+    """Everything about an order that a **reprice** may not change.
+
+    :func:`structure_digest` minus the two fields a reprice legitimately moves:
+    the limit price, and the maximum loss that is arithmetically derived from
+    it. Those two are omitted rather than compared because on a credit spread
+    they are the same fact -- ``max loss = (width - credit) x multiplier``, see
+    :func:`engine.options.domain.compute_maximum_loss_per_contract` -- so
+    holding one fixed while moving the other would only ever produce an intent
+    the domain refuses to construct.
+
+    Everything a reprice must **not** touch is still here: the strategy id, the
+    action, the underlying, the quantity, the expiration, the direction of the
+    price, and every leg's contract, side, ratio and strike. So two intents with
+    the same repricing digest are the same trade at two prices, and nothing else
+    can hide behind the word "reprice".
+
+    This is not a substitute for the digest check in :func:`place_combo`. The
+    authorization :func:`authorize_reprice` mints still carries a full
+    :func:`structure_digest` of the exact repriced order, and ``place_combo``
+    still compares it. This one bounds what may be *asked for*; that one binds
+    what is actually *sent*.
+    """
+    payload = _digest_payload(intent)
+    payload.pop("limit_price")
+    payload.pop("maximum_loss_per_contract")
+    return _sha(payload)
 
 
 def structure_digest(intent: OptionStrategyIntent) -> str:
@@ -83,34 +184,7 @@ def structure_digest(intent: OptionStrategyIntent) -> str:
     *not* included: ``created_at`` and anything advisory, so that re-deriving
     the digest from the same structure is stable.
     """
-    legs = sorted(
-        (
-            leg.con_id,
-            leg.action.value,
-            leg.ratio,
-            leg.multiplier,
-            str(leg.strike),
-            leg.right.value,
-        )
-        for leg in intent.legs
-    )
-    payload = json.dumps(
-        {
-            "strategy_id": str(intent.strategy_id),
-            "action": intent.strategy_action.value,
-            "type": intent.strategy_type.value,
-            "underlying": intent.underlying.strip().upper(),
-            "quantity": intent.quantity,
-            "expiration": intent.expiration.isoformat(),
-            "limit_price": str(intent.limit_price),
-            "price_effect": intent.price_effect.value,
-            "maximum_loss_per_contract": str(intent.maximum_loss_per_contract),
-            "legs": legs,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return _sha(_digest_payload(intent))
 
 
 @dataclass(frozen=True)
@@ -203,6 +277,14 @@ class TransmitResult:
     transmitted: bool
     snapshot: BrokerOrderSnapshot | None = None
     message: str | None = None
+    #: The broker's own handle on the order, when there is one.
+    #:
+    #: Carried because a working order cannot be cancelled without it -- IBKR's
+    #: ``cancelOrder`` takes the ``Order`` object, and after ``place_combo``
+    #: returns, this is the only reference to it that exists. Excluded from
+    #: equality, ``repr`` and :meth:`to_record`: it is a live broker object, not
+    #: part of what happened, and it must never reach the journal.
+    trade: Any = field(default=None, repr=False, compare=False)
 
     @property
     def state(self) -> OrderLifecycleState:
@@ -360,6 +442,237 @@ def authorize_close(
     )
 
 
+@dataclass(frozen=True)
+class CancelAuthorization:
+    """Proof that a cancellation is permitted. Deliberately cheap to obtain.
+
+    Same unforgeable construction as :class:`TransmitAuthorization` -- a private
+    key checked by identity -- and a deliberately smaller set of things it
+    proves: the kill switch was clear, the run was armed, and the cancellation
+    names a strategy. It carries no risk assessment and no governor verdict
+    because neither is a reason to refuse to *reduce* exposure.
+
+    A separate type rather than a flag on ``TransmitAuthorization``: the two
+    grant different powers, and a token that could be passed to either
+    :func:`place_combo` or :func:`cancel_combo` would make "authorized to
+    cancel" silently sufficient to send. The type system says otherwise --
+    ``place_combo`` rejects a ``CancelAuthorization`` on the ``isinstance``
+    check it already performs.
+    """
+
+    strategy_id: UUID
+    authorized_at: dt.datetime
+    armed: bool
+    reason: str = ""
+    key: Any = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.key is not _AUTHORIZATION_KEY:
+            raise RefusedError(
+                "a CancelAuthorization cannot be constructed directly",
+                hint="use authorize_cancel(); it is the only code that can mint "
+                "one, and it checks the kill switch first",
+            )
+        if not isinstance(self.strategy_id, UUID):
+            raise RefusedError("a cancellation must name a strategy id")
+        if self.armed is not True:
+            raise RefusedError("an authorization may only exist for an armed run")
+        if self.authorized_at.tzinfo is None:
+            raise RefusedError("authorized_at must be timezone-aware")
+
+    def describe(self) -> str:
+        detail = f" ({self.reason})" if self.reason else ""
+        return (
+            f"authorized cancel {self.strategy_id} at "
+            f"{self.authorized_at.isoformat()}{detail}"
+        )
+
+
+def authorize_cancel(
+    strategy_id: UUID,
+    *,
+    gate: SafetyGate,
+    armed: bool,
+    now: dt.datetime,
+    reason: str = "",
+) -> CancelAuthorization:
+    """Authorize pulling a working order. Two gates, and they are the right two.
+
+    No governor, no daily cap, no risk assessment, no intent -- see the module
+    docstring. Cancelling is the operation that makes every other bound
+    enforceable after the fact, and a cancel path that could itself be vetoed
+    would be a bound with no way out.
+    """
+    gate.assert_not_halted()
+    gate.gate_armed(armed=armed)
+    return CancelAuthorization(
+        strategy_id=strategy_id,
+        authorized_at=now,
+        armed=armed,
+        reason=reason,
+        key=_AUTHORIZATION_KEY,
+    )
+
+
+@dataclass(frozen=True)
+class RepricedOrder:
+    """A repriced intent and the authorization that covers exactly it.
+
+    Only :func:`authorize_reprice` can produce one, and it builds **both**
+    halves. A caller cannot assemble an intent of its own and pair it with an
+    authorization, which is the failure mode a plain
+    ``(intent, authorization)`` return would have left open.
+    """
+
+    intent: OptionStrategyIntent
+    authorization: TransmitAuthorization
+    previous_price: Decimal
+    envelope: PriceEnvelope
+
+    def describe(self) -> str:
+        return (
+            f"reprice {self.intent.strategy_id} "
+            f"{self.previous_price} -> {self.intent.limit_price} "
+            f"[{self.envelope.minimum}, {self.envelope.maximum}]"
+        )
+
+
+def authorize_reprice(
+    previous: TransmitAuthorization,
+    reference: OptionStrategyIntent,
+    *,
+    limit_price: Decimal,
+    envelope: PriceEnvelope,
+    tick: Decimal,
+    gate: SafetyGate,
+    armed: bool,
+    now: dt.datetime,
+) -> RepricedOrder:
+    """Re-authorize the same structure at a new price, or refuse.
+
+    ``previous`` is the authorization that covered the order now working. It is
+    required, and not merely as bookkeeping: it is the proof that the gates ran
+    at all, and its risk assessment and governor verdict are carried into the
+    new token, so a repriced *opening* order is still an order the governor
+    approved. Nobody who did not hold the original authorization can reprice.
+
+    Five refusals, each guarding a different way a "reprice" could become
+    something else:
+
+    1. ``previous`` does not match ``reference`` -- the structure being repriced
+       is not the structure that was approved, so nothing here means anything.
+    2. the new price is outside ``envelope`` -- the risk figures were computed
+       against a credit inside that band, and a replace that leaves it is an
+       order whose arithmetic nobody checked. Bounded on **both** sides, for
+       the reason :func:`engine.options.proof.envelope_for` gives.
+    3. the new price is not a multiple of ``tick`` -- an off-tick limit is
+       rejected or silently rounded by the exchange, and a silently rounded
+       limit is an order at a price the engine did not choose.
+    4. the price did not actually change -- a "replace" that replaces nothing
+       burns one of the four attempts and tells the operator a lie.
+    5. the rebuilt intent's repricing digest differs from the reference's --
+       belt and braces, since this function builds the intent itself, but it is
+       the assertion that would fire if that construction ever grew a way to
+       vary something other than the price.
+
+    The kill switch and ``--arm`` are checked too. A repriced order is still an
+    order going to the market.
+    """
+    if not isinstance(previous, TransmitAuthorization):
+        raise RefusedError(
+            "repricing requires the authorization the working order was sent under",
+            hint="mint it with authorize_open() or authorize_close()",
+        )
+    if previous.strategy_id != reference.strategy_id:
+        raise RefusedError(
+            f"authorization is for strategy {previous.strategy_id}, but the working "
+            f"order is {reference.strategy_id}"
+        )
+    if previous.digest != structure_digest(reference):
+        raise RefusedError(
+            "the order being repriced is not the structure that was authorized",
+            hint="reprice the intent that was actually sent, not a rebuilt copy",
+        )
+
+    price = Decimal(limit_price)
+    if not envelope.contains(price):
+        raise RefusedError(
+            f"a replace at {price} is outside the approved envelope "
+            f"[{envelope.minimum}, {envelope.maximum}]",
+            hint="the risk gates approved a structure at a credit inside that band; "
+            "a price outside it is a different trade and needs the gates re-run",
+        )
+    if tick <= 0:
+        raise RefusedError(f"tick increment must be positive, got {tick}")
+    if price % tick != 0:
+        raise RefusedError(
+            f"a replace at {price} is not a multiple of the {tick} tick increment",
+            hint="an off-tick limit is rejected or silently rounded by the "
+            "exchange, and a silently rounded limit is not the price we chose",
+        )
+    if price == reference.limit_price:
+        raise RefusedError(
+            f"a replace at {price} does not change the working order's price"
+        )
+
+    # Built here, from the reference, so the ONLY thing that varies is the
+    # price. The maximum loss is re-derived rather than carried over: on a
+    # credit spread it is a function of the credit, and a repriced order
+    # carrying the old figure would misreport its own risk to the governor,
+    # the store and every downstream reader.
+    maximum_loss = (
+        compute_maximum_loss_per_contract(
+            strategy_type=reference.strategy_type,
+            legs=reference.legs,
+            credit=price,
+            multiplier=reference.multiplier,
+        )
+        if reference.strategy_action is StrategyAction.OPEN
+        else reference.maximum_loss_per_contract
+    )
+    repriced = OptionStrategyIntent(
+        strategy_id=reference.strategy_id,
+        strategy_type=reference.strategy_type,
+        strategy_action=reference.strategy_action,
+        underlying=reference.underlying,
+        quantity=reference.quantity,
+        legs=reference.legs,
+        expiration=reference.expiration,
+        limit_price=price,
+        price_effect=reference.price_effect,
+        maximum_loss_per_contract=maximum_loss,
+        configuration_version=reference.configuration_version,
+        created_at=reference.created_at,
+        estimated_buying_power_change=reference.estimated_buying_power_change,
+        closes_strategy_id=reference.closes_strategy_id,
+    )
+    if repricing_digest(repriced) != repricing_digest(reference):
+        raise RefusedError(  # pragma: no cover - unreachable while the build above is a copy
+            "a replace changed something other than the price",
+            hint="only the limit price and the maximum loss derived from it may move",
+        )
+
+    gate.assert_not_halted()
+    gate.gate_armed(armed=armed)
+
+    authorization = TransmitAuthorization(
+        strategy_id=repriced.strategy_id,
+        action=repriced.strategy_action,
+        authorized_at=now,
+        armed=armed,
+        digest=structure_digest(repriced),
+        risk=previous.risk,
+        governor=previous.governor,
+        key=_AUTHORIZATION_KEY,
+    )
+    return RepricedOrder(
+        intent=repriced,
+        authorization=authorization,
+        previous_price=reference.limit_price,
+        envelope=envelope,
+    )
+
+
 def place_combo(
     ib: Any,
     intent: OptionStrategyIntent,
@@ -500,6 +813,114 @@ def place_combo(
             if disconnected
             else None
         ),
+        trade=trade,
+    )
+
+
+def cancel_combo(
+    ib: Any,
+    trade: Any,
+    *,
+    authorization: CancelAuthorization,
+    closing: bool = False,
+    quantity: int | None = None,
+    timeout: float = 15.0,
+    poll_seconds: float = 0.5,
+    sink: OrderLifecycleSink | None = None,
+) -> TransmitResult:
+    """Retract a working order. **The only cancelling call in this package.**
+
+    Shaped exactly like :func:`place_combo` and for the same reasons: one call
+    site, a required token with no public constructor, every observation pushed
+    through the sink as it happens rather than summarised at the end, and no
+    exception permitted to escape once the broker has been touched.
+
+    ``trade`` is what ``place_combo`` returned on
+    :attr:`TransmitResult.trade`, or an entry from ``ib.openTrades()`` after a
+    restart. Both carry the ``Order`` that ``cancelOrder`` needs.
+
+    **A cancel does not mean the order died.** ``PendingCancel`` is a working
+    state, a cancel can lose a race with a fill, and cancelling the remainder of
+    a partial leaves contracts in the book. So this returns the same nine-state
+    :class:`TransmitResult` every other broker interaction does, and the caller
+    must read :attr:`TransmitResult.has_position` rather than assume a
+    cancellation left it flat.
+    """
+    if not isinstance(authorization, CancelAuthorization):
+        raise RefusedError(
+            "cancel_combo requires a CancelAuthorization",
+            hint="mint one with authorize_cancel(); an opening or closing "
+            "authorization does not grant this and is not interchangeable",
+        )
+    if trade is None:
+        raise RefusedError(
+            "there is no broker handle for the order being cancelled",
+            hint="pass the trade place_combo returned, or one from openTrades()",
+        )
+
+    order = getattr(trade, "order", None)
+    if order is None:
+        raise RefusedError("the broker handle carries no order to cancel")
+
+    strategy_id = authorization.strategy_id
+
+    def emit(timed: bool = False, lost: bool = False) -> BrokerOrderSnapshot:
+        observation = snapshot_from_trade(
+            trade,
+            observed_at=dt.datetime.now(dt.timezone.utc),
+            quantity=quantity,
+            timed_out=timed,
+            disconnected=lost,
+        )
+        if sink is not None:
+            sink.observe(strategy_id, observation, closing=closing)
+        return observation
+
+    ib.cancelOrder(order)
+
+    # From here the request is at the broker. Every path below produces a
+    # result rather than raising, for the reason place_combo gives: an
+    # exception escaping after the broker has been touched is the one state
+    # the caller cannot reason about.
+    waited = 0.0
+    disconnected = False
+    while waited < timeout:
+        if not _is_connected(ib):
+            disconnected = True
+            break
+        try:
+            done = trade.isDone()
+        except Exception:  # noqa: BLE001 - a partial Trade must not mask the cancel
+            break
+        emit()
+        if done:
+            break
+        try:
+            ib.sleep(poll_seconds)
+        except Exception:  # noqa: BLE001 - a dropped socket surfaces here
+            disconnected = True
+            break
+        waited += poll_seconds
+
+    timed_out = False
+    if not disconnected:
+        try:
+            timed_out = not trade.isDone()
+        except Exception:  # noqa: BLE001
+            timed_out = True
+
+    snapshot = emit(timed=timed_out, lost=disconnected)
+    return TransmitResult(
+        strategy_id=strategy_id,
+        action=StrategyAction.CLOSE if closing else StrategyAction.OPEN,
+        transmitted=True,
+        snapshot=snapshot,
+        message=(
+            "connection lost while awaiting the cancellation outcome"
+            if disconnected
+            else None
+        ),
+        trade=trade,
     )
 
 

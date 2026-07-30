@@ -26,6 +26,13 @@ reports differences and refuses to guess. If the broker holds a structure the
 store does not, that is a fact to surface loudly, not something to silently
 adopt -- adopting it would mean inventing an entry credit and a maximum loss that
 nothing ever validated.
+
+**This engine does not own the account.** Reconciliation is scoped to orders it
+can prove are its own -- by ``orderRef`` (a strategy id it minted) or by a
+``permId`` it persisted. A resting order placed by hand in TWS, or by another
+tool, is ignored rather than reported: treating it as a disagreement would block
+every entry for as long as it rested, and no amount of correct engine behaviour
+would clear it.
 """
 
 from __future__ import annotations
@@ -504,10 +511,22 @@ class ReconciliationReport:
     missing_at_broker: tuple[UUID, ...] = ()
     unknown_at_broker: tuple[str, ...] = ()
     replay_errors: tuple[str, ...] = ()
-    #: Store positions mid-transition whose order the broker is not working.
-    #: Either it filled unobserved or it was never accepted -- opposite fixes.
+    #: Store positions mid-transition whose order the broker is **confirmed to
+    #: be working**. Not a defect and not an absence: the order is alive and can
+    #: still fill. Reported so the operator is told what is actually true.
+    orders_working_at_broker: tuple[UUID, ...] = ()
+    #: Store positions mid-transition whose order the broker was asked about and
+    #: is not working. Either it filled unobserved or it was never accepted --
+    #: opposite fixes. Only ever populated when the broker really was asked.
     orders_absent_at_broker: tuple[UUID, ...] = ()
-    #: Broker orders this engine has no record of transmitting.
+    #: Store positions mid-transition that could not be checked at all, because
+    #: the caller supplied no open-order enumeration. Distinct from *absent* on
+    #: purpose: "I did not ask" is not evidence that nothing is working, and
+    #: reporting it as absence is exactly the false claim this field removes.
+    orders_unverified_at_broker: tuple[UUID, ...] = ()
+    #: Broker orders **this engine owns** that the live book cannot account for.
+    #: Orders belonging to anything else on the account are ignored entirely --
+    #: see :meth:`PositionStore._reconcile_orders`.
     orders_unknown_to_store: tuple[int, ...] = ()
 
     @property
@@ -517,6 +536,12 @@ class ReconciliationReport:
         ``replay_errors`` counts. A book that could not be fully replayed is not
         a book the engine understands, and "the parts I could read match" is not
         agreement.
+
+        ``orders_working_at_broker`` deliberately does **not** count. A working
+        order is the broker and the store agreeing about a live order; the
+        position it belongs to is already reported as stranded OPENING/CLOSING
+        or as uncertain, and those are what block an entry. Counting it here as
+        well would say the two sides disagree about the one thing they agree on.
         """
         return not (
             self.stranded_opening
@@ -525,6 +550,7 @@ class ReconciliationReport:
             or self.unknown_at_broker
             or self.replay_errors
             or self.orders_absent_at_broker
+            or self.orders_unverified_at_broker
             or self.orders_unknown_to_store
         )
 
@@ -557,16 +583,30 @@ class ReconciliationReport:
                 f"    unknown structures at broker on {list(self.unknown_at_broker)} "
                 "-- not opened by this engine, or opened before the store existed"
             )
+        if self.orders_working_at_broker:
+            lines.append(
+                f"    ORDERS WORKING    {[str(i) for i in self.orders_working_at_broker]} "
+                "-- transmitted, and the broker IS working them; unfilled and live, "
+                "so they can be repriced or cancelled rather than chased"
+            )
         if self.orders_absent_at_broker:
             lines.append(
                 f"    ORDERS ABSENT     {[str(i) for i in self.orders_absent_at_broker]} "
-                "-- transmitted, and the broker is not working them; either they "
-                "filled unobserved or were never accepted"
+                "-- transmitted, the broker was asked, and it is not working them; "
+                "either they filled unobserved or were never accepted"
+            )
+        if self.orders_unverified_at_broker:
+            lines.append(
+                "    ORDERS UNVERIFIED "
+                f"{[str(i) for i in self.orders_unverified_at_broker]} "
+                "-- transmitted, and the broker's open orders were never enumerated; "
+                "this says nothing about whether they are working"
             )
         if self.orders_unknown_to_store:
             lines.append(
                 f"    ORDERS UNKNOWN    {list(self.orders_unknown_to_store)} "
-                "-- live at the broker with no record of this engine sending them"
+                "-- this engine's own orderRef, live at the broker, with no live "
+                "position to account for them"
             )
         return "\n".join(lines)
 
@@ -581,7 +621,11 @@ class ReconciliationReport:
             "missing_at_broker": [str(i) for i in self.missing_at_broker],
             "unknown_at_broker": list(self.unknown_at_broker),
             "replay_errors": list(self.replay_errors),
+            "orders_working_at_broker": [str(i) for i in self.orders_working_at_broker],
             "orders_absent_at_broker": [str(i) for i in self.orders_absent_at_broker],
+            "orders_unverified_at_broker": [
+                str(i) for i in self.orders_unverified_at_broker
+            ],
             "orders_unknown_to_store": list(self.orders_unknown_to_store),
         }
 
@@ -1162,7 +1206,7 @@ class PositionStore:
         broker_positions: Any,
         *,
         checked_at: dt.datetime,
-        broker_orders: Any = (),
+        broker_orders: Any = None,
     ) -> ReconciliationReport:
         """Compare the replayed book against what the broker reports holding.
 
@@ -1172,6 +1216,22 @@ class PositionStore:
         structures -- so this deliberately checks only what it can: that every
         underlying the store believes it holds appears at the broker, and that
         no state is stranded mid-transition. It reports; it never repairs.
+
+        ``broker_orders`` distinguishes three cases, and the distinction is the
+        whole reason this argument is not a plain sequence:
+
+        ``None``   the caller did not enumerate open orders. Nothing may be
+                   concluded about working orders, so every in-flight position
+                   is reported as *unverified*.
+        ``()``     the caller asked and the broker is working nothing. An
+                   in-flight position is genuinely *absent*.
+        entries    matched, per :meth:`_reconcile_orders`.
+
+        The default used to be ``()``, which made "I never asked" indistinguish-
+        able from "I asked and there is nothing" -- and the report then said, of
+        an order the broker was demonstrably working, that the broker was not
+        working it. That claim was false and it was the reconciler's own
+        default that produced it.
         """
         problems: list[str] = []
         book = self.positions(errors=problems)
@@ -1197,11 +1257,14 @@ class PositionStore:
             ),
             unknown_at_broker=tuple(sorted(broker_symbols - store_symbols)),
             replay_errors=tuple(problems),
-            **self._reconcile_orders(broker_orders, live),
+            **self._reconcile_orders(broker_orders, live, book),
         )
 
     def _reconcile_orders(
-        self, broker_orders: Any, live: list[OpenPosition]
+        self,
+        broker_orders: Any,
+        live: list[OpenPosition],
+        book: dict[UUID, OpenPosition] | None = None,
     ) -> dict[str, tuple[Any, ...]]:
         """Match the store's transmitted orders against the broker's open ones.
 
@@ -1231,10 +1294,19 @@ class PositionStore:
         # reported an order as unknown by its reassigned orderId even after its
         # permId had matched, so any reconnect produced a disagreement that never
         # cleared and blocked new entries permanently.
+        asked = broker_orders is not None
         broker_entries: list[tuple[int | None, int | None, str | None]] = []
         broker_perm: set[int] = set()
         broker_order: set[int] = set()
         for entry in broker_orders or ():
+            # An ``ib_async`` Trade carries the identifiers on ``.order``, not on
+            # itself, so ``ib.openTrades()`` would otherwise contribute nothing
+            # but blanks -- and a blank entry is indistinguishable from an
+            # account with no working orders. Unwrapped here rather than in the
+            # caller so every caller gets it.
+            inner = getattr(entry, "order", None)
+            if inner is not None and getattr(entry, "orderId", None) is None:
+                entry = inner
             order_id = getattr(entry, "orderId", None)
             perm_id = getattr(entry, "permId", None)
             order_ref = getattr(entry, "orderRef", None)
@@ -1262,6 +1334,40 @@ class PositionStore:
 
         broker_refs = {ref for _o, _p, ref in broker_entries if ref}
         store_refs = {str(p.strategy_id) for p in live}
+
+        # Ownership, which is a *different* question from matching, and keeping
+        # them apart is what stops an unrelated resting order on the same paper
+        # account from becoming a permanent DISAGREEMENT that blocks every
+        # entry forever.
+        #
+        # An order is this engine's only on evidence that cannot be coincidence:
+        #
+        #   * its ``orderRef`` is a strategy id this store has recorded --
+        #     ``build_combo`` sets ``orderRef = str(strategy_id)`` (see
+        #     ``execution.build_combo``), and a v4 UUID is not something another
+        #     trading tool stamps on its orders by accident; or
+        #   * its ``permId`` is one this store persisted for an order it sent.
+        #
+        # ``orderId`` is deliberately NOT ownership evidence. It is client-
+        # assigned and reused across sessions, so an unrelated order can carry
+        # one of ours; that is the C22 defect pointed the other way, and using
+        # it here would claim a stranger's order as our own. It stays what it
+        # was: last-resort evidence for matching an order already known to be
+        # ours.
+        #
+        # Everything that fails both tests is another tool's order, or a manual
+        # ticket the operator entered in TWS. Those are ignored -- not reported,
+        # not counted as a disagreement. This engine does not own the account.
+        every_position = list((book or {}).values()) or list(live)
+        owned_refs = {str(p.strategy_id) for p in every_position}
+        owned_perm = {p.open_perm_id for p in every_position if p.open_perm_id} | {
+            p.close_perm_id for p in every_position if p.close_perm_id
+        }
+
+        def is_ours(perm_id: int | None, order_ref: str | None) -> bool:
+            if order_ref and order_ref in owned_refs:
+                return True
+            return perm_id is not None and perm_id in owned_perm
 
         def known_to_broker(position: OpenPosition) -> bool:
             """Matched by the strongest identity available. See above."""
@@ -1292,18 +1398,31 @@ class PositionStore:
             if p.state in (PositionState.OPENING, PositionState.CLOSING, PositionState.UNCERTAIN)
             and (p.open_order_id or p.open_perm_id or p.close_order_id or p.close_perm_id)
         ]
+        # Three outcomes, not two. "Working" and "absent" are opposite facts and
+        # both are conclusions; "unverified" is the absence of a conclusion, and
+        # collapsing it into "absent" is how the report came to state, of a live
+        # working order, that the broker was not working it.
+        working = tuple(p.strategy_id for p in in_flight if asked and known_to_broker(p))
+        absent = tuple(
+            p.strategy_id for p in in_flight if asked and not known_to_broker(p)
+        )
+        unverified = () if asked else tuple(p.strategy_id for p in in_flight)
+
         return {
-            "orders_absent_at_broker": tuple(
-                p.strategy_id for p in in_flight if not known_to_broker(p)
-            ),
-            # A broker order is unknown only if NEITHER identifier matches the
-            # store. Reported by whichever id it does carry, preferring the
-            # durable one so the operator can look it up after a reconnect.
+            "orders_working_at_broker": working,
+            "orders_absent_at_broker": absent,
+            "orders_unverified_at_broker": unverified,
+            # Ours, and the live book cannot account for it. Scoped by
+            # ``is_ours`` first: a foreign order is not a disagreement, it is
+            # none of our business. Reported by whichever id it carries,
+            # preferring the durable one so the operator can look it up in TWS
+            # after a reconnect.
             "orders_unknown_to_store": tuple(
                 sorted(
                     perm_id if perm_id is not None else order_id  # type: ignore[misc]
                     for order_id, perm_id, order_ref in broker_entries
-                    if not matched_to_store(order_id, perm_id, order_ref)
+                    if is_ours(perm_id, order_ref)
+                    and not matched_to_store(order_id, perm_id, order_ref)
                     and (perm_id is not None or order_id is not None)
                 )
             ),

@@ -270,8 +270,21 @@ class LifecycleRecorder:
         nothing, because none of the materiality tests fire. What is rejected is
         a *lower* progression rank carrying no new information, which is what a
         re-delivered early callback looks like after a fill has landed.
+
+        **Staleness is about one order, not about one strategy.** A cancel and
+        replace puts a *second* opening order under the same strategy id, and
+        its first callbacks legitimately rank below the cancellation that
+        retired the first one. Ranking them against the previous order's state
+        classified every replacement's ``Submitted`` as old news, so its
+        identifiers did not reach disk until something later happened to carry
+        them -- leaving a live order at the broker that the store could not name
+        for as long as it was working. A different ``orderId``/``permId`` is
+        proof this is a different order, so it is never a stale callback about
+        the previous one.
         """
         if known.state is None:
+            return False
+        if self._new_identity(known, observation):
             return False
         if observation.is_uncertain:
             return False
