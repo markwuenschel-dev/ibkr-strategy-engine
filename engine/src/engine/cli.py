@@ -177,6 +177,26 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    cancel = subs.add_parser(
+        "options-cancel",
+        help="pull one working order by its strategy id (requires --arm)",
+        description=(
+            "Retract a working order through the engine's single cancel "
+            "chokepoint. Matched on orderRef, which carries the strategy id -- "
+            "never on orderId, which is reused across sessions. Authorized by "
+            "the kill switch and --arm only: refusing to cancel because the "
+            "book is concentrated would be backwards, since cancelling is what "
+            "reduces exposure."
+        ),
+    )
+    cancel.add_argument("--strategy-id", required=True, help="the order's orderRef")
+    cancel.add_argument("--reason", default="", help="recorded with the cancellation")
+    cancel.add_argument(
+        "--arm",
+        action="store_true",
+        help="actually cancel. Without this the target is printed and nothing is sent.",
+    )
+
     positions = subs.add_parser(
         "options-positions", help="list open option structures and reconcile them"
     )
@@ -515,6 +535,116 @@ def cmd_options_run(args: argparse.Namespace, broker_factory: Any = Broker) -> i
     out("")
     if not args.arm:
         note("dry run complete; nothing was transmitted. Pass --arm to trade.")
+    return EXIT_OK
+
+
+def cmd_options_cancel(args: argparse.Namespace, broker_factory: Any = Broker) -> int:
+    """Pull one working order, by the strategy id it carries as its orderRef.
+
+    The operator surface for the cancel chokepoint. It exists because a working
+    order that neither fills nor rejects had, until now, no way out of this
+    engine at all -- it had to be cancelled by hand in TWS, which means the one
+    action that makes every other bound enforceable after the fact was the one
+    action the engine could not take.
+
+    Matching is on ``orderRef``, which ``build_combo`` sets to the strategy id.
+    Deliberately not ``orderId``: it is reused across sessions, so a stranger's
+    order can carry one of ours.
+    """
+    from uuid import UUID
+
+    from .options.adapters import read_open_orders
+    from .options.positions import PositionStore
+    from .options.sink import LifecycleRecorder
+    from .options.transmit import authorize_cancel, cancel_combo
+
+    config = config_from(args)
+    try:
+        strategy_id = UUID(str(args.strategy_id).strip())
+    except (ValueError, AttributeError, TypeError):
+        raise RefusedError(
+            f"not a strategy id: {args.strategy_id!r}",
+            hint="pass the uuid the order carries as its orderRef; "
+            "`engine options-positions` prints it",
+        ) from None
+
+    journal = OrderJournal(config.journal_path)
+    journal.preflight()
+    gate = SafetyGate(config, journal)
+    # Before the socket, as everywhere else. A halted engine does not connect.
+    gate.assert_not_halted()
+
+    store = PositionStore(config.state_dir / "positions.jsonl")
+    recorder = LifecycleRecorder(store)
+
+    with broker_factory(config, journal) as broker:
+        working = read_open_orders(broker.ib)
+        if working is None:
+            raise RefusedError(
+                "the broker could not be asked what it is working",
+                hint="without that answer a cancel would be aimed at a guess",
+            )
+        matches = [
+            trade
+            for trade in working
+            if str(getattr(getattr(trade, "order", None), "orderRef", "")).strip()
+            == str(strategy_id)
+        ]
+        out(f"working orders   {len(working)} at the broker, {len(matches)} ours")
+        if not matches:
+            out("")
+            note(f"no working order carries orderRef {strategy_id}")
+            note("it may have filled, been cancelled, or expired -- reconcile first")
+            return EXIT_ERROR
+
+        for trade in matches:
+            order = getattr(trade, "order", None)
+            status = getattr(trade, "orderStatus", None)
+            out(
+                f"  orderId={getattr(order, 'orderId', None)} "
+                f"permId={getattr(order, 'permId', None)} "
+                f"lmt={getattr(order, 'lmtPrice', None)} "
+                f"status={getattr(status, 'status', None)} "
+                f"filled={getattr(status, 'filled', None)} "
+                f"remaining={getattr(status, 'remaining', None)}"
+            )
+
+        if not args.arm:
+            out("")
+            note("not armed: nothing was cancelled. Pass --arm to pull it.")
+            return EXIT_OK
+
+        authorization = authorize_cancel(
+            strategy_id,
+            gate=gate,
+            armed=True,
+            now=utc_now(),
+            reason=args.reason,
+        )
+        out("")
+        out(f"AUTHORIZED CANCEL  {authorization.describe()}")
+
+        for trade in matches:
+            result = cancel_combo(
+                broker.ib, trade, authorization=authorization, sink=recorder
+            )
+            out("")
+            out(result.describe())
+            # A cancel is not a flat book. It can lose a race with a fill, and
+            # cancelling the remainder of a partial leaves contracts behind.
+            if result.has_position:
+                out("")
+                note(
+                    "THIS DID NOT LEAVE YOU FLAT -- the order carries a position. "
+                    "Reconcile before doing anything else."
+                )
+            journal.record(
+                event="order_cancelled",
+                strategy_id=str(strategy_id),
+                state=result.state.value,
+                has_position=bool(result.has_position),
+                reason=args.reason,
+            )
     return EXIT_OK
 
 
@@ -1104,6 +1234,7 @@ COMMANDS = {
     "options-scan": cmd_options_scan,
     "options-run": cmd_options_run,
     "options-positions": cmd_options_positions,
+    "options-cancel": cmd_options_cancel,
     "options-verify-execution": cmd_options_verify_execution,
     "options-execution-proof": cmd_options_execution_proof,
 }
