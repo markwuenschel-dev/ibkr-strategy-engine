@@ -137,6 +137,8 @@ __all__ = [
     "RepriceStop",
     "DEFAULT_LADDER",
     "tick_size",
+    "execution_increment",
+    "PAPER_EXECUTION_INCREMENT",
     "round_to_tick",
     "work_order",
 ]
@@ -190,6 +192,38 @@ def tick_size(symbol: str, price: Decimal) -> Decimal:
     if symbol.strip().upper() in PENNY_ALL_PRICES:
         return _PENNY_ALL
     return _NON_PENNY_BELOW if Decimal(price) < PENNY_BREAKPOINT else _NON_PENNY_ABOVE
+
+
+#: What IBKR's *paper* simulator will actually fill, which is not what the
+#: contract's ``minTick`` says may be quoted. IBKR documents that paper accounts
+#: may submit US option orders at penny prices but do not receive penny fills,
+#: alongside limited combo support and top-of-book simulated fills.
+#:
+#: This distinction cost a real experiment. A 1-wide SPY vertical walked
+#: 0.21/0.20/0.19/0.18 on the penny grid would sit unfilled for simulator
+#: reasons, and the result would read as evidence about *pricing* when it is
+#: evidence about the *venue*. An order the simulator structurally cannot fill
+#: teaches nothing about whether the price was right.
+#:
+#: This engine connects to paper ports by construction (``PAPER_PORTS``), so the
+#: execution grid IS the paper grid. A live path would derive its increment from
+#: contract and market-rule data instead, and must not inherit this constant.
+PAPER_EXECUTION_INCREMENT = Decimal("0.05")
+
+
+def execution_increment(symbol: str, price: Decimal) -> Decimal:
+    """The grid a submitted price must land on to be *fillable* here.
+
+    Deliberately separate from :func:`tick_size`, which is the OPRA quoting
+    schedule. Quoting and filling are different facts, and conflating them is
+    how a penny-quoted symbol produces an order the simulator will never fill.
+    Never finer than the quoting increment -- a price off the quoting grid is
+    rejected outright, which is a worse failure than one that merely rests.
+    """
+    quoting = tick_size(symbol, price)
+    if Decimal(price) >= PENNY_BREAKPOINT:
+        return max(quoting, _NON_PENNY_ABOVE)
+    return max(quoting, PAPER_EXECUTION_INCREMENT)
 
 
 def round_to_tick(price: Decimal, tick: Decimal, *, up: bool = False) -> Decimal:
