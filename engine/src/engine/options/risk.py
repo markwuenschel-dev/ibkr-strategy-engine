@@ -377,18 +377,51 @@ def stress_loss(
 # ---------------------------------------------------------------------------
 
 
+def execution_entitlement_set(
+    snapshot: StrategyQuoteSnapshot, intent: OptionStrategyIntent | None
+) -> tuple[Any, ...]:
+    """The quotes that must be live for **this structure** to be authorized.
+
+    A snapshot is two different things wearing one name. As a *selection
+    universe* it holds every contract the scan inspected -- dozens of strikes,
+    most of which were considered and discarded, and any of which may be
+    missing a market-data callback for reasons that say nothing about the two
+    legs actually being traded. As an *execution proof* it should hold exactly
+    the underlying and the legs of the structure about to be sent.
+
+    Conflating them let an unrelated strike veto a finished candidate: contract
+    891847214, never selected and never to be traded, refused a 722/721 spread
+    three times on 2026-07-30 because it sat in the same chain window.
+
+    Returning the full leg set when there is no intent is deliberate and is the
+    fail-closed direction: with nothing naming the structure, there is no basis
+    for narrowing, and checking more than necessary refuses trades that would
+    have been fine. Checking *fewer* would authorize trades that are not.
+    """
+    if intent is None:
+        return tuple(snapshot.legs)
+    wanted = {leg.con_id for leg in intent.legs}
+    return tuple(quote for quote in snapshot.legs if quote.con_id in wanted)
+
+
 def check_market_data_entitlement(
     snapshot: StrategyQuoteSnapshot | None,
     *,
     decision_time: dt.datetime,
     policy: RiskPolicy,
+    intent: OptionStrategyIntent | None = None,
 ) -> CheckResult:
-    """Refuse unless every leg and the underlying are live, current and coherent.
+    """Refuse unless the underlying and **the selected legs** are live and current.
 
     Fails closed on a missing snapshot. "No market data was supplied" is not a
     reason to skip the check -- it is the strongest possible reason to refuse,
     and treating an absent feed as "nothing to verify" is how a delayed-data
     account ends up selecting strikes.
+
+    ``intent`` narrows the check to the structure being authorized. See
+    :func:`execution_entitlement_set`: without it the entire scanned chain has
+    to be live, so one unrelated strike with no callback vetoes a candidate it
+    has nothing to do with.
     """
     if snapshot is None:
         return CheckResult(
@@ -404,7 +437,7 @@ def check_market_data_entitlement(
     try:
         require_uniform_live_provenance(
             underlying=snapshot.underlying,
-            legs=snapshot.legs,
+            legs=execution_entitlement_set(snapshot, intent),
             decision_time=decision_time,
             maximum_age=policy.quote_maximum_age,
             active_generations=snapshot.generation_map(),
@@ -697,7 +730,7 @@ def assess_candidate(
     """
     results = (
         check_market_data_entitlement(
-            quotes, decision_time=evaluated_at, policy=policy
+            quotes, decision_time=evaluated_at, policy=policy, intent=intent
         ),
         check_defined_loss(intent, policy=policy, net_liquidation=net_liquidation),
         check_broker_margin(margin, policy=policy, net_liquidation=net_liquidation),
