@@ -39,7 +39,9 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
+from dataclasses import fields as dataclass_fields
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import Path
@@ -117,6 +119,14 @@ class PositionEvent(str, Enum):
     CLOSE_FAILED = "CLOSE_FAILED"
     CLOSE_UNCERTAIN = "CLOSE_UNCERTAIN"
     ROLLED = "ROLLED"
+    #: The broker's own executions and commission reports for a fill, captured
+    #: after the fact. A separate event rather than a richer ``*_FILLED`` because
+    #: the commission genuinely arrives later than the fill -- IBKR delivers
+    #: ``commissionReport`` on its own callback, and the first real fill this
+    #: engine took recorded ``commission=None`` because nothing ever went back
+    #: for it. An append-only log can record a fact learned late; it cannot
+    #: rewrite the line that did not know it yet.
+    EXECUTIONS_RECORDED = "EXECUTIONS_RECORDED"
 
 
 def _refuse(message: str, *, hint: str | None = None) -> None:
@@ -165,6 +175,14 @@ class OpenPosition:
     #: opening-side defect recorded as C21.
     close_filled_quantity: Decimal = Decimal("0")
     commission: Decimal | None = None
+    #: Whether ``commission`` is the **whole** cost of the opening fill, proven
+    #: leg by leg, rather than however much of it happened to arrive. Carried
+    #: separately because ``commission`` alone cannot express the difference: a
+    #: two-legged spread with one leg costed holds a real, finite, too-small
+    #: number, and net profit computed against it is wrong in the flattering
+    #: direction with nothing about it looking wrong. See
+    #: :mod:`engine.options.executions`, which is what establishes it.
+    commission_complete: bool = False
     #: Why the outcome is unknown, when ``state`` is UNCERTAIN.
     uncertainty: str | None = None
 
@@ -241,6 +259,18 @@ class OpenPosition:
                 f"close_filled_quantity {self.close_filled_quantity} exceeds the "
                 f"ordered quantity {self.intent.quantity}",
                 hint="closing more than was ever ordered is a parsing error",
+            )
+        if not isinstance(self.commission_complete, bool):
+            _refuse(
+                f"commission_complete must be a bool, got "
+                f"{type(self.commission_complete).__name__}"
+            )
+        if self.commission_complete and self.commission is None:
+            _refuse(
+                "commission_complete is set but no commission is recorded",
+                hint="'the whole cost is known' and 'the cost is unknown' cannot "
+                "both be true; a complete claim with no number is what would let "
+                "net profit be computed against nothing",
             )
 
     # -- derived ----------------------------------------------------------
@@ -404,6 +434,7 @@ class OpenPosition:
             "filled_quantity": str(self.filled_quantity),
             "close_filled_quantity": str(self.close_filled_quantity),
             "commission": str(self.commission) if self.commission is not None else None,
+            "commission_complete": self.commission_complete,
             "uncertainty": self.uncertainty,
             "legs": [
                 {
@@ -492,6 +523,12 @@ class OpenPosition:
                 _decimal_or_none(record.get("close_filled_quantity")) or Decimal("0")
             ),
             commission=_decimal_or_none(record.get("commission")),
+            # Absent from every line written before the field existed, and
+            # defaulting to False rather than raising for the same reason
+            # ``close_filled_quantity`` does: an older journal must still replay,
+            # and "we never proved the cost" is exactly what those lines mean.
+            commission_complete=bool(record.get("commission_complete"))
+            and _decimal_or_none(record.get("commission")) is not None,
             uncertainty=record.get("uncertainty") or None,
         )
 
@@ -870,6 +907,50 @@ class PositionStore:
             }
         )
 
+    def record_executions(
+        self,
+        strategy_id: UUID,
+        *,
+        at: dt.datetime,
+        executions: Sequence[dict[str, Any]],
+        total_commission: Decimal | None,
+        complete: bool,
+        gaps: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        """Persist what the broker says actually filled, and what it charged.
+
+        Written whenever executions are read back, complete or not. Recording an
+        *incomplete* capture is the point of doing it at all: it is the durable
+        difference between "this fill cost nothing" and "nobody ever asked what
+        this fill cost", and the second is what the store said for a real
+        position because the commission callback was never read.
+
+        ``complete`` is refused unless a total accompanies it. The two are a pair
+        -- see :class:`engine.options.executions.CommissionEvidence`, which
+        couples them at construction -- and a claim of completeness with no
+        number is exactly the shape that would let net profit be stated against
+        nothing.
+        """
+        if complete and total_commission is None:
+            _refuse(
+                "a complete commission capture must record the total it proved",
+                hint="incomplete evidence records what is missing instead; a "
+                "partial sum understates the cost and nothing about it looks wrong",
+            )
+        return self._append(
+            {
+                "event": PositionEvent.EXECUTIONS_RECORDED.value,
+                "at": at.isoformat(),
+                "strategy_id": str(strategy_id),
+                "executions": list(executions),
+                "total_commission": (
+                    str(total_commission) if total_commission is not None else None
+                ),
+                "commission_complete": bool(complete),
+                "commission_gaps": list(gaps),
+            }
+        )
+
     def record_open_failed(
         self, strategy_id: UUID, *, at: dt.datetime, reason: str
     ) -> dict[str, Any]:
@@ -1129,6 +1210,20 @@ class PositionStore:
             if current.filled_quantity > Decimal("0"):
                 return _replace(current, state=PositionState.OPEN, uncertainty=None)
             return None
+
+        if kind == PositionEvent.EXECUTIONS_RECORDED.value:
+            total = _decimal_or_none(event.get("total_commission"))
+            claimed = bool(event.get("commission_complete"))
+            # Completeness is monotonic: evidence is not un-learned. A later
+            # capture that could not reach the broker must not demote a cost that
+            # was already proven, or a transient query failure would make a net
+            # figure disappear and reappear between passes.
+            complete = current.commission_complete or (claimed and total is not None)
+            return _replace(
+                current,
+                commission=total if total is not None else current.commission,
+                commission_complete=complete,
+            )
 
         if kind == PositionEvent.CLOSE_SUBMITTED.value:
             return _replace(current, state=PositionState.CLOSING)
@@ -1432,27 +1527,26 @@ class PositionStore:
 def _replace(position: OpenPosition, **changes: Any) -> OpenPosition:
     """A frozen-dataclass update that re-runs every invariant.
 
-    ``dataclasses.replace`` would do this too; it is spelled out so the
-    re-validation is visible -- a replayed state transition is exactly where a
-    corrupt log would otherwise smuggle in an impossible position.
+    Reconstructing through the constructor rather than mutating is deliberate:
+    a replayed state transition is exactly where a corrupt log would otherwise
+    smuggle in an impossible position, and ``OpenPosition.__post_init__`` is the
+    thing that stops it.
+
+    **The carried fields are enumerated from the dataclass, never by hand.** They
+    used to be a written-out literal, and it silently went stale the moment
+    ``close_filled_quantity`` was added for C24: the field was absent from the
+    literal, so every transition that did not pass it explicitly reset it to its
+    default of zero. A ``CLOSE_PARTIAL`` followed by a ``CLOSE_FAILED`` -- an exit
+    cancelled after filling part of the way, which is the exact shape C24 was
+    written to make representable -- replayed as a position holding everything it
+    had ever bought. ``remaining_quantity`` then reported contracts that were
+    already out of the market, and an exit sized off it would sell them a second
+    time. That is C21's failure reached by a different road, so the fix is the one
+    that cannot go stale again rather than one more name in a list.
     """
     fields: dict[str, Any] = {
-        "strategy_id": position.strategy_id,
-        "intent": position.intent,
-        "opened_at": position.opened_at,
-        "state": position.state,
-        "buying_power_reserved": position.buying_power_reserved,
-        "filled_credit": position.filled_credit,
-        "closed_at": position.closed_at,
-        "closing_debit": position.closing_debit,
-        "rolled_to": position.rolled_to,
-        "open_order_id": position.open_order_id,
-        "open_perm_id": position.open_perm_id,
-        "close_order_id": position.close_order_id,
-        "close_perm_id": position.close_perm_id,
-        "filled_quantity": position.filled_quantity,
-        "commission": position.commission,
-        "uncertainty": position.uncertainty,
+        field.name: getattr(position, field.name)
+        for field in dataclass_fields(position)
     }
     fields.update(changes)
     return OpenPosition(**fields)

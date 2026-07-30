@@ -8,6 +8,7 @@
 
     engine probe-options-data                      capability probe; transmits nothing
     engine options-scan --symbol SPY               IV Rank + chain + real what-if; transmits nothing
+    engine options-mark                            mark every open position; proposes, sends nothing
 
     engine halt "reason"                           engage the kill switch
     engine resume                                  release it
@@ -201,6 +202,33 @@ def build_parser() -> argparse.ArgumentParser:
         "options-positions", help="list open option structures and reconcile them"
     )
     positions.add_argument("--no-connect", action="store_true", help="read the store only")
+
+    # Read-only by construction: there is deliberately no --arm here and no
+    # code path that could use one. Marking answers "what is this worth"; acting
+    # on the answer is options-run's job, behind its own gates.
+    mark = subs.add_parser(
+        "options-mark",
+        help="mark every open structure: closing price, P&L, and a close proposal",
+        description=(
+            "Subscribes to each open position's own underlying and its own legs "
+            "-- not a chain window -- and reports, per position, one of four "
+            "states: MARKED, STALE, UNAVAILABLE or COMMISSION_INCOMPLETE. "
+            "Closing prices are quoted both at the midpoint (a valuation) and at "
+            "the natural (what an exit can actually be done at: the short leg's "
+            "ask minus the long leg's bid). Executions and commissions are "
+            "captured and persisted, and net profit is stated only when the "
+            "broker has costed every leg. Any close it prints is a PROPOSAL. "
+            "This command transmits nothing and has no --arm."
+        ),
+    )
+    mark.add_argument(
+        "--strategy-id", help="mark only this position (default: every open one)"
+    )
+    mark.add_argument(
+        "--no-connect",
+        action="store_true",
+        help="read the store only; every position reports UNAVAILABLE",
+    )
 
     # A command of its own, not a flag on the strategy pass. The bounded proof
     # and the production strategy answer different questions -- "does the broker
@@ -690,6 +718,126 @@ def cmd_options_positions(args: argparse.Namespace, broker_factory: Any = Broker
     out(report.describe())
     journal.record(**report.to_record())
     return EXIT_OK if report.agrees else EXIT_ERROR
+
+
+def cmd_options_mark(args: argparse.Namespace, broker_factory: Any = Broker) -> int:
+    """Mark every open structure and say, in one of four states, how far that got.
+
+    The one thing this command must never do is print a number it could not
+    stand behind, so every refusal path here reports a state rather than a
+    price. It sends nothing: it reads quotes, reads executions, writes the
+    commission evidence it found to the position store, and prints.
+    """
+    from uuid import UUID
+
+    from .options.adapters import (
+        IBKRExecutionReportAdapter,
+        IBKRLiveMarketDataAdapter,
+    )
+    from .options.executions import commission_evidence_for
+    from .options.marking import MarkState, mark_open_positions
+    from .options.policy import RiskPolicy
+    from .options.positions import PositionStore
+
+    config = config_from(args)
+    journal = OrderJournal(config.journal_path)
+    journal.preflight()
+
+    gate = SafetyGate(config, journal)
+    # Before any socket, exactly as options-run does. A halted engine must not
+    # talk to the broker at all, even to ask a read-only question.
+    gate.assert_not_halted()
+
+    policy = RiskPolicy.from_env()
+    store = PositionStore(config.state_dir / "positions.jsonl")
+
+    wanted = getattr(args, "strategy_id", None)
+    open_positions = store.open_positions()
+    if wanted:
+        try:
+            target = UUID(str(wanted))
+        except ValueError:
+            note(f"--strategy-id {wanted!r} is not a UUID")
+            return EXIT_USAGE
+        open_positions = [p for p in open_positions if p.strategy_id == target]
+        if not open_positions:
+            note(f"no open position with strategy id {target}")
+            return EXIT_ERROR
+
+    out(f"open positions   {len(open_positions)}")
+    for position in open_positions:
+        out(f"  {position.describe()}")
+    out("")
+
+    if not open_positions:
+        note("nothing to mark")
+        return EXIT_OK
+
+    now = utc_now()
+    evidence_by_position = {}
+
+    if args.no_connect:
+        note("--no-connect: no quotes were requested, so nothing can be marked")
+        reports = mark_open_positions(
+            open_positions, market_data=None, policy=policy, now=now
+        )
+    else:
+        with broker_factory(config, journal) as broker:
+            ib = getattr(broker, "ib", broker)
+            executions = IBKRExecutionReportAdapter(ib).executions()
+            for position in open_positions:
+                evidence = commission_evidence_for(
+                    strategy_id=position.strategy_id,
+                    legs=position.legs,
+                    filled_quantity=position.filled_quantity,
+                    executions=executions,
+                    order_id=position.open_order_id,
+                    perm_id=position.open_perm_id,
+                )
+                evidence_by_position[position.strategy_id] = evidence
+                # Persisted whether or not it is complete. An incomplete capture
+                # is the durable difference between "this fill cost nothing" and
+                # "nobody ever asked what it cost", and the second is what the
+                # store said for a real position.
+                store.record_executions(
+                    position.strategy_id,
+                    at=now,
+                    executions=[e.to_record() for e in evidence.executions],
+                    total_commission=evidence.total_commission,
+                    complete=evidence.is_complete,
+                    gaps=evidence.gaps,
+                )
+            reports = mark_open_positions(
+                open_positions,
+                market_data=IBKRLiveMarketDataAdapter(
+                    ib, requested_type=int(getattr(args, "market_data_type", 1) or 1)
+                ),
+                policy=policy,
+                now=now,
+                commission_by_position=evidence_by_position,
+                configuration_version="options-mark",
+            )
+
+    out(f"MARKING          {len(reports)} position(s)")
+    for report in reports:
+        out(report.describe())
+        journal.record(**report.to_record())
+
+    out("")
+    unmarked = [r for r in reports if not r.is_marked]
+    if unmarked:
+        note(
+            f"{len(unmarked)} position(s) could not be marked: "
+            + ", ".join(f"{r.state.value}[{r.reason_code}]" for r in unmarked)
+        )
+        return EXIT_ERROR
+    incomplete = [r for r in reports if r.state is MarkState.COMMISSION_INCOMPLETE]
+    if incomplete:
+        note(
+            f"{len(incomplete)} position(s) marked, but net profit is unstateable "
+            "until the broker costs the fill"
+        )
+    return EXIT_OK
 
 
 def cmd_options_verify_execution(
@@ -1248,6 +1396,7 @@ COMMANDS = {
     "options-scan": cmd_options_scan,
     "options-run": cmd_options_run,
     "options-positions": cmd_options_positions,
+    "options-mark": cmd_options_mark,
     "options-cancel": cmd_options_cancel,
     "options-verify-execution": cmd_options_verify_execution,
     "options-execution-proof": cmd_options_execution_proof,

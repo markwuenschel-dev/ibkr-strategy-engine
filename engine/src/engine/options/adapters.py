@@ -39,6 +39,7 @@ from .chain import (
 )
 from .domain import OptionStrategyIntent
 from .execution import MarginAssessment, what_if
+from .executions import executions_from_fills
 from .ivrank import IVObservation, observations_from_bars
 from .marketdata import (
     IB_UNSET,
@@ -93,6 +94,7 @@ __all__ = [
     "IBKRVolatilityHistoryAdapter",
     "IBKRWhatIfAdapter",
     "IBKRLiveMarketDataAdapter",
+    "IBKRExecutionReportAdapter",
     "IBKRPortfolioStateAdapter",
     "NET_LIQUIDATION_TAG",
     "INITIAL_MARGIN_TAG",
@@ -414,6 +416,43 @@ class IBKRLiveMarketDataAdapter:
             legs=tuple(legs),
             generations=tuple(generations),
         )
+
+
+class IBKRExecutionReportAdapter:
+    """:class:`~engine.options.ports.ExecutionReportPort` over ``ib_async``.
+
+    ``ib.fills()`` is preferred over ``ib.executions()`` because only the first
+    pairs each execution with its ``commissionReport``. The second returns bare
+    ``Execution`` objects, and an execution with no commission attached is
+    exactly the state this engine already recorded once and could not recover
+    from -- reading the API that structurally cannot answer the question is how
+    that happens twice.
+
+    ``reqExecutions`` is called first when available, because ``ib.fills()``
+    returns only what has been delivered to *this* session's event loop. After a
+    restart that set is empty, and an empty set is indistinguishable from an
+    uncosted fill. Asking the server repopulates it.
+
+    Reads only. Both calls are queries.
+    """
+
+    def __init__(self, ib: Any) -> None:
+        self.ib = ib
+
+    def executions(self) -> Sequence[Any]:
+        request = getattr(self.ib, "reqExecutions", None)
+        if callable(request):
+            try:
+                request()
+            except Exception:  # noqa: BLE001 - a refill failure is not a result
+                # The local fill set is still readable and may already hold what
+                # is needed. Swallowing here loses nothing: an execution that is
+                # genuinely absent shows up downstream as a coverage gap, which
+                # is the honest answer rather than an outage.
+                pass
+        reader = getattr(self.ib, "fills", None)
+        fills = reader() if callable(reader) else ()
+        return executions_from_fills(fills)
 
 
 class IBKRPortfolioStateAdapter:
