@@ -871,7 +871,12 @@ def _build_candidate(
 
 
 def _entry_evidence(
-    report: "RunReport", *, margin: Any, snapshot: Any
+    report: "RunReport",
+    *,
+    margin: Any,
+    snapshot: Any,
+    intent: OptionStrategyIntent | None = None,
+    minimum_iv_rank: Decimal | None = None,
 ) -> dict[str, Any]:
     """The section 3.1 evidence the reviewer needs and the digest cannot bind.
 
@@ -882,6 +887,15 @@ def _entry_evidence(
     which is legible to the reviewer as grounds for UNAVAILABLE. Substituting a
     plausible default here would be the engine answering a question that was
     asked of the reviewer.
+
+    ``intent`` narrows the per-leg fields to the structure actually proposed --
+    the same narrowing :func:`engine.options.risk.execution_entitlement_set`
+    applies, and for the same reason: the reviewer is judging this order, not
+    every strike the scan happened to inspect. ``minimum_iv_rank`` is stated in
+    the filter field because "ENFORCED" without a threshold reads as the
+    default, and a proof run at a deliberately lower threshold that does not
+    say so is asking the reviewer to approve under a false label -- the exact
+    omission the 20260731T133434Z UNAVAILABLE named.
     """
 
     def observed(source: Any, check: str) -> str | None:
@@ -893,6 +907,10 @@ def _entry_evidence(
             return None
         return None if result.observed is None else str(result.observed)
 
+    def event_time(provenance: Any) -> str:
+        at = getattr(provenance, "last_provider_event_at", None)
+        return at.isoformat() if at is not None else "no provider event"
+
     evidence: dict[str, Any] = {
         "iv_rank": (
             str(report.iv_rank.iv_rank)
@@ -903,6 +921,8 @@ def _entry_evidence(
             "BYPASSED"
             if "OPTIONS_IV_RANK_FILTER_BYPASSED" in report.refusal_codes
             else "ENFORCED"
+            if minimum_iv_rank is None
+            else f"ENFORCED at minimum {minimum_iv_rank}"
         ),
         "defined_max_loss": observed(report.risk, "defined_loss"),
         "stress_loss": observed(report.risk, "stress_loss"),
@@ -915,24 +935,49 @@ def _entry_evidence(
             str(snapshot_total(report.portfolio)) if report.portfolio else None
         ),
         "pending_reservations": (
-            str(report.portfolio.reported_buying_power_reserved)
-            if report.portfolio is not None
-            and report.portfolio.reported_buying_power_reserved is not None
+            None
+            if report.portfolio is None
+            else f"reported {report.portfolio.reported_buying_power_reserved}"
+            if report.portfolio.reported_buying_power_reserved is not None
+            else f"derived {report.portfolio.total_buying_power_reserved}"
+            if getattr(report.portfolio, "total_buying_power_reserved", None)
+            is not None
             else None
         ),
         "sector_impact": observed(report.governor, "sector_concentration"),
         "correlation_impact": observed(report.governor, "correlation_concentration"),
+        "portfolio_exposure_after": observed(report.governor, "total_bpr"),
     }
     if snapshot is not None:
         under = getattr(snapshot, "underlying", None)
+        wanted = {leg.con_id for leg in intent.legs} if intent is not None else None
+        legs = [
+            leg
+            for leg in tuple(getattr(snapshot, "legs", ()) or ())
+            if wanted is None or leg.con_id in wanted
+        ]
+        provenances: list[str] = []
+        quote_times: list[str] = []
+        if under is not None:
+            provenances.append(f"underlying {under.provenance.describe()}")
+            quote_times.append(f"underlying {event_time(under.provenance)}")
+        for leg in legs:
+            provenances.append(f"{leg.con_id} {leg.provenance.describe()}")
+            quote_times.append(f"{leg.con_id} {event_time(leg.provenance)}")
         evidence["market_data_provenance"] = (
-            getattr(getattr(under, "liveness", None), "value", None) if under else None
+            "; ".join(provenances) if provenances else None
         )
-        evidence["quote_timestamps"] = (
-            getattr(under, "observed_at", None).isoformat()
-            if under is not None and getattr(under, "observed_at", None) is not None
-            else None
-        )
+        evidence["quote_timestamps"] = "; ".join(quote_times) if quote_times else None
+        greek_times = [
+            f"{leg.con_id} "
+            + (
+                f"delta {leg.greeks.delta} received {leg.greeks.received_at.isoformat()}"
+                if leg.greeks is not None and leg.greeks.delta is not None
+                else "no greeks reported"
+            )
+            for leg in legs
+        ]
+        evidence["greek_timestamps"] = "; ".join(greek_times) if greek_times else None
     return {name: value for name, value in evidence.items() if value is not None}
 
 
@@ -1190,7 +1235,13 @@ def run_once(
             order_type=COMBO_ORDER_TYPE,
             time_in_force=COMBO_TIME_IN_FORCE,
             now=now,
-            evidence=_entry_evidence(report, margin=margin, snapshot=snapshot),
+            evidence=_entry_evidence(
+                report,
+                margin=margin,
+                snapshot=snapshot,
+                intent=candidate,
+                minimum_iv_rank=minimum_iv_rank,
+            ),
         )
 
         try:

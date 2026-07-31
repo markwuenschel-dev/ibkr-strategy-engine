@@ -1389,3 +1389,83 @@ class TestMarkFromSnapshot:
         mark = mark_from_snapshot(position, snapshot)
 
         assert mark is not None and mark.is_live is False
+
+
+# ===========================================================================
+# The packet's evidence section is complete
+# ===========================================================================
+
+
+class TestEntryEvidenceIsComplete:
+    """The evidence section is what the reviewer judges freshness and
+    eligibility from, and an absent field renders as MISSING -- which is
+    grounds for UNAVAILABLE and blocks the open.
+
+    The 2026-07-31 UNAVAILABLE (handoff 20260731T133434Z-786403) named four
+    fields the runner silently dropped: ``market_data_provenance`` and
+    ``quote_timestamps`` read attributes the snapshot never had, and the
+    trailing None-filter pruned them without a trace; ``greek_timestamps`` and
+    ``portfolio_exposure_after`` were never assembled at all. These tests pin
+    every expected field present on a live pass, so the next wrong attribute
+    path fails a named test instead of a live review.
+    """
+
+    def _captured_evidence(self, tmp_path: Path) -> tuple[Any, RunReport]:
+        captured: list[Any] = []
+
+        class CapturingGate(reviewer.ReviewedGate):
+            def require(self, packet: Any, *, now: dt.datetime) -> Any:
+                captured.append(packet)
+                return super().require(packet, now=now)
+
+        root = reviewer.collab_at(tmp_path / "verifier")
+        verifier = CapturingGate(
+            root=root,
+            ledger=tmp_path / "verifier" / "state" / "verification",
+            reviewer=reviewer.ScriptedReviewer(root=root),
+        )
+        report = run_pass(
+            FakeBroker(),
+            gate_for(tmp_path),
+            store_for(tmp_path),
+            armed=False,
+            verifier=verifier,
+        )
+        assert captured, report.describe()
+        return captured[-1], report
+
+    def test_every_expected_evidence_field_reaches_the_packet(
+        self, tmp_path: Path
+    ) -> None:
+        from engine.options.approval import VerificationPacket
+
+        packet, report = self._captured_evidence(tmp_path)
+        missing = [
+            name
+            for name in VerificationPacket.EXPECTED_EVIDENCE
+            if packet.evidence.get(name) is None
+        ]
+        assert missing == [], f"evidence dropped {missing}\n{report.describe()}"
+        assert "**MISSING**" not in packet.render()
+
+    def test_provenance_and_timestamps_name_the_selected_legs(
+        self, tmp_path: Path
+    ) -> None:
+        """Per-leg fields must cover the structure proposed -- underlying and
+        both selected legs -- not the whole scanned chain window."""
+        packet, _report = self._captured_evidence(tmp_path)
+        for name in ("market_data_provenance", "quote_timestamps", "greek_timestamps"):
+            value = str(packet.evidence[name])
+            assert str(SHORT_CON_ID) in value, f"{name}: {value}"
+            assert str(LONG_CON_ID) in value, f"{name}: {value}"
+        assert "underlying" in str(packet.evidence["market_data_provenance"])
+        assert "LIVE" in str(packet.evidence["market_data_provenance"])
+
+    def test_the_filter_field_states_the_threshold_it_enforced(
+        self, tmp_path: Path
+    ) -> None:
+        """"ENFORCED" without a number reads as the default. A proof run at a
+        deliberately lower threshold must say so in the packet, or the reviewer
+        is asked to approve under a false label."""
+        packet, _report = self._captured_evidence(tmp_path)
+        assert packet.evidence["iv_rank_filter"] == "ENFORCED at minimum 50"
