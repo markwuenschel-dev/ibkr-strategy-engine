@@ -60,6 +60,52 @@ class HaltedError(RefusedError):
     exit_code = EXIT_HALTED
 
 
+class InvalidStrategyError(RefusedError):
+    """An option strategy violates a structural invariant and was not built.
+
+    A distinct type from RefusedError for the same reason UnsafeConfigError is
+    distinct from ConfigError: "this credit is too small" and "this structure
+    contains an uncovered short call" are not the same category of event, and a
+    broad ``except RefusedError`` that logs and moves to the next candidate must
+    not be able to swallow the second one quietly.
+
+    Raised at construction time, so an invalid structure cannot exist as an
+    object waiting to be passed to a gate that happens not to check it.
+    """
+
+
+class InvalidPortfolioStateError(RefusedError):
+    """A portfolio snapshot is malformed and was not built.
+
+    Distinct from RefusedError for the same reason InvalidStrategyError is: "the
+    book is too concentrated to add this" is a governor decision the caller
+    should log and move past, while "net liquidation came back as a float" is a
+    broken adapter. A loop that catches RefusedError to try the next candidate
+    must not be able to swallow the second one and keep trading against a
+    portfolio view it never successfully read.
+
+    Raised at construction time, so a snapshot that cannot be trusted cannot
+    exist as an object the governor might size against.
+    """
+
+
+class MarketDataRefusedError(RefusedError):
+    """Market data was not good enough to make a trading decision on.
+
+    Carries a machine-readable ``reason`` because the caller's response differs
+    by cause: an entitlement problem is a purchase, a stale quote is a retry,
+    and a generation mismatch is a bug in the subscription lifecycle. A human
+    reading the message must not be the only way to tell them apart.
+    """
+
+    def __init__(self, reason: str, message: str, *, hint: str | None = None) -> None:
+        super().__init__(message, hint=hint)
+        self.reason = reason
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return f"[{self.reason}] {super().__str__()}"
+
+
 class ConnectionError_(EngineError):
     """Could not reach TWS / IB Gateway, or the connection was rejected.
 

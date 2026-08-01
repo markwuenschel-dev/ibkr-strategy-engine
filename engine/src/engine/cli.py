@@ -6,6 +6,10 @@
     engine preview --symbol SPY --qty 1            M3: margin preview, places nothing
     engine trade   --symbol SPY --qty 1 --arm      M4: one order
 
+    engine probe-options-data                      capability probe; transmits nothing
+    engine options-scan --symbol SPY               IV Rank + chain + real what-if; transmits nothing
+    engine options-mark                            mark every open position; proposes, sends nothing
+
     engine halt "reason"                           engage the kill switch
     engine resume                                  release it
     engine journal -n 20                           read the durable record
@@ -32,8 +36,8 @@ from ._collabkit import load_dotenv
 from .alerts import Alerter
 from .broker import Broker
 from .config import PAPER_PORTS, EngineConfig
-from .errors import EXIT_OK, EXIT_USAGE, EngineError, RefusedError
-from .journal import OrderJournal
+from .errors import EXIT_ERROR, EXIT_OK, EXIT_USAGE, EngineError, RefusedError
+from .journal import OrderJournal, utc_now
 from .safety import BUY, SIDES, OrderIntent, SafetyGate
 
 
@@ -43,6 +47,23 @@ def out(*parts: Any) -> None:
 
 def note(message: str) -> None:
     print(message, file=sys.stderr)
+
+
+def _open_orders_or_none(broker: Any) -> Any:
+    """What the broker is working, or ``None`` when it could not be asked.
+
+    ``None`` and ``()`` are different answers to the reconciler: the first is
+    "nobody asked", the second is "asked, nothing working". Collapsing them is
+    how a report came to state, of a live working order, that the broker was
+    not working it. A broker that raises or has no such method is the first
+    case, never the second.
+    """
+    from .options.adapters import read_open_orders  # noqa: PLC0415 - optional path
+
+    try:
+        return read_open_orders(getattr(broker, "ib", broker))
+    except Exception:  # noqa: BLE001 - an unanswered question is not an answer of no
+        return None
 
 
 # ==========================================================================
@@ -91,6 +112,216 @@ def build_parser() -> argparse.ArgumentParser:
                 action="store_true",
                 help="actually transmit. Without this, the order is only described.",
             )
+
+    probe = subs.add_parser(
+        "probe-options-data",
+        help="non-transmitting capability probe: do option greeks arrive?",
+    )
+    probe.add_argument("--symbol", default="SPY")
+    probe.add_argument(
+        "--market-data-type",
+        type=int,
+        default=3,
+        choices=[1, 2, 3, 4],
+        help="1 live, 2 frozen, 3 delayed (default), 4 delayed-frozen. "
+        "Requested once and never changed, so run each type in its own process.",
+    )
+    probe.add_argument("--dte", type=int, default=45, help="target days to expiry")
+    probe.add_argument("--strikes", type=int, default=4, help="contracts to subscribe")
+    probe.add_argument(
+        "--settle", type=float, default=12.0, help="seconds to wait for ticks"
+    )
+
+    scan = subs.add_parser(
+        "options-scan",
+        help="shadow scan: IV Rank, expiry, chain and a real broker what-if. Transmits nothing.",
+    )
+    scan.add_argument("--symbol", default="SPY")
+    scan.add_argument("--dte", type=int, default=45, help="target days to expiry")
+    scan.add_argument("--min-iv-rank", type=float, default=50.0)
+    scan.add_argument("--width-steps", type=int, default=5, help="strikes between the wings")
+
+    run = subs.add_parser(
+        "options-run",
+        help=(
+            "one strategy pass: reconcile, manage open positions, consider one "
+            "entry. Requires --arm to transmit anything."
+        ),
+    )
+    run.add_argument("--symbol", default="SPY")
+    run.add_argument(
+        "--bias",
+        default="BULLISH",
+        choices=["BULLISH", "BEARISH", "NEUTRAL"],
+        help="BULLISH sells puts, BEARISH sells calls",
+    )
+    run.add_argument("--dte", type=int, default=45, help="target days to expiry")
+    run.add_argument("--min-iv-rank", type=float, default=50.0)
+    run.add_argument(
+        "--market-data-type",
+        type=int,
+        default=1,
+        choices=[1, 2, 3, 4],
+        help=(
+            "1 live (default), 2 frozen, 3 delayed, 4 delayed-frozen. Anything "
+            "other than live is for exercising the pipeline during development: "
+            "the entitlement gate refuses non-live data, so a run on delayed data "
+            "can build and grade a candidate but can never transmit one."
+        ),
+    )
+    run.add_argument(
+        "--arm",
+        action="store_true",
+        help=(
+            "actually transmit. Without this the pass runs every gate and shows "
+            "exactly what it would have sent, and sends nothing."
+        ),
+    )
+
+    cancel = subs.add_parser(
+        "options-cancel",
+        help="pull one working order by its strategy id (requires --arm)",
+        description=(
+            "Retract a working order through the engine's single cancel "
+            "chokepoint. Matched on orderRef, which carries the strategy id -- "
+            "never on orderId, which is reused across sessions. Authorized by "
+            "the kill switch and --arm only: refusing to cancel because the "
+            "book is concentrated would be backwards, since cancelling is what "
+            "reduces exposure."
+        ),
+    )
+    cancel.add_argument("--strategy-id", required=True, help="the order's orderRef")
+    cancel.add_argument("--reason", default="", help="recorded with the cancellation")
+    cancel.add_argument(
+        "--arm",
+        action="store_true",
+        help="actually cancel. Without this the target is printed and nothing is sent.",
+    )
+
+    positions = subs.add_parser(
+        "options-positions", help="list open option structures and reconcile them"
+    )
+    positions.add_argument("--no-connect", action="store_true", help="read the store only")
+
+    # Read-only by construction: there is deliberately no --arm here and no
+    # code path that could use one. Marking answers "what is this worth"; acting
+    # on the answer is options-run's job, behind its own gates.
+    mark = subs.add_parser(
+        "options-mark",
+        help="mark every open structure: closing price, P&L, and a close proposal",
+        description=(
+            "Subscribes to each open position's own underlying and its own legs "
+            "-- not a chain window -- and reports, per position, one of four "
+            "states: MARKED, STALE, UNAVAILABLE or COMMISSION_INCOMPLETE. "
+            "Closing prices are quoted both at the midpoint (a valuation) and at "
+            "the natural (what an exit can actually be done at: the short leg's "
+            "ask minus the long leg's bid). Executions and commissions are "
+            "captured and persisted, and net profit is stated only when the "
+            "broker has costed every leg. Any close it prints is a PROPOSAL. "
+            "This command transmits nothing and has no --arm."
+        ),
+    )
+    mark.add_argument(
+        "--strategy-id", help="mark only this position (default: every open one)"
+    )
+    mark.add_argument(
+        "--no-connect",
+        action="store_true",
+        help="read the store only; every position reports UNAVAILABLE",
+    )
+
+    # A command of its own, not a flag on the strategy pass. The bounded proof
+    # and the production strategy answer different questions -- "does the broker
+    # lifecycle work" versus "should this trade be made" -- and sharing a command
+    # meant one forgotten flag silently ran the other one armed. A separate verb
+    # cannot be reached by omission.
+    proof = subs.add_parser(
+        "options-execution-proof",
+        help=(
+            "bounded execution proof: one 1-wide SPY vertical, quantity 1, "
+            "defined loss <= $100. Tests the broker lifecycle, not the strategy."
+        ),
+        description=(
+            "A tightly bounded operational test of the IBKR execution lifecycle. "
+            "It is NOT the trading strategy and does not claim a strategy signal, "
+            "which is why it does not consult the IV Rank filter. Every safety "
+            "gate still runs: live uniform provenance, quote and greek freshness, "
+            "defined-risk construction, maximum loss, broker what-if margin, "
+            "stress loss, portfolio reconciliation, the authorization token, the "
+            "kill switch, the paper-port restriction and durable persistence. "
+            "The bounds are module constants -- no environment variable and no "
+            "flag can widen them."
+        ),
+    )
+    proof.add_argument("--symbol", default="SPY")
+    proof.add_argument("--dte", type=int, default=45, help="target days to expiry")
+    proof.add_argument(
+        "--arm",
+        action="store_true",
+        help=(
+            "transmit exactly one bounded order. Without it the whole timeline "
+            "runs and stops at the authorization step, printing the exact order "
+            "it would have sent."
+        ),
+    )
+    # Pinned, and deliberately not exposed as flags. Market data type in
+    # particular: offering --market-data-type here would let an operator run the
+    # proof on delayed data, which is exactly the kind of widening this command
+    # exists to make impossible. The entitlement gate would refuse it anyway --
+    # but a bound you can ask for and be refused is weaker than one you cannot
+    # express. IV Rank is carried only because the shared runner signature takes
+    # it; the proof does not enforce it.
+    proof.add_argument(
+        "--price-at",
+        default="midpoint",
+        choices=["midpoint", "natural"],
+        help=(
+            "where on the book to ask. midpoint is fair value and the strategy "
+            "default; natural is what the book pays now (short bid minus long "
+            "ask) and is for an execution experiment that wants a fill rather "
+            "than a good price. Every risk bound is re-run at whichever is used."
+        ),
+    )
+    proof.set_defaults(
+        execution_proof=True,
+        bias="BULLISH",
+        market_data_type=1,
+        min_iv_rank=0.0,
+    )
+
+    verify = subs.add_parser(
+        "options-verify-execution",
+        help=(
+            "print the full authorization, submission, broker-status, fill, "
+            "persistence and reconciliation timeline. Paper ports only."
+        ),
+    )
+    verify.add_argument("--symbol", default="SPY")
+    verify.add_argument("--bias", default="BULLISH", choices=["BULLISH", "BEARISH", "NEUTRAL"])
+    verify.add_argument("--dte", type=int, default=45)
+    verify.add_argument("--min-iv-rank", type=float, default=50.0)
+    verify.add_argument(
+        "--market-data-type", type=int, default=1, choices=[1, 2, 3, 4]
+    )
+    verify.add_argument(
+        "--execution-proof",
+        action="store_true",
+        help=(
+            "run the bounded execution proof instead of an ordinary armed pass: "
+            "SPY only, one 1-wide vertical, quantity 1, defined loss <= $100, "
+            "broker margin <= $150, stress loss <= $100, one opening order. The "
+            "IV Rank filter is off -- this is a lifecycle test, not a strategy "
+            "signal -- and every safety gate still runs. Requires --arm to send."
+        ),
+    )
+    verify.add_argument(
+        "--arm",
+        action="store_true",
+        help=(
+            "transmit one order. Without it the timeline stops at the "
+            "authorization step and reports exactly which gate would have refused."
+        ),
+    )
 
     halt = subs.add_parser("halt", help="engage the kill switch")
     halt.add_argument("reason", nargs="?", default="halted from the CLI")
@@ -196,6 +427,784 @@ def cmd_quote(args: argparse.Namespace) -> int:
                 "subscriptions; outside trading hours even delayed data can be empty."
             )
             return 1
+    return EXIT_OK
+
+
+def cmd_probe_options_data(args: argparse.Namespace, broker_factory: Any = Broker) -> int:
+    """Subscribe, observe, report, cancel. Places nothing, ever.
+
+    Exits 0 whichever capability state is found -- an answer of "delayed greeks
+    are unavailable" is a successful probe, not a failure. Only a probe that
+    could not reach a conclusion exits non-zero.
+    """
+    from .options.probe import ProbeOutcome, run_market_data_probe
+
+    config = config_from(args)
+    journal = OrderJournal(config.journal_path)
+    journal.preflight()
+
+    gate = SafetyGate(config, journal)
+    # The kill switch covers reads too. If someone has halted the engine, the
+    # answer is that nothing talks to the broker -- not "nothing places orders".
+    gate.assert_not_halted()
+
+    with broker_factory(config, journal) as broker:
+        report = run_market_data_probe(
+            broker,
+            symbol=args.symbol.strip().upper(),
+            market_data_type=args.market_data_type,
+            target_dte=args.dte,
+            strike_count=args.strikes,
+            settle_seconds=args.settle,
+            account=config.account_id,
+        )
+
+    out(report.describe())
+    journal.record(**report.to_record())
+    out("")
+    note("probe complete; no order was transmitted and none can be from this path")
+
+    if report.outcome is ProbeOutcome.PROBE_ERROR:
+        return EXIT_ERROR
+    return EXIT_OK
+
+
+def cmd_options_scan(args: argparse.Namespace, broker_factory: Any = Broker) -> int:
+    """Run every options step that works without a market-data subscription.
+
+    Places nothing. Exits 0 whether or not a tradeable candidate was found --
+    "IV Rank is 26, no trade" is a successful scan.
+    """
+    from decimal import Decimal
+
+    from .options.adapters import (
+        IBKRLiveMarketDataAdapter,
+        IBKRPortfolioStateAdapter,
+    )
+    from .options.policy import RiskPolicy
+    from .options.scan import run_scan
+
+    config = config_from(args)
+    journal = OrderJournal(config.journal_path)
+    journal.preflight()
+
+    gate = SafetyGate(config, journal)
+    gate.assert_not_halted()
+
+    # Built from IBKR_OPTIONS_* with validated defaults. Constructing it here
+    # rather than inside run_scan means a bad threshold fails before the socket
+    # opens, like every other config error in this engine.
+    policy = RiskPolicy.from_env()
+
+    with broker_factory(config, journal) as broker:
+        # The real adapters are passed in. Under the current entitlement they
+        # will make the gate refuse -- with OPTIONS_REALTIME_DATA_REQUIRED rather
+        # than "no data was supplied", which is the difference between the gate
+        # being wired in and merely existing.
+        report = run_scan(
+            broker,
+            symbol=args.symbol.strip().upper(),
+            target_dte=args.dte,
+            minimum_iv_rank=Decimal(str(args.min_iv_rank)),
+            width_steps=args.width_steps,
+            account=config.account_id,
+            policy=policy,
+            market_data=IBKRLiveMarketDataAdapter(broker.ib),
+            portfolio=IBKRPortfolioStateAdapter(broker),
+        )
+
+    out(report.describe())
+    journal.record(**report.to_record())
+    out("")
+    note("scan complete; no order was transmitted and none can be from this path")
+    return EXIT_OK
+
+
+def cmd_options_run(args: argparse.Namespace, broker_factory: Any = Broker) -> int:
+    """One strategy pass. The only options command that can transmit.
+
+    Gate ordering mirrors :func:`cmd_trade`, and for the same reason: the local
+    gates run before a socket is opened, and ``--arm`` is checked last inside
+    :func:`engine.options.transmit.authorize_open`, so an unarmed pass still
+    shows every other refusal instead of stopping at "not armed".
+    """
+    from decimal import Decimal
+
+    from .options.adapters import IBKRLiveMarketDataAdapter, IBKRPortfolioStateAdapter
+    from .options.policy import RiskPolicy
+    from .options.positions import PositionStore
+    from .options.runner import EntryPricing, run_once
+    from .options.selection import Bias
+
+    config = config_from(args)
+    journal = OrderJournal(config.journal_path)
+    journal.preflight()
+
+    gate = SafetyGate(config, journal)
+    # Before any socket. A halted engine must not talk to the broker at all.
+    gate.assert_not_halted()
+
+    policy = RiskPolicy.from_env()
+    store = PositionStore(config.state_dir / "positions.jsonl")
+
+    if not args.arm:
+        note("DRY RUN -- every gate will run and nothing will be transmitted.")
+
+    _verifier, _context = _verifier_for(config, policy)
+    with broker_factory(config, journal) as broker:
+        report = run_once(
+            broker,
+            gate=gate,
+            journal=journal,
+            store=store,
+            policy=policy,
+            armed=bool(args.arm),
+            symbol=args.symbol.strip().upper(),
+            bias=Bias(args.bias),
+            market_data=IBKRLiveMarketDataAdapter(
+                broker.ib, requested_type=args.market_data_type
+            ),
+            portfolio=IBKRPortfolioStateAdapter(broker),
+            target_dte=args.dte,
+            minimum_iv_rank=Decimal(str(args.min_iv_rank)),
+            account=config.account_id,
+            verifier=_verifier,
+            approval_context=_context,
+            entry_preflight=_paper_day_preflight(config),
+        )
+
+    out(report.describe())
+    journal.record(**report.to_record())
+    out("")
+    if not args.arm:
+        note("dry run complete; nothing was transmitted. Pass --arm to trade.")
+    return EXIT_OK
+
+
+def _paper_day_preflight(config: EngineConfig) -> Any:
+    """The session controller's entry gate, enforced at the runner seam.
+
+    Runs after risk and the governor and before a verification proposal is
+    filed, so a CLOSED gate stops proposals as well as orders. Management,
+    exits and cancels never pass through here -- ``run_once`` only consults the
+    preflight for entry candidates.
+    """
+    from .paperday import PaperDayPaths, entry_gate_preflight
+
+    return entry_gate_preflight(PaperDayPaths(state_dir=config.state_dir))
+
+
+
+def _verifier_for(config: EngineConfig, policy: Any) -> tuple[Any, Any]:
+    """The independent-verifier gate and the context an approval binds to.
+
+    Returns ``(None, None)`` when no collab can be found. That is deliberately
+    not an error here: reconciliation, management and exits all run fine without
+    a reviewer, and only the *entry* needs one -- so the runner refuses the entry
+    with a named code rather than this command refusing to start and leaving an
+    open position unmanaged. Trapping a position to enforce a gate on new risk
+    would invert the whole asymmetry this engine is built around.
+    """
+    from .options.approval import ApprovalContext, CollabVerifierGate, default_collab_root
+
+    root = default_collab_root(config.project)
+    if root is None:
+        return None, None
+    gate = CollabVerifierGate(root=root, ledger=config.state_dir / "verification")
+    return gate, ApprovalContext.for_run(config=config, policy=policy, account=config.account_id)
+
+
+def cmd_options_cancel(args: argparse.Namespace, broker_factory: Any = Broker) -> int:
+    """Pull one working order, by the strategy id it carries as its orderRef.
+
+    The operator surface for the cancel chokepoint. It exists because a working
+    order that neither fills nor rejects had, until now, no way out of this
+    engine at all -- it had to be cancelled by hand in TWS, which means the one
+    action that makes every other bound enforceable after the fact was the one
+    action the engine could not take.
+
+    Matching is on ``orderRef``, which ``build_combo`` sets to the strategy id.
+    Deliberately not ``orderId``: it is reused across sessions, so a stranger's
+    order can carry one of ours.
+    """
+    from uuid import UUID
+
+    from .options.adapters import read_open_orders
+    from .options.positions import PositionStore
+    from .options.sink import LifecycleRecorder
+    from .options.transmit import authorize_cancel, cancel_combo
+
+    config = config_from(args)
+    try:
+        strategy_id = UUID(str(args.strategy_id).strip())
+    except (ValueError, AttributeError, TypeError):
+        raise RefusedError(
+            f"not a strategy id: {args.strategy_id!r}",
+            hint="pass the uuid the order carries as its orderRef; "
+            "`engine options-positions` prints it",
+        ) from None
+
+    journal = OrderJournal(config.journal_path)
+    journal.preflight()
+    gate = SafetyGate(config, journal)
+    # Before the socket, as everywhere else. A halted engine does not connect.
+    gate.assert_not_halted()
+
+    store = PositionStore(config.state_dir / "positions.jsonl")
+    recorder = LifecycleRecorder(store)
+
+    with broker_factory(config, journal) as broker:
+        working = read_open_orders(broker.ib)
+        if working is None:
+            raise RefusedError(
+                "the broker could not be asked what it is working",
+                hint="without that answer a cancel would be aimed at a guess",
+            )
+        matches = [
+            trade
+            for trade in working
+            if str(getattr(getattr(trade, "order", None), "orderRef", "")).strip()
+            == str(strategy_id)
+        ]
+        out(f"working orders   {len(working)} at the broker, {len(matches)} ours")
+        if not matches:
+            out("")
+            note(f"no working order carries orderRef {strategy_id}")
+            note("it may have filled, been cancelled, or expired -- reconcile first")
+            return EXIT_ERROR
+
+        for trade in matches:
+            order = getattr(trade, "order", None)
+            status = getattr(trade, "orderStatus", None)
+            out(
+                f"  orderId={getattr(order, 'orderId', None)} "
+                f"permId={getattr(order, 'permId', None)} "
+                f"lmt={getattr(order, 'lmtPrice', None)} "
+                f"status={getattr(status, 'status', None)} "
+                f"filled={getattr(status, 'filled', None)} "
+                f"remaining={getattr(status, 'remaining', None)}"
+            )
+
+        if not args.arm:
+            out("")
+            note("not armed: nothing was cancelled. Pass --arm to pull it.")
+            return EXIT_OK
+
+        authorization = authorize_cancel(
+            strategy_id,
+            gate=gate,
+            armed=True,
+            now=utc_now(),
+            reason=args.reason,
+        )
+        out("")
+        out(f"AUTHORIZED CANCEL  {authorization.describe()}")
+
+        for trade in matches:
+            result = cancel_combo(
+                broker.ib, trade, authorization=authorization, sink=recorder
+            )
+            out("")
+            out(result.describe())
+            # A cancel is not a flat book. It can lose a race with a fill, and
+            # cancelling the remainder of a partial leaves contracts behind.
+            if result.has_position:
+                out("")
+                note(
+                    "THIS DID NOT LEAVE YOU FLAT -- the order carries a position. "
+                    "Reconcile before doing anything else."
+                )
+            journal.record(
+                event="order_cancelled",
+                strategy_id=str(strategy_id),
+                state=result.state.value,
+                has_position=bool(result.has_position),
+                reason=args.reason,
+            )
+    return EXIT_OK
+
+
+def cmd_options_positions(args: argparse.Namespace, broker_factory: Any = Broker) -> int:
+    """List what the engine believes it holds, and check it against the broker."""
+    from .options.positions import PositionStore
+
+    config = config_from(args)
+    store = PositionStore(config.state_dir / "positions.jsonl")
+
+    open_positions = store.open_positions()
+    out(f"open positions   {len(open_positions)}")
+    for position in open_positions:
+        out(f"  {position.describe()}")
+
+    if args.no_connect:
+        out("")
+        note("--no-connect: the broker was not consulted, so nothing was reconciled")
+        return EXIT_OK
+
+    journal = OrderJournal(config.journal_path)
+    with broker_factory(config, journal) as broker:
+        # Positions AND working orders. A working order is not a position, so
+        # asking only the first reported an order the broker was demonstrably
+        # working as one it was not.
+        report = store.reconcile_against_broker(
+            broker.positions(),
+            checked_at=utc_now(),
+            broker_orders=_open_orders_or_none(broker),
+        )
+    out("")
+    out(report.describe())
+    journal.record(**report.to_record())
+    return EXIT_OK if report.agrees else EXIT_ERROR
+
+
+def cmd_options_mark(args: argparse.Namespace, broker_factory: Any = Broker) -> int:
+    """Mark every open structure and say, in one of four states, how far that got.
+
+    The one thing this command must never do is print a number it could not
+    stand behind, so every refusal path here reports a state rather than a
+    price. It sends nothing: it reads quotes, reads executions, writes the
+    commission evidence it found to the position store, and prints.
+    """
+    from uuid import UUID
+
+    from .options.adapters import (
+        IBKRExecutionReportAdapter,
+        IBKRLiveMarketDataAdapter,
+    )
+    from .options.executions import commission_evidence_for
+    from .options.marking import MarkState, mark_open_positions
+    from .options.policy import RiskPolicy
+    from .options.positions import PositionStore
+
+    config = config_from(args)
+    journal = OrderJournal(config.journal_path)
+    journal.preflight()
+
+    gate = SafetyGate(config, journal)
+    # Before any socket, exactly as options-run does. A halted engine must not
+    # talk to the broker at all, even to ask a read-only question.
+    gate.assert_not_halted()
+
+    policy = RiskPolicy.from_env()
+    store = PositionStore(config.state_dir / "positions.jsonl")
+
+    wanted = getattr(args, "strategy_id", None)
+    open_positions = store.open_positions()
+    if wanted:
+        try:
+            target = UUID(str(wanted))
+        except ValueError:
+            note(f"--strategy-id {wanted!r} is not a UUID")
+            return EXIT_USAGE
+        open_positions = [p for p in open_positions if p.strategy_id == target]
+        if not open_positions:
+            note(f"no open position with strategy id {target}")
+            return EXIT_ERROR
+
+    out(f"open positions   {len(open_positions)}")
+    for position in open_positions:
+        out(f"  {position.describe()}")
+    out("")
+
+    if not open_positions:
+        note("nothing to mark")
+        return EXIT_OK
+
+    now = utc_now()
+    evidence_by_position = {}
+
+    if args.no_connect:
+        note("--no-connect: no quotes were requested, so nothing can be marked")
+        reports = mark_open_positions(
+            open_positions, market_data=None, policy=policy, now=now
+        )
+    else:
+        with broker_factory(config, journal) as broker:
+            ib = getattr(broker, "ib", broker)
+            executions = IBKRExecutionReportAdapter(ib).executions()
+            for position in open_positions:
+                evidence = commission_evidence_for(
+                    strategy_id=position.strategy_id,
+                    legs=position.legs,
+                    filled_quantity=position.filled_quantity,
+                    executions=executions,
+                    order_id=position.open_order_id,
+                    perm_id=position.open_perm_id,
+                )
+                evidence_by_position[position.strategy_id] = evidence
+                # Persisted whether or not it is complete. An incomplete capture
+                # is the durable difference between "this fill cost nothing" and
+                # "nobody ever asked what it cost", and the second is what the
+                # store said for a real position.
+                store.record_executions(
+                    position.strategy_id,
+                    at=now,
+                    executions=[e.to_record() for e in evidence.executions],
+                    total_commission=evidence.total_commission,
+                    complete=evidence.is_complete,
+                    gaps=evidence.gaps,
+                )
+            reports = mark_open_positions(
+                open_positions,
+                market_data=IBKRLiveMarketDataAdapter(
+                    ib, requested_type=int(getattr(args, "market_data_type", 1) or 1)
+                ),
+                policy=policy,
+                now=now,
+                commission_by_position=evidence_by_position,
+                configuration_version="options-mark",
+            )
+
+    out(f"MARKING          {len(reports)} position(s)")
+    for report in reports:
+        out(report.describe())
+        journal.record(**report.to_record())
+
+    out("")
+    unmarked = [r for r in reports if not r.is_marked]
+    if unmarked:
+        note(
+            f"{len(unmarked)} position(s) could not be marked: "
+            + ", ".join(f"{r.state.value}[{r.reason_code}]" for r in unmarked)
+        )
+        return EXIT_ERROR
+    incomplete = [r for r in reports if r.state is MarkState.COMMISSION_INCOMPLETE]
+    if incomplete:
+        note(
+            f"{len(incomplete)} position(s) marked, but net profit is unstateable "
+            "until the broker costs the fill"
+        )
+    return EXIT_OK
+
+
+def cmd_options_verify_execution(
+    args: argparse.Namespace, broker_factory: Any = Broker
+) -> int:
+    """Print the whole execution timeline, gate by gate. Paper ports only.
+
+    The point of this command is that it is *legible*: every gate reports pass
+    or refuse with its machine-readable code, in the order the engine actually
+    evaluates them, so an operator can see precisely where a run stops rather
+    than inferring it from an absence.
+
+    It refuses **before** any socket transmission whenever entitlement,
+    provenance, risk, governor, kill-switch, allowlist, arm or strategy-id
+    checks fail -- and because it reuses :func:`engine.options.runner.run_once`
+    rather than reimplementing the pipeline, it cannot drift from what the armed
+    command does. A verification path with its own copy of the gates would prove
+    something about the copy.
+
+    With ``--execution-proof`` it becomes a different and much narrower thing:
+    a bounded operational test of the broker's execution lifecycle, run under
+    :class:`engine.options.proof.ExecutionProofProfile` rather than under the
+    strategy's own policy. See :func:`cmd_options_execution_proof`.
+    """
+    if getattr(args, "execution_proof", False):
+        return cmd_options_execution_proof(args, broker_factory)
+
+    from decimal import Decimal
+
+    from .options.adapters import IBKRLiveMarketDataAdapter, IBKRPortfolioStateAdapter
+    from .options.policy import RiskPolicy
+    from .options.positions import PositionStore
+    from .options.runner import EntryPricing, run_once
+    from .options.selection import Bias
+
+    config = config_from(args)
+    # The paper-port interlock is enforced in EngineConfig, so reaching this line
+    # already proves the endpoint is a paper one. Stated here because a command
+    # named "verify execution" is exactly where someone would look for it.
+    journal = OrderJournal(config.journal_path)
+    journal.preflight()
+
+    gate = SafetyGate(config, journal)
+    gate.assert_not_halted()
+
+    policy = RiskPolicy.from_env()
+    store = PositionStore(config.state_dir / "positions.jsonl")
+
+    out("EXECUTION VERIFICATION")
+    out(f"  venue          {config.venue} ({config.host}:{config.port})")
+    out(f"  account        {config.account_id}")
+    out(f"  policy         {policy.version}")
+    out(f"  armed          {'YES -- one order may be transmitted' if args.arm else 'NO'}")
+    out("")
+
+    _verifier, _context = _verifier_for(config, policy)
+    with broker_factory(config, journal) as broker:
+        report = run_once(
+            broker,
+            gate=gate,
+            journal=journal,
+            store=store,
+            policy=policy,
+            armed=bool(args.arm),
+            symbol=args.symbol.strip().upper(),
+            bias=Bias(args.bias),
+            market_data=IBKRLiveMarketDataAdapter(
+                broker.ib, requested_type=args.market_data_type
+            ),
+            portfolio=IBKRPortfolioStateAdapter(broker),
+            target_dte=args.dte,
+            minimum_iv_rank=Decimal(str(args.min_iv_rank)),
+            account=config.account_id,
+            verifier=_verifier,
+            approval_context=_context,
+            entry_preflight=_paper_day_preflight(config),
+        )
+
+    out(report.describe())
+    out("")
+
+    out("TIMELINE")
+    events = list(store.events())
+    if not events:
+        out("  no position events were written -- nothing reached the transmit step")
+    for event in events[-24:]:
+        out(
+            f"  {str(event.get('at', ''))[:19]}  {str(event.get('event', '')):<22}"
+            f"  order={event.get('order_id')} perm={event.get('perm_id')}"
+        )
+    out("")
+
+    integrity = store.integrity_errors()
+    out("STORE INTEGRITY")
+    out("  clean" if not integrity else f"  {len(integrity)} unreadable event(s)")
+    for problem in integrity:
+        out(f"    {problem}")
+    out("")
+
+    journal.record(**report.to_record())
+
+    if not args.arm:
+        note(
+            "not armed: the timeline above stops at the authorization step and "
+            "names the gate that would have refused. Pass --arm to transmit one order."
+        )
+    elif not report.transmissions:
+        note(
+            "armed, and nothing was transmitted -- a gate refused first. The "
+            "refusal codes above say which."
+        )
+    return EXIT_OK
+
+
+def cmd_options_execution_proof(
+    args: argparse.Namespace, broker_factory: Any = Broker
+) -> int:
+    """The bounded execution proof. Not a strategy pass, and it says so.
+
+    Two things make this different from ``options-verify-execution --arm``, and
+    both are the point of the command existing:
+
+    **Its bounds come from a schema, not the environment.** The policy it runs
+    under is :meth:`ExecutionProofProfile.derive_policy`, which folds the proof's
+    ceilings into whatever ``IBKR_OPTIONS_*`` says using ``min()`` -- so an
+    environment variable can make this run stricter and can never make it looser.
+    The profile's fingerprint is printed before anything happens, so what the run
+    was bounded by is a fact on the operator's screen rather than an inference
+    from a config file.
+
+    **It does not claim to be the strategy signal.** The IV Rank filter is off,
+    deliberately, and the refusal code that would have fired is recorded anyway.
+    Every gate that answers "is this survivable if it fills" -- provenance,
+    freshness, defined-risk construction, maximum loss, broker what-if margin,
+    stress loss, portfolio reconciliation, the authorization token, the kill
+    switch, the paper port and durable persistence -- runs untouched, because
+    this reaches them through the same :func:`engine.options.runner.run_once`
+    the armed strategy command uses.
+    """
+    from decimal import Decimal
+
+    from .options.adapters import IBKRLiveMarketDataAdapter, IBKRPortfolioStateAdapter
+    from .options.positions import PositionStore
+    from .options.proof import (
+        PROOF_CONFIGURATION_VERSION,
+        ExecutionProofProfile,
+        OpeningOrderBudget,
+        ProofEntryPreflight,
+        RecordingLifecycleSink,
+        new_proof_session_id,
+    )
+    from .options.runner import EntryPricing, run_once
+    from .options.selection import Bias
+    from .options.sink import LifecycleRecorder
+
+    config = config_from(args)
+
+    # Constructed before the journal, before the gate and long before a socket.
+    # A non-paper port or a symbol other than SPY is refused here, as a
+    # ConfigError, with nothing yet opened -- which is the earliest any of the
+    # proof's bounds can possibly be checked.
+    profile = ExecutionProofProfile(
+        port=config.port,
+        account=config.account_id,
+        symbol=args.symbol.strip().upper(),
+    )
+
+    journal = OrderJournal(config.journal_path)
+    journal.preflight()
+
+    gate = SafetyGate(config, journal)
+    gate.assert_not_halted()
+
+    policy = profile.derive_policy()
+    store = PositionStore(config.state_dir / "positions.jsonl")
+    session_id = new_proof_session_id()
+
+    out("EXECUTION PROOF")
+    out(f"  session        {session_id}")
+    out(f"  venue          {config.venue} ({config.host}:{config.port})")
+    out(f"  armed          {'YES -- one order may be sent' if args.arm else 'NO'}")
+    out(profile.describe())
+    out("")
+    out("EFFECTIVE POLICY (proof ceilings folded into the environment)")
+    out(policy.describe())
+    out("")
+
+    budget = OpeningOrderBudget(limit=profile.maximum_opening_orders)
+    preflight = ProofEntryPreflight(profile=profile, budget=budget, emit=out)
+    capture = RecordingLifecycleSink(inner=LifecycleRecorder(store))
+
+    _verifier, _context = _verifier_for(config, policy)
+    with broker_factory(config, journal) as broker:
+        report = run_once(
+            broker,
+            gate=gate,
+            journal=journal,
+            store=store,
+            policy=policy,
+            armed=bool(args.arm),
+            symbol=profile.symbol,
+            bias=Bias(args.bias),
+            market_data=IBKRLiveMarketDataAdapter(
+                broker.ib, requested_type=args.market_data_type
+            ),
+            portfolio=IBKRPortfolioStateAdapter(broker),
+            target_dte=args.dte,
+            minimum_iv_rank=Decimal(str(args.min_iv_rank)),
+            account=config.account_id,
+            configuration_version=PROOF_CONFIGURATION_VERSION,
+            enforce_iv_rank=False,
+            entry_pricing=EntryPricing(
+                str(getattr(args, "price_at", "midpoint")).upper()
+            ),
+            entry_preflight=preflight,
+            sink=capture,
+            verifier=_verifier,
+            approval_context=_context,
+        )
+
+        # Restart reconciliation, in the same connection but through a *fresh*
+        # store and a fresh recorder. This is the question a proof exists to
+        # answer and a normal run cannot: would a process that started just now,
+        # knowing only what is on disk, agree with the broker about what is
+        # held? Reusing the store above would prove only that an object agrees
+        # with itself.
+        replayed = PositionStore(config.state_dir / "positions.jsonl")
+        try:
+            restart = replayed.reconcile_against_broker(
+                broker.positions(),
+                checked_at=utc_now(),
+                broker_orders=_open_orders_or_none(broker),
+            )
+        except Exception as exc:  # noqa: BLE001 - reporting must not crash the proof
+            restart = None
+            report.errors.append(f"restart reconciliation failed: {exc}")
+
+    out("")
+    out(report.describe())
+    out("")
+
+    out("ORDER IDENTITY")
+    if report.candidate is not None:
+        out(f"  intent id      {report.candidate.strategy_id}")
+        out(f"  orderRef       {report.candidate.strategy_id}")
+        out(f"  configuration  {report.candidate.configuration_version}")
+    else:
+        out("  no candidate was built, so no order identity exists")
+    for result in report.transmissions:
+        out(f"  orderId        {result.order_id}")
+        out(f"  permId         {result.perm_id}")
+        out(f"  state          {result.state.value}")
+        out(f"  filled         {result.filled}")
+        out(f"  average price  {result.average_price}")
+        if result.snapshot is not None:
+            out(f"  remaining      {result.snapshot.remaining}")
+            out(f"  commission     {result.snapshot.commission}")
+            if result.snapshot.message:
+                out(f"  broker text    {result.snapshot.message}")
+    out(f"  profile hash   {profile.fingerprint()}")
+    out(f"  audit tag      {profile.audit_tag}")
+    out("")
+
+    out(f"BROKER LIFECYCLE  {len(capture.observations)} observation(s), as heard")
+    if not capture.observations:
+        out("  none -- nothing reached the order-placement step")
+    for line in capture.timeline():
+        out(line)
+    out("")
+
+    out("DURABLE STORE EVENTS")
+    events = list(store.events())
+    if not events:
+        out("  no position events were written")
+    for event in events[-24:]:
+        out(
+            f"  {str(event.get('at', ''))[:19]}  {str(event.get('event', '')):<22}"
+            f"  order={event.get('order_id')} perm={event.get('perm_id')}"
+        )
+    integrity = store.integrity_errors()
+    out(f"  integrity      {'clean' if not integrity else f'{len(integrity)} bad'}")
+    for problem in integrity:
+        out(f"    {problem}")
+    out("")
+
+    out("RESTART RECONCILIATION (a fresh store, replayed from disk)")
+    out(restart.describe() if restart is not None else "  could not be run")
+    out("")
+
+    out("SESSION BUDGET")
+    out(f"  opening orders {budget.spent} of {budget.limit} used")
+    if preflight.envelope is not None:
+        out(f"  price envelope {preflight.envelope.describe()}")
+        out(f"  credit at send {preflight.credit_at_send}")
+    if preflight.refusal:
+        out(f"  refused by     {preflight.refusal}")
+
+    journal.record(
+        "options_execution_proof",
+        audit_tag=profile.audit_tag,
+        session_id=str(session_id),
+        profile_fingerprint=profile.fingerprint(),
+        profile=profile.to_record(),
+        armed=bool(args.arm),
+        opening_orders_used=budget.spent,
+        price_envelope=(
+            preflight.envelope.to_record() if preflight.envelope is not None else None
+        ),
+        credit_at_send=(
+            str(preflight.credit_at_send)
+            if preflight.credit_at_send is not None
+            else None
+        ),
+        preflight_refusal=preflight.refusal,
+        observations=capture.to_record(),
+        restart_reconciliation=(restart.to_record() if restart is not None else None),
+        run=report.to_record(),
+    )
+
+    out("")
+    if not args.arm:
+        note(
+            "not armed: every bound and every gate above was evaluated and "
+            "nothing was sent. Pass --execution-proof --arm to send one order."
+        )
+    elif not report.transmissions:
+        note(
+            "armed, and nothing was sent -- a bound or a gate refused first. The "
+            "blockers and refusal codes above say which."
+        )
     return EXIT_OK
 
 
@@ -427,6 +1436,14 @@ COMMANDS = {
     "halt": cmd_halt,
     "resume": cmd_resume,
     "journal": cmd_journal,
+    "probe-options-data": cmd_probe_options_data,
+    "options-scan": cmd_options_scan,
+    "options-run": cmd_options_run,
+    "options-positions": cmd_options_positions,
+    "options-mark": cmd_options_mark,
+    "options-cancel": cmd_options_cancel,
+    "options-verify-execution": cmd_options_verify_execution,
+    "options-execution-proof": cmd_options_execution_proof,
 }
 
 

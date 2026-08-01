@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from engine.broker import IB_UNSET, MARKET_DATA_DELAYED, Broker, _as_float
+from engine.broker import (
+    IB_UNSET,
+    MARKET_DATA_DELAYED,
+    MARKET_DATA_LIVE,
+    Broker,
+    _as_float,
+)
 from engine.config import EngineConfig
 from engine.errors import ConnectionError_, EngineError
 from engine.journal import OrderJournal
@@ -91,6 +97,36 @@ class TestMarketData:
         broker.connect()
         broker.quote("SPY")
         assert broker.ib.cancelled, "market data subscriptions must not be left open"
+
+    def test_the_label_comes_from_the_provider_not_the_request(
+        self, config: EngineConfig, journal: OrderJournal
+    ) -> None:
+        # The two were one field, holding the requested constant -- so a quote
+        # could read "live" purely because live was asked for. If the provider
+        # says something other than what was requested, the provider wins.
+        ticker = FakeTicker(bid=1.0, ask=2.0, marketDataType=MARKET_DATA_LIVE)
+        ticker.confirms_data_type = False
+        broker = make(config, journal, ticker=ticker)
+        broker.connect()
+        quote = broker.quote("SPY")
+        assert quote.requested_market_data_type == MARKET_DATA_DELAYED
+        assert quote.reported_market_data_type == MARKET_DATA_LIVE
+        assert quote.source == "live"
+
+    def test_a_silent_provider_is_labelled_unconfirmed_not_assumed(
+        self, config: EngineConfig, journal: OrderJournal
+    ) -> None:
+        # A real ib_async Ticker defaults marketDataType to 1, so a server that
+        # never answered is indistinguishable from one that confirmed live.
+        # Where the fake can express silence, the label must admit to it.
+        ticker = FakeTicker(bid=1.0, ask=2.0)
+        ticker.confirms_data_type = False
+        broker = make(config, journal, ticker=ticker)
+        broker.connect()
+        quote = broker.quote("SPY")
+        assert quote.reported_market_data_type is None
+        assert quote.source == "delayed (requested, unconfirmed)"
+        assert "unconfirmed" in quote.describe()
 
 
 class TestPositions:

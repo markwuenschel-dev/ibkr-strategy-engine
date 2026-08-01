@@ -38,6 +38,13 @@ class FakeTicker:
     ask: float | None = None
     last: float | None = None
     close: float | None = None
+    # What the provider reported. None models a server that never sent its
+    # market-data-type message -- the case a real ib_async Ticker hides, because
+    # its own field defaults to 1 and so reads as "live" when nothing arrived.
+    # FakeIB.reqMktData stamps this with the requested type unless a test has
+    # deliberately pinned it, so a silent server stays testable.
+    marketDataType: int | None = None  # noqa: N815 - mirrors the ib_async name
+    confirms_data_type: bool = True
 
     def marketPrice(self) -> float:  # noqa: N802 - mirrors the ib_async name
         if self.bid is not None and self.ask is not None:
@@ -140,6 +147,12 @@ class FakeIB:
         self.market_data_types.append(data_type)
 
     def reqMktData(self, contract: Any, *args: object, **kwargs: object) -> FakeTicker:  # noqa: N802
+        # A cooperating server answers reqMarketDataType with the type it is
+        # actually serving. Setting confirms_data_type=False on the ticker
+        # models one that stays silent, which is the case a real Ticker cannot
+        # express because its marketDataType field defaults to 1.
+        if self._ticker.confirms_data_type and self.market_data_types:
+            self._ticker.marketDataType = self.market_data_types[-1]
         return self._ticker
 
     def cancelMktData(self, contract: Any) -> None:  # noqa: N802

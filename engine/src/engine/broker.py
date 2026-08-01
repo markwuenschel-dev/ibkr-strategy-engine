@@ -80,11 +80,34 @@ class Quote:
     ask: float | None = None
     last: float | None = None
     close: float | None = None
-    market_data_type: int = MARKET_DATA_DELAYED
+    requested_market_data_type: int = MARKET_DATA_DELAYED
+    reported_market_data_type: int | None = None
 
     @property
     def source(self) -> str:
-        return MARKET_DATA_LABELS.get(self.market_data_type, f"type-{self.market_data_type}")
+        """What the *provider* said this is, never what we asked for.
+
+        These were one field until it was noticed that it stored the requested
+        constant, which meant a quote could be labelled "live" purely because
+        live was requested -- the label being wrong in exactly the case where
+        it matters. When the server has not reported a type the label says so
+        rather than guessing.
+
+        This is a display-honesty fix, not an entitlement gate. A real
+        ``ib_async`` ``Ticker.marketDataType`` defaults to ``1``, so a silent
+        server is indistinguishable from a confirmed-live one at this layer.
+        Distinguishing them needs per-subscription bookkeeping, which is why
+        the options path uses :mod:`engine.options.marketdata` and not this
+        class.
+        """
+        if self.reported_market_data_type is None:
+            requested = MARKET_DATA_LABELS.get(
+                self.requested_market_data_type, f"type-{self.requested_market_data_type}"
+            )
+            return f"{requested} (requested, unconfirmed)"
+        return MARKET_DATA_LABELS.get(
+            self.reported_market_data_type, f"type-{self.reported_market_data_type}"
+        )
 
     def describe(self) -> str:
         price = f"{self.price:,.4f}" if self.price is not None else "unavailable"
@@ -313,6 +336,13 @@ class Broker:
         except Exception:  # pragma: no cover
             pass
 
+        # Read back what the provider said rather than echoing the request.
+        # getattr, because a ticker that has received nothing may not carry the
+        # attribute at all -- and absent is the honest answer in that case.
+        reported = getattr(ticker, "marketDataType", None)
+        if not isinstance(reported, int) or isinstance(reported, bool):
+            reported = None
+
         return Quote(
             symbol=symbol.strip().upper(),
             price=price,
@@ -320,7 +350,8 @@ class Broker:
             ask=ask,
             last=last,
             close=close,
-            market_data_type=data_type,
+            requested_market_data_type=data_type,
+            reported_market_data_type=reported,
         )
 
     # -- orders (M3, M4) -------------------------------------------------
