@@ -511,6 +511,7 @@ def run_pass(
     policy: RiskPolicy | None = None,
     verifier: Any = None,
     approval_context: Any = None,
+    **extra: Any,
 ) -> RunReport:
     """One pass, with a real reviewed verifier gate unless one is supplied.
 
@@ -542,6 +543,7 @@ def run_pass(
         account="DU1234567",
         verifier=verifier,
         approval_context=approval_context,
+        **extra,
     )
 
 
@@ -1469,3 +1471,109 @@ class TestEntryEvidenceIsComplete:
         is asked to approve under a false label."""
         packet, _report = self._captured_evidence(tmp_path)
         assert packet.evidence["iv_rank_filter"] == "ENFORCED at minimum 50"
+
+
+# ===========================================================================
+# The volatility-regime gate: shadow records, live gates
+# ===========================================================================
+
+
+class TestRegimeGate:
+    """Shadow must be behavior-preserving; live must gate and scale sizing.
+
+    The DEPRESSED cases use a policy whose boundaries sit above any possible
+    IV Rank (rank is capped at 100), so the fake's rich history lands in the
+    bottom tier without inventing a second market fixture.
+    """
+
+    UNREACHABLE = dict(
+        low_minimum_iv_rank=Decimal("101"),
+        medium_minimum_iv_rank=Decimal("102"),
+        high_minimum_iv_rank=Decimal("103"),
+    )
+
+    def test_every_pass_records_a_regime_decision(self, tmp_path: Path) -> None:
+        from engine.options.regime import VolatilityRegime
+
+        report = run_pass(
+            FakeBroker(), gate_for(tmp_path), store_for(tmp_path), armed=False
+        )
+        assert report.regime is not None
+        assert report.regime.regime is VolatilityRegime.HIGH, report.regime.describe()
+        assert report.to_record()["regime"]["reasons"]
+
+    def test_shadow_mode_never_gates_on_the_regime(self, tmp_path: Path) -> None:
+        """DEPRESSED in shadow: the decision says refuse, the pass does not."""
+        from engine.options.regime import VolatilityRegime, VolatilityRegimePolicy
+
+        report = run_pass(
+            FakeBroker(),
+            gate_for(tmp_path),
+            store_for(tmp_path),
+            armed=False,
+            regime_policy=VolatilityRegimePolicy(**self.UNREACHABLE),
+            regime_live=False,
+        )
+        assert report.regime is not None
+        assert report.regime.regime is VolatilityRegime.DEPRESSED
+        assert "OPTIONS_REGIME_DEPRESSED_REFUSED" not in report.refusal_codes
+        assert report.candidate is not None, report.describe()
+
+    def test_live_mode_refuses_depressed_with_the_named_code(
+        self, tmp_path: Path
+    ) -> None:
+        from engine.options.regime import VolatilityRegimePolicy
+
+        report = run_pass(
+            FakeBroker(),
+            gate_for(tmp_path),
+            store_for(tmp_path),
+            armed=False,
+            regime_policy=VolatilityRegimePolicy(**self.UNREACHABLE),
+            regime_live=True,
+        )
+        assert "OPTIONS_REGIME_DEPRESSED_REFUSED" in report.refusal_codes
+        assert report.candidate is None, "a refused tier must not build a candidate"
+
+    def test_live_mode_replaces_the_flat_iv_wall(self, tmp_path: Path) -> None:
+        """HIGH tier in live mode: entry proceeds even with the old filter set
+        impossibly high -- the wall is no longer consulted."""
+        report = run_pass(
+            FakeBroker(),
+            gate_for(tmp_path),
+            store_for(tmp_path),
+            armed=False,
+            regime_live=True,
+            minimum_iv_rank=Decimal("99"),
+        )
+        assert report.regime is not None and report.regime.permits_entry
+        assert not any("entry filter" in b for b in report.blockers), report.blockers
+
+    def test_live_allocation_scales_the_sizing_budget(self, tmp_path: Path) -> None:
+        """A vanishing allocation must reach size_position: the same market
+        that builds a candidate at full allocation sizes to nothing at 1e-4,
+        which proves the multiplier is wired into the build, not just recorded."""
+        from engine.options.regime import VolatilityRegimePolicy
+
+        full = run_pass(
+            FakeBroker(),
+            gate_for(tmp_path / "full"),
+            store_for(tmp_path / "full"),
+            armed=False,
+            regime_live=True,
+        )
+        assert full.candidate is not None, full.describe()
+
+        starved = run_pass(
+            FakeBroker(),
+            gate_for(tmp_path / "starved"),
+            store_for(tmp_path / "starved"),
+            armed=False,
+            regime_policy=VolatilityRegimePolicy(
+                high_allocation=Decimal("0.0001"),
+                medium_allocation=Decimal("0.0001"),
+                low_allocation=Decimal("0.0001"),
+            ),
+            regime_live=True,
+        )
+        assert starved.candidate is None, starved.describe()

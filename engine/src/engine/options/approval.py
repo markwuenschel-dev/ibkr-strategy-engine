@@ -570,6 +570,12 @@ class VerificationPacket:
         "greek_timestamps",
         "iv_rank",
         "iv_rank_filter",
+        # The regime protocol (spec §1): every packet states the tier, the
+        # sizing multiplier and the exact reasons. Absent renders MISSING,
+        # which the reviewer treats as grounds for UNAVAILABLE.
+        "volatility_regime",
+        "allocation_multiplier",
+        "regime_reasons",
         "defined_max_loss",
         "stress_loss",
         "broker_what_if_margin",

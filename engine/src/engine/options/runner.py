@@ -37,6 +37,7 @@ token this module obtains from the real gates or not at all.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 from enum import Enum
 from dataclasses import dataclass, field
@@ -96,6 +97,14 @@ from .approval import (
     VerificationState,
     VerifierGate,
     packet_for,
+)
+from .regime import (
+    REGIME_MODE_LIVE,
+    RegimeDecision,
+    VolatilityAssessment,
+    VolatilityRegimePolicy,
+    classify,
+    regime_mode,
 )
 from .execution import COMBO_ORDER_TYPE, COMBO_TIME_IN_FORCE
 from .transmit import (
@@ -159,6 +168,10 @@ class RunReport:
     #: "the pass died before reconciling" refuse instead of authorise.
     reconciliation_outcome: ReconciliationOutcome = ReconciliationOutcome.UNAVAILABLE
     iv_rank: IVRankMetric | None = None
+    #: The volatility-regime classification for this pass, always computed
+    #: (cheap and pure once the IV metric exists). Whether it *gates* is the
+    #: runner's ``regime_live`` decision; in shadow it is a recorded opinion.
+    regime: RegimeDecision | None = None
     decisions: list[ManagementDecision] = field(default_factory=list)
     transmissions: list[TransmitResult] = field(default_factory=list)
     candidate: OptionStrategyIntent | None = None
@@ -196,6 +209,9 @@ class RunReport:
             lines.append(
                 f"  {decision.action.value:<20} [{decision.reason_code}] {decision.detail}"
             )
+        if self.regime is not None:
+            lines.append("")
+            lines.append(f"VOLATILITY REGIME  {self.regime.describe()}")
         lines.append("")
         lines.append("ENTRY")
         if self.candidate is not None:
@@ -236,6 +252,7 @@ class RunReport:
             "reconciliation": self.reconciliation.to_record() if self.reconciliation else None,
             "reconciliation_outcome": self.reconciliation_outcome.value,
             "iv_rank": self.iv_rank.to_record() if self.iv_rank else None,
+            "regime": self.regime.to_record() if self.regime else None,
             "decisions": [d.to_record() for d in self.decisions],
             "transmissions": [t.to_record() for t in self.transmissions],
             "candidate": self.candidate.describe() if self.candidate else None,
@@ -699,6 +716,33 @@ def _underlying_reference_price(broker: Any, symbol: str) -> Decimal | None:
     return value if value.is_finite() and value > ZERO else None
 
 
+def _qualify_underlying(ib: Any, symbol: str, report: RunReport) -> Any | None:
+    """Qualify the stock, or record the blocker and return ``None``."""
+    from ib_async import Stock  # noqa: PLC0415 - optional dependency
+
+    qualified = ib.qualifyContracts(Stock(symbol, "SMART", "USD"))
+    if not qualified:
+        report.blockers.append(f"IBKR did not qualify the underlying {symbol}")
+        return None
+    return qualified[0]
+
+
+def _iv_metric_for(
+    ib: Any, underlying: Any, symbol: str, *, now: dt.datetime
+) -> IVRankMetric:
+    """One year of daily implied volatility, reduced to the rank metric."""
+    bars = ib.reqHistoricalData(
+        underlying,
+        endDateTime="",
+        durationStr="1 Y",
+        barSizeSetting="1 day",
+        whatToShow="OPTION_IMPLIED_VOLATILITY",
+        useRTH=True,
+        formatDate=1,
+    )
+    return build_iv_rank(symbol, observations_from_bars(bars or []), calculated_at=now)
+
+
 def _build_candidate(
     *,
     ib: Any,
@@ -716,28 +760,25 @@ def _build_candidate(
     configuration_version: str,
     entry_pricing: EntryPricing = EntryPricing.MIDPOINT,
     report: RunReport,
+    underlying: Any | None = None,
+    iv_metric: IVRankMetric | None = None,
 ) -> tuple[OptionStrategyIntent | None, StrategyQuoteSnapshot | None]:
-    """Chain -> quotes -> delta selection -> a validated opening intent."""
-    from ib_async import Stock  # noqa: PLC0415 - optional dependency
+    """Chain -> quotes -> delta selection -> a validated opening intent.
 
-    qualified_underlying = ib.qualifyContracts(Stock(symbol, "SMART", "USD"))
-    if not qualified_underlying:
-        report.blockers.append(f"IBKR did not qualify the underlying {symbol}")
-        return None, None
-    underlying = qualified_underlying[0]
+    ``underlying`` and ``iv_metric`` are accepted pre-computed because the
+    regime gate needs the IV metric *before* the build (the allocation
+    multiplier scales the sizing budget the build uses). When absent, both are
+    derived here exactly as before, so a caller that has not adopted the
+    regime path gets the previous behaviour byte for byte.
+    """
+    if underlying is None:
+        underlying = _qualify_underlying(ib, symbol, report)
+        if underlying is None:
+            return None, None
 
-    bars = ib.reqHistoricalData(
-        underlying,
-        endDateTime="",
-        durationStr="1 Y",
-        barSizeSetting="1 day",
-        whatToShow="OPTION_IMPLIED_VOLATILITY",
-        useRTH=True,
-        formatDate=1,
-    )
-    report.iv_rank = build_iv_rank(
-        symbol, observations_from_bars(bars or []), calculated_at=now
-    )
+    if iv_metric is None:
+        iv_metric = _iv_metric_for(ib, underlying, symbol, now=now)
+    report.iv_rank = iv_metric
 
     expiry = select_expiration(
         discover_expirations(ib, symbol, underlying.conId),
@@ -947,6 +988,17 @@ def _entry_evidence(
         "sector_impact": observed(report.governor, "sector_concentration"),
         "correlation_impact": observed(report.governor, "correlation_concentration"),
         "portfolio_exposure_after": observed(report.governor, "total_bpr"),
+        "volatility_regime": (
+            report.regime.regime.value if report.regime is not None else None
+        ),
+        "allocation_multiplier": (
+            str(report.regime.allocation) if report.regime is not None else None
+        ),
+        "regime_reasons": (
+            " | ".join(report.regime.reasons)
+            if report.regime is not None and report.regime.reasons
+            else None
+        ),
     }
     if snapshot is not None:
         under = getattr(snapshot, "underlying", None)
@@ -1003,6 +1055,12 @@ def run_once(
     minimum_dte: int = 35,
     maximum_dte: int = 55,
     minimum_iv_rank: Decimal = Decimal("50"),
+    regime_policy: VolatilityRegimePolicy | None = None,
+    #: ``None`` reads IBKR_OPTIONS_REGIME_MODE (default shadow). Shadow keeps
+    #: the ``minimum_iv_rank`` wall authoritative and records the regime
+    #: decision beside it; live replaces the wall with the tiered gate and
+    #: scales the sizing budget by the tier's allocation.
+    regime_live: bool | None = None,
     strike_window: int = 24,
     entry_pricing: EntryPricing = EntryPricing.MIDPOINT,
     account: str = "",
@@ -1109,12 +1167,53 @@ def run_once(
             report.refusal_codes.append(f"RUNNER_RECONCILIATION_{outcome.value}")
             return report
 
+        # -- 3. regime first, because its allocation scales the build --------
+        # The IV metric is hoisted ahead of the candidate build so the tier
+        # can be placed before sizing. Always classified, even in shadow: the
+        # decision is recorded in the report, the journal and the packet
+        # evidence either way, which is what makes the later live flip a
+        # reviewed config change instead of a code change.
+        live_regime = (
+            regime_mode() == REGIME_MODE_LIVE if regime_live is None else regime_live
+        )
+        resolved_regime = regime_policy or VolatilityRegimePolicy.from_env()
+
+        underlying_contract = _qualify_underlying(ib, symbol, report)
+        if underlying_contract is None:
+            return report
+        iv_metric = _iv_metric_for(ib, underlying_contract, symbol, now=now)
+        report.iv_rank = iv_metric
+        report.regime = classify(
+            VolatilityAssessment(
+                symbol=symbol,
+                iv_rank=iv_metric.iv_rank if iv_metric.is_usable else None,
+                iv_percentile=iv_metric.iv_percentile,
+                current_iv=iv_metric.current_iv,
+            ),
+            resolved_regime,
+        )
+
+        effective_policy = policy
+        if live_regime:
+            if not report.regime.permits_entry:
+                report.blockers.append(
+                    f"volatility regime: {report.regime.reasons[0]}"
+                )
+                report.refusal_codes.append(report.regime.refusal_code)
+                return report
+            effective_policy = dataclasses.replace(
+                policy,
+                risk_budget_per_position=(
+                    policy.risk_budget_per_position * report.regime.allocation
+                ),
+            )
+
         candidate, snapshot = _build_candidate(
             ib=ib,
             broker=broker,
             symbol=symbol,
             bias=bias,
-            policy=policy,
+            policy=effective_policy,
             market_data=market_data,
             now=now,
             today=today,
@@ -1125,6 +1224,8 @@ def run_once(
             configuration_version=configuration_version,
             entry_pricing=entry_pricing,
             report=report,
+            underlying=underlying_contract,
+            iv_metric=iv_metric,
         )
         report.candidate = candidate
         if candidate is None:
@@ -1133,8 +1234,11 @@ def run_once(
         # The one filter a bounded caller may switch off, and only because it is
         # an opinion about timing rather than a statement about survivability.
         # The refusal code is still recorded when it is off, so a proof run's
-        # journal says plainly that the filter would have refused.
-        if report.iv_rank is None or not report.iv_rank.meets(minimum_iv_rank):
+        # journal says plainly that the filter would have refused. Authoritative
+        # only while the regime gate is in shadow; live mode replaced it above.
+        if not live_regime and (
+            report.iv_rank is None or not report.iv_rank.meets(minimum_iv_rank)
+        ):
             actual = (
                 report.iv_rank.iv_rank
                 if report.iv_rank and report.iv_rank.iv_rank is not None
