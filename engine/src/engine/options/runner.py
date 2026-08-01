@@ -334,10 +334,22 @@ def _quotes_for(
     con_ids: list[int],
     report: RunReport,
     label: str,
+    require_two_sided: bool = False,
 ) -> StrategyQuoteSnapshot | None:
+    """One snapshot, or ``None`` with the failure recorded.
+
+    ``require_two_sided`` is passed through only when set, so ports that
+    predate the parameter (every test fake, and any adapter not yet updated)
+    keep working on the default path -- and a port that cannot honour the
+    request fails loudly here rather than silently ignoring it.
+    """
     if market_data is None or not con_ids:
         return None
     try:
+        if require_two_sided:
+            return market_data.strategy_quotes(
+                underlying_symbol=symbol, con_ids=con_ids, require_two_sided=True
+            )
         return market_data.strategy_quotes(underlying_symbol=symbol, con_ids=con_ids)
     except Exception as exc:  # noqa: BLE001 - adapter boundary; see scan.py
         report.errors.append(f"{label}: quotes unavailable: {type(exc).__name__}: {exc}")
@@ -362,12 +374,18 @@ def _manage_one(
     report: RunReport,
 ) -> None:
     """Decide and, if the decision acts, send the exit."""
+    # Two-sided demanded for the held position's own legs: a one-sided
+    # snapshot here is why in-pass marking failed 7 of 10 passes on
+    # 2026-07-31, and at <=21 DTE it turns the calendar exit into a per-pass
+    # coin flip. The set is small (the structure's legs, not a chain window),
+    # so the wait is bounded by contracts that are actually held.
     snapshot = _quotes_for(
         market_data,
         symbol=position.underlying,
         con_ids=[leg.con_id for leg in position.legs],
         report=report,
         label=f"manage {position.strategy_id}",
+        require_two_sided=True,
     )
     mark = mark_from_snapshot(position, snapshot)
     decision = decide_management_action(

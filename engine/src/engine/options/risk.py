@@ -17,7 +17,7 @@ whichever fired first. The safety property is moved rather than dropped --
 :data:`REQUIRED_CHECKS` is present, so approval-by-omission is not expressible.
 A missing check is a construction error, not a silent pass.
 
-The four checks:
+The candidate checks:
 
 ``market_data_entitlement``
     Delegates to :func:`engine.options.marketdata.require_uniform_live_provenance`
@@ -89,6 +89,9 @@ REQUIRED_CHECKS: tuple[str, ...] = (
     CHECK_DEFINED_LOSS,
     CHECK_BROKER_MARGIN,
     CHECK_STRESS_LOSS,
+    # The liquidity gate (engine.options.liquidity). Named here so an
+    # assessment that skipped it cannot be built -- the intended pressure.
+    "liquidity",
 )
 
 ZERO = Decimal("0")
@@ -728,6 +731,8 @@ def assess_candidate(
     both, so a delayed price can be used to produce an informative stress number
     while still being unable to make the candidate tradeable.
     """
+    from .liquidity import check_liquidity  # noqa: PLC0415 - avoids a module cycle
+
     results = (
         check_market_data_entitlement(
             quotes, decision_time=evaluated_at, policy=policy, intent=intent
@@ -740,6 +745,7 @@ def assess_candidate(
             underlying_price=underlying_price,
             net_liquidation=net_liquidation,
         ),
+        check_liquidity(intent, quotes=quotes, policy=policy),
     )
     return CandidateRiskAssessment(
         strategy_id=intent.strategy_id,

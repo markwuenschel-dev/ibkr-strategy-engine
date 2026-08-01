@@ -66,6 +66,21 @@ DEFAULT_MAX_STRESS_LOSS_PER_POSITION = Decimal("500")
 DEFAULT_MAX_STRESS_LOSS_FRACTION = Decimal("0.02")
 DEFAULT_QUOTE_MAXIMUM_AGE_SECONDS = Decimal("10")
 
+# -- liquidity defaults -------------------------------------------------------
+#
+# Liquidity is a hard gate at every volatility tier; IV Rank is a ranking and
+# sizing variable (engine.options.regime). Starting-point numbers for liquid
+# ETF/large-cap chains, deliberately conservative -- and unmeasured counts as
+# insufficient: a market whose depth cannot be established is one the *exit*
+# cannot be priced in either.
+
+DEFAULT_MAX_LEG_SPREAD_FRACTION = Decimal("0.10")
+DEFAULT_MAX_LEG_SPREAD_DOLLARS = Decimal("0.50")
+DEFAULT_MAX_CROSSING_COST_FRACTION = Decimal("0.25")
+DEFAULT_MINIMUM_OPEN_INTEREST = 500
+DEFAULT_MINIMUM_VOLUME = 100
+DEFAULT_MINIMUM_QUOTED_STRIKES = 10
+
 # -- strike-selection and sizing defaults ------------------------------------
 #
 # "16-delta neutral / 30-delta directional strikes" is the recorded strategy, so
@@ -228,6 +243,14 @@ class RiskPolicy:
     max_stress_loss_fraction: Decimal = DEFAULT_MAX_STRESS_LOSS_FRACTION
     quote_maximum_age: timedelta = timedelta(seconds=10)
 
+    # -- liquidity (hard gate; see engine.options.liquidity) ---------------
+    max_leg_spread_fraction: Decimal = DEFAULT_MAX_LEG_SPREAD_FRACTION
+    max_leg_spread_dollars: Decimal = DEFAULT_MAX_LEG_SPREAD_DOLLARS
+    max_crossing_cost_fraction: Decimal = DEFAULT_MAX_CROSSING_COST_FRACTION
+    minimum_open_interest: int = DEFAULT_MINIMUM_OPEN_INTEREST
+    minimum_volume: int = DEFAULT_MINIMUM_VOLUME
+    minimum_quoted_strikes: int = DEFAULT_MINIMUM_QUOTED_STRIKES
+
     # -- portfolio-level -------------------------------------------------
     max_total_bpr_fraction: Decimal = DEFAULT_MAX_TOTAL_BPR_FRACTION
     max_incremental_bpr_fraction: Decimal = DEFAULT_MAX_INCREMENTAL_BPR_FRACTION
@@ -283,8 +306,25 @@ class RiskPolicy:
             "max_underlying_bpr_fraction",
             "max_sector_bpr_fraction",
             "max_correlation_group_bpr_fraction",
+            "max_leg_spread_fraction",
+            "max_crossing_cost_fraction",
         ):
             _check_fraction(getattr(self, label), label)
+
+        _check_amount(self.max_leg_spread_dollars, "max_leg_spread_dollars")
+        for label in (
+            "minimum_open_interest",
+            "minimum_volume",
+            "minimum_quoted_strikes",
+        ):
+            value = getattr(self, label)
+            if not isinstance(value, int) or isinstance(value, bool):
+                _refuse(f"{label} must be an int, got {type(value).__name__}")
+            if value <= 0:
+                _refuse(
+                    f"{label} must be greater than zero, got {value}",
+                    hint="a floor of zero disables the check it exists to perform",
+                )
 
         # The stress move is a magnitude, and a move of 100% or more would take
         # the underlying to zero or double it -- past the point where a terminal
@@ -454,6 +494,34 @@ class RiskPolicy:
                 f"{ENV_PREFIX}QUOTE_MAXIMUM_AGE_SECONDS",
                 DEFAULT_QUOTE_MAXIMUM_AGE_SECONDS,
             ),
+            "max_leg_spread_fraction": _decimal(
+                source,
+                f"{ENV_PREFIX}MAX_LEG_SPREAD_FRACTION",
+                DEFAULT_MAX_LEG_SPREAD_FRACTION,
+            ),
+            "max_leg_spread_dollars": _decimal(
+                source,
+                f"{ENV_PREFIX}MAX_LEG_SPREAD_DOLLARS",
+                DEFAULT_MAX_LEG_SPREAD_DOLLARS,
+            ),
+            "max_crossing_cost_fraction": _decimal(
+                source,
+                f"{ENV_PREFIX}MAX_CROSSING_COST_FRACTION",
+                DEFAULT_MAX_CROSSING_COST_FRACTION,
+            ),
+            "minimum_open_interest": _int(
+                source,
+                f"{ENV_PREFIX}MINIMUM_OPEN_INTEREST",
+                DEFAULT_MINIMUM_OPEN_INTEREST,
+            ),
+            "minimum_volume": _int(
+                source, f"{ENV_PREFIX}MINIMUM_VOLUME", DEFAULT_MINIMUM_VOLUME
+            ),
+            "minimum_quoted_strikes": _int(
+                source,
+                f"{ENV_PREFIX}MINIMUM_QUOTED_STRIKES",
+                DEFAULT_MINIMUM_QUOTED_STRIKES,
+            ),
             "max_total_bpr_fraction": _decimal(
                 source, f"{ENV_PREFIX}MAX_TOTAL_BPR_FRACTION", DEFAULT_MAX_TOTAL_BPR_FRACTION
             ),
@@ -594,6 +662,12 @@ class RiskPolicy:
             "profit_target_fraction": str(self.profit_target_fraction),
             "management_dte": str(self.management_dte),
             "roll_at_management_dte": str(self.roll_at_management_dte),
+            "max_leg_spread_fraction": str(self.max_leg_spread_fraction),
+            "max_leg_spread_dollars": str(self.max_leg_spread_dollars),
+            "max_crossing_cost_fraction": str(self.max_crossing_cost_fraction),
+            "minimum_open_interest": str(self.minimum_open_interest),
+            "minimum_volume": str(self.minimum_volume),
+            "minimum_quoted_strikes": str(self.minimum_quoted_strikes),
             "quote_maximum_age_seconds": str(self.quote_maximum_age.total_seconds()),
             "portfolio_snapshot_maximum_age_seconds": str(
                 self.portfolio_snapshot_maximum_age.total_seconds()

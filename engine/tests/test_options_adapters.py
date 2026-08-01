@@ -204,18 +204,135 @@ class TestTheWaitIsOnDataNotOnAClock:
         assert ib.subscribe_order[0] == UNDERLYING_CON_ID
         assert set(ib.subscribe_order[1:]) == set(LEG_CON_IDS)
 
-    def test_it_requests_the_default_tick_list(self) -> None:
-        """Generic tick 106 is implied volatility, not model greeks.
+    def test_the_tick_lists_are_split_by_role(self) -> None:
+        """Underlying default; option legs volume + open interest, never 106.
 
-        The adapter used to pass "106" under a comment claiming IBKR sends no
-        model computation without it. ``modelGreeks`` comes from
-        tickOptionComputation on a bare request -- which is what the probe asks
-        for, and the probe is the path that reliably gets greeks.
+        Two histories meet here. Tick 106 (implied vol) was once requested
+        under a false claim that greeks need it -- they come from bare
+        tickOptionComputation -- so no request may carry it. And ticks 100/101
+        were never requested at all, which is why open interest was None on
+        every live run before 2026-08-01: IBKR does not send OI on the default
+        set. The underlying keeps the default list because OI is an option
+        concept.
         """
         ib = FakeIB(greek_after={101: 1, 102: 1, 103: 1})
         _snapshot(ib, settle_seconds=10.0, poll_seconds=1.0)
 
-        assert set(ib.generic_tick_lists) == {""}
+        assert ib.generic_tick_lists[0] == ""
+        assert set(ib.generic_tick_lists[1:]) == {"100,101"}
+        assert not any("106" in ticks for ticks in ib.generic_tick_lists)
+
+
+class _RightContract(_Contract):
+    def __init__(self, con_id: int, right: str) -> None:
+        super().__init__(con_id)
+        self.right = right
+
+
+class MarketFakeIB(FakeIB):
+    """FakeIB that also delivers bid/ask and open interest on a schedule.
+
+    ``bid_ask_after`` maps con_id -> the poll iteration on which both sides of
+    the book appear; absent means never. ``open_interest`` maps con_id ->
+    (callOpenInterest, putOpenInterest) applied when the book arrives, and
+    ``rights`` stamps the contract so the adapter can read the right side.
+    """
+
+    def __init__(
+        self,
+        *,
+        greek_after: dict[int, int],
+        bid_ask_after: dict[int, int] | None = None,
+        open_interest: dict[int, tuple[float | None, float | None]] | None = None,
+        rights: dict[int, str] | None = None,
+        data_type: int = 1,
+    ) -> None:
+        super().__init__(greek_after=greek_after, data_type=data_type)
+        self.bid_ask_after = bid_ask_after or {}
+        self.open_interest = open_interest or {}
+        self.rights = rights or {}
+
+    def qualifyContracts(self, *contracts: Any) -> list[Any]:
+        out = []
+        for contract in contracts:
+            con_id = int(getattr(contract, "conId", 0) or UNDERLYING_CON_ID)
+            right = self.rights.get(con_id)
+            out.append(
+                _RightContract(con_id, right) if right else _Contract(con_id)
+            )
+        return out
+
+    def sleep(self, seconds: float) -> None:
+        super().sleep(seconds)
+        for ticker in self.wrapper.reqId2Ticker.values():
+            con_id = int(ticker.contract.conId)
+            due = self.bid_ask_after.get(con_id)
+            if due is not None and self._ticks >= due:
+                ticker.bid = 1.00
+                ticker.ask = 1.05
+                call_oi, put_oi = self.open_interest.get(con_id, (None, None))
+                if call_oi is not None:
+                    ticker.callOpenInterest = call_oi
+                if put_oi is not None:
+                    ticker.putOpenInterest = put_oi
+
+
+class TestTwoSidedWait:
+    def test_without_the_flag_greeks_alone_end_the_wait(self) -> None:
+        """The default contract, byte for byte: greeks land on poll 1, the
+        book on poll 30 -- and the loop must NOT wait for the book."""
+        ib = MarketFakeIB(
+            greek_after={101: 1, 102: 1, 103: 1},
+            bid_ask_after={101: 30, 102: 30, 103: 30},
+        )
+        snapshot = _snapshot(ib, settle_seconds=60.0, poll_seconds=1.0)
+        assert ib.now - 1000.0 < 10.0
+        assert all(leg.bid is None for leg in snapshot.legs)
+
+    def test_the_flag_holds_the_window_open_for_the_book(self) -> None:
+        """require_two_sided waits past the greeks until every leg has both
+        sides -- the fix for in-pass marking failing 7 of 10 passes on
+        2026-07-31 (one-sided snapshots on held-position legs)."""
+        ib = MarketFakeIB(
+            greek_after={101: 1, 102: 1, 103: 1},
+            bid_ask_after={101: 2, 102: 4, 103: 8},
+        )
+        snapshot = _adapter(ib, settle_seconds=60.0, poll_seconds=1.0).strategy_quotes(
+            underlying_symbol="SPY", con_ids=LEG_CON_IDS, require_two_sided=True
+        )
+        assert all(
+            leg.bid is not None and leg.ask is not None for leg in snapshot.legs
+        )
+
+    def test_the_flag_changes_patience_never_truthfulness(self) -> None:
+        """A book that never appears still returns at the deadline, one-sided
+        -- the snapshot reports the market that existed, and the liquidity
+        gate is what refuses it."""
+        ib = MarketFakeIB(greek_after={101: 1, 102: 1, 103: 1})
+        snapshot = _adapter(ib, settle_seconds=10.0, poll_seconds=1.0).strategy_quotes(
+            underlying_symbol="SPY", con_ids=LEG_CON_IDS, require_two_sided=True
+        )
+        assert ib.now - 1000.0 <= 11.0
+        assert all(leg.bid is None for leg in snapshot.legs)
+
+
+class TestOpenInterestByRight:
+    def test_calls_read_call_open_interest_and_puts_read_put(self) -> None:
+        ib = MarketFakeIB(
+            greek_after={101: 1, 102: 1, 103: 1},
+            bid_ask_after={101: 1, 102: 1, 103: 1},
+            rights={101: "C", 102: "P", 103: "P"},
+            open_interest={
+                101: (750.0, 1.0),
+                102: (1.0, 850.0),
+                103: (None, 950.0),
+            },
+        )
+        snapshot = _snapshot(ib, settle_seconds=10.0, poll_seconds=1.0)
+        by_id = {leg.con_id: leg for leg in snapshot.legs}
+        assert by_id[101].open_interest == 750
+        assert by_id[102].open_interest == 850
+        assert by_id[103].open_interest == 950
 
     def test_greeks_on_the_ticker_are_used_when_the_recorder_missed_them(self) -> None:
         """The reqId mapping is a second thing that can fail independently.

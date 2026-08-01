@@ -141,6 +141,26 @@ def _int_or_none(value: Any) -> int | None:
     return int(value)
 
 
+def _open_interest_for(ticker: Any) -> int | None:
+    """The right side's open interest, chosen by the ticker's own contract.
+
+    ib_async exposes ``callOpenInterest`` and ``putOpenInterest`` as separate
+    fields (tick 101 fills exactly one of them per contract). Reading
+    ``putOpenInterest`` unconditionally -- the pre-2026-08-01 behaviour --
+    reports None for every call. Falling back to the other field when the
+    right cannot be read keeps a mislabeled ticker from erasing a real figure;
+    both absent is honestly None.
+    """
+    right = str(getattr(getattr(ticker, "contract", None), "right", "")).upper()
+    call_oi = _int_or_none(getattr(ticker, "callOpenInterest", None))
+    put_oi = _int_or_none(getattr(ticker, "putOpenInterest", None))
+    if right.startswith("C"):
+        return call_oi if call_oi is not None else put_oi
+    if right.startswith("P"):
+        return put_oi if put_oi is not None else call_oi
+    return put_oi if put_oi is not None else call_oi
+
+
 def _aware(value: Any) -> dt.datetime | None:
     """A timezone-aware provider timestamp, or ``None``.
 
@@ -287,6 +307,7 @@ class IBKRLiveMarketDataAdapter:
         *,
         underlying_symbol: str,
         con_ids: Sequence[int],
+        require_two_sided: bool = False,
     ) -> StrategyQuoteSnapshot:
         from ib_async import Contract, Stock  # noqa: PLC0415 - optional dependency
 
@@ -334,7 +355,14 @@ class IBKRLiveMarketDataAdapter:
             self.ib.sleep(min(self.underlying_lead_seconds, self.settle_seconds))
             option_ids = [c for c in contracts if c != underlying_con_id]
             for con_id in option_ids:
-                tickers[con_id] = self.ib.reqMktData(contracts[con_id], "", False, False)
+                # Generic ticks 100 (option volume) and 101 (open interest):
+                # neither arrives on the default tick set, so an empty list here
+                # is why open interest was None on every live run before
+                # 2026-08-01. The underlying keeps the default set -- OI is an
+                # option concept.
+                tickers[con_id] = self.ib.reqMktData(
+                    contracts[con_id], "100,101", False, False
+                )
 
             # Wait for the greeks themselves rather than for a fixed number of
             # seconds. A flat sleep is a bet that every model computation lands
@@ -343,11 +371,28 @@ class IBKRLiveMarketDataAdapter:
             # each run, and strike selection becomes a race. Polling the
             # recorder (rather than ``waitOnUpdate``, which drops ticks) lets a
             # good run finish early and a slow one keep waiting.
+            #
+            # ``require_two_sided`` additionally holds out for a bid AND an ask
+            # on every leg. Callers quoting a *selected structure* (marking a
+            # held position, pricing an exit) pass True, because a one-sided
+            # snapshot is precisely the coin-flip that made in-pass marking
+            # fail 7 of 10 passes on 2026-07-31. Callers sweeping a chain
+            # window must NOT: deep wings without bids would pin the wait at
+            # its ceiling on every pass.
             deadline = self.clock() + self.settle_seconds
             while self.clock() < deadline:
                 self.ib.sleep(self.poll_seconds)
-                if all(recorder.latest_greeks.get(c) is not None for c in option_ids):
-                    break
+                if not all(
+                    recorder.latest_greeks.get(c) is not None for c in option_ids
+                ):
+                    continue
+                if require_two_sided and not all(
+                    _price(getattr(tickers.get(c), "bid", None)) is not None
+                    and _price(getattr(tickers.get(c), "ask", None)) is not None
+                    for c in option_ids
+                ):
+                    continue
+                break
 
             observed_at = _utcnow()
             for con_id, subscription in subscriptions.items():
@@ -404,7 +449,7 @@ class IBKRLiveMarketDataAdapter:
                     ask=_price(getattr(ticker, "ask", None)),
                     last=_price(getattr(ticker, "last", None)),
                     close=_price(getattr(ticker, "close", None)),
-                    open_interest=_int_or_none(getattr(ticker, "putOpenInterest", None)),
+                    open_interest=_open_interest_for(ticker),
                     volume=_int_or_none(getattr(ticker, "volume", None)),
                     greeks=subscription.current_greeks(),
                 )

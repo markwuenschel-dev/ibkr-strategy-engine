@@ -67,10 +67,7 @@ from engine.options.reprice import (
     work_order,
 )
 from engine.options.risk import (
-    CHECK_BROKER_MARGIN,
-    CHECK_DEFINED_LOSS,
-    CHECK_MARKET_DATA_ENTITLEMENT,
-    CHECK_STRESS_LOSS,
+    REQUIRED_CHECKS,
     CandidateRiskAssessment,
     CheckResult,
 )
@@ -164,14 +161,11 @@ def approving_risk(strategy_id: UUID) -> CandidateRiskAssessment:
         strategy_id=strategy_id,
         evaluated_at=NOW,
         policy_version="test",
+        # Built from REQUIRED_CHECKS so a check added to the risk module is
+        # automatically part of what this helper claims was approved.
         results=tuple(
             CheckResult(check=name, approved=True, detail="ok")
-            for name in (
-                CHECK_MARKET_DATA_ENTITLEMENT,
-                CHECK_DEFINED_LOSS,
-                CHECK_BROKER_MARGIN,
-                CHECK_STRESS_LOSS,
-            )
+            for name in REQUIRED_CHECKS
         ),
     )
 

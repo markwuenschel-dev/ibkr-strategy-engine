@@ -138,12 +138,17 @@ def option_quote(
     delta: Decimal | None = None,
     reported: MarketDataType = MarketDataType.LIVE,
     at: dt.datetime = NOW,
+    open_interest: int | None = 1000,
+    volume: int | None = 500,
 ) -> OptionQuote:
     """One leg quote whose greeks carry the quote's own generation.
 
     A mismatched generation would be refused by
     ``require_uniform_live_provenance`` and would sink every candidate for a
-    reason no test in this file is about.
+    reason no test in this file is about. Open interest and volume default
+    comfortably above the liquidity policy floors for the same reason: a
+    liquid baseline market, so the liquidity gate (which reads unmeasured as
+    insufficient) is not what refuses candidates in tests about recovery.
     """
     generation = uuid4()
     return OptionQuote(
@@ -151,6 +156,8 @@ def option_quote(
         provenance=provenance(generation, reported=reported, at=at),
         bid=mid - HALF_SPREAD,
         ask=mid + HALF_SPREAD,
+        open_interest=open_interest,
+        volume=volume,
         greeks=OptionGreeks(
             received_at=at, subscription_generation=generation, delta=delta
         ),
@@ -688,8 +695,14 @@ class FakeMarketDataPort:
         self.calls: list[tuple[str, tuple[int, ...]]] = []
 
     def strategy_quotes(
-        self, *, underlying_symbol: str, con_ids: Any
+        self,
+        *,
+        underlying_symbol: str,
+        con_ids: Any,
+        require_two_sided: bool = False,
     ) -> StrategyQuoteSnapshot:
+        # ``require_two_sided`` is accepted to match the runner's call and
+        # deliberately ignored: every quote this fake serves is two-sided.
         con_ids = tuple(int(c) for c in con_ids)
         self.calls.append((underlying_symbol, con_ids))
         legs = tuple(
