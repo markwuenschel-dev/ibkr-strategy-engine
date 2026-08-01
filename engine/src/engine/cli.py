@@ -141,6 +141,35 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--min-iv-rank", type=float, default=50.0)
     scan.add_argument("--width-steps", type=int, default=5, help="strikes between the wings")
 
+    universe = subs.add_parser(
+        "options-universe-scan",
+        help=(
+            "two-phase read-only universe scan: serve cached observations, "
+            "refresh the stale under the pacing budget, rank, and nominate "
+            "structures. Transmits nothing, files nothing, reserves nothing."
+        ),
+    )
+    universe.add_argument(
+        "--refresh-limit",
+        type=int,
+        default=None,
+        help="stale symbols one pass may refresh (default from config, max 200)",
+    )
+    universe.add_argument(
+        "--phase2-limit",
+        type=int,
+        default=None,
+        help="top-ranked symbols that get chain+quotes this pass (default from config)",
+    )
+    universe.add_argument(
+        "--extra-symbols",
+        default="",
+        help=(
+            "comma-separated additions for today. Unclassified symbols are "
+            "scannable only: the governor and allowlist fail closed on them."
+        ),
+    )
+
     run = subs.add_parser(
         "options-run",
         help=(
@@ -517,6 +546,103 @@ def cmd_options_scan(args: argparse.Namespace, broker_factory: Any = Broker) -> 
     journal.record(**report.to_record())
     out("")
     note("scan complete; no order was transmitted and none can be from this path")
+    return EXIT_OK
+
+
+def cmd_options_universe_scan(
+    args: argparse.Namespace, broker_factory: Any = Broker
+) -> int:
+    """One read-only scheduling pass over the whole options universe.
+
+    Serves fresh-cached observations without touching the broker, refreshes
+    the stale under a connection-scoped pacing budget, ranks, runs Phase 2 on
+    the strongest bounded subset, and persists the ScanBook. Nominates
+    structures; mints no intents, files no handoffs, reserves no capital, and
+    cannot transmit -- the universe module imports no path that could.
+
+    Exits 0 whatever the coverage looks like: "everything deferred by pacing"
+    is a successful, honestly-reported pass.
+    """
+    import datetime as _dt
+
+    from .options.adapters import (
+        IBKRContractDataAdapter,
+        IBKRLiveMarketDataAdapter,
+        IBKRVolatilityHistoryAdapter,
+    )
+    from .options.freshness import SessionMetadataStore
+    from .options.ivstore import IVStore
+    from .options.pacing import PacedRequestBudget
+    from .options.policy import RiskPolicy
+    from .options.regime import VolatilityRegimePolicy
+    from .options.universe import UniverseScanConfig, run_universe_pass
+    from .options.universe_data import augment, seed_universe
+
+    config = config_from(args)
+    journal = OrderJournal(config.journal_path)
+    journal.preflight()
+
+    gate = SafetyGate(config, journal)
+    # The kill switch covers reads too, exactly as it does for the probe: a
+    # halted engine talks to nobody, not merely "places nothing".
+    gate.assert_not_halted()
+
+    # All three policies are built before the socket opens, so a bad threshold
+    # fails as a config error rather than mid-scan.
+    policy = RiskPolicy.from_env()
+    regime_policy = VolatilityRegimePolicy.from_env()
+    scan_config = UniverseScanConfig.from_env(
+        refresh_limit=args.refresh_limit,
+        phase2_limit=args.phase2_limit,
+    )
+
+    extras = [s for s in (args.extra_symbols or "").split(",") if s.strip()]
+    universe = augment(seed_universe(), extras)
+
+    with broker_factory(config, journal) as broker:
+        ib = broker.ib
+        # One budget per connection: IBKR meters the socket, not the module,
+        # so the scanner draws from the same buckets anything else on this
+        # connection would. ``ib.sleep`` keeps the event loop breathing while
+        # a refill is awaited.
+        budget = PacedRequestBudget(sleeper=ib.sleep)
+        contract_data = IBKRContractDataAdapter(ib)
+        book = run_universe_pass(
+            universe=universe,
+            session_date=_dt.date.today(),
+            iv_store=IVStore(config.state_dir / "universe" / "iv"),
+            metadata_store=SessionMetadataStore(
+                config.state_dir / "universe" / "metadata"
+            ),
+            budget=budget,
+            policy=policy,
+            regime_policy=regime_policy,
+            config=scan_config,
+            # The adapters are constructed without their own budget seams on
+            # purpose: the scanner owns every acquire for this pass, and an
+            # adapter that also acquired would double-spend each request.
+            volatility_history=IBKRVolatilityHistoryAdapter(ib, contract_data),
+            contract_data=contract_data,
+            market_data=IBKRLiveMarketDataAdapter(ib),
+        )
+        path = book.write(config.state_dir)
+
+    out(book.describe())
+    out("")
+    out(f"scan book        {path}")
+    journal.record(
+        "options_universe_scan",
+        session_date=book.session_date.isoformat(),
+        coverage=book.coverage.to_record(),
+        candidates=[row.symbol for row in book.candidates()],
+        version=book.version,
+        universe_version=book.universe_version,
+        rank_version=book.rank_version,
+    )
+    note(
+        "universe scan complete; nothing was transmitted, no handoff was filed "
+        "and none can be from this path"
+    )
     return EXIT_OK
 
 
@@ -1438,6 +1564,7 @@ COMMANDS = {
     "journal": cmd_journal,
     "probe-options-data": cmd_probe_options_data,
     "options-scan": cmd_options_scan,
+    "options-universe-scan": cmd_options_universe_scan,
     "options-run": cmd_options_run,
     "options-positions": cmd_options_positions,
     "options-mark": cmd_options_mark,
