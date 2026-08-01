@@ -97,6 +97,7 @@ __all__ = [
     "ScanBookRow",
     "CoverageSummary",
     "ScanBook",
+    "ScanBookFileWriter",
     "UniverseScanConfig",
     "run_universe_pass",
     "transition",
@@ -499,6 +500,86 @@ def claim_for_logical_entry(
 def supersede(row: ScanBookRow, *, reason: str, at: dt.datetime) -> ScanBookRow:
     """CANDIDATE or CLAIMED -> SUPERSEDED (a newer book replaced this row)."""
     return transition(row, ScanState.SUPERSEDED, reason=reason, at=at)
+
+
+class ScanBookFileWriter:
+    """The claim-writer seam over one session's persisted whole-file book.
+
+    The logical-entry integration's writer (contract sections 2 and 9.2): the
+    scanner itself never calls this. Each mark is read-modify-write over the
+    whole frozen book -- ``ScanBook.read``, one row replaced through the
+    transition functions above, coverage recomputed, atomic ``write`` -- so
+    the compare-and-set is against the state on disk at the instant of the
+    call, under the same single-writer deployment assumption the logical-entry
+    store states.
+
+    Semantics mirror ``tests/integration_support.py``'s executable reference
+    (``RecordingScanBookWriter``): a lost race returns ``False`` (an ordinary
+    outcome -- someone else owns the row, or a newer book retired it), an
+    idempotent re-claim by the same entry returns ``True`` without a second
+    transition, a re-claim by a *different* entry raises (double ownership is
+    the invariant, never a race), and an unknown row raises.
+    """
+
+    def __init__(self, root: Path, session_date: dt.date) -> None:
+        self.root = Path(root)
+        self.session_date = session_date
+
+    def _book(self) -> ScanBook:
+        book = ScanBook.read(self.root, self.session_date)
+        if book is None:
+            raise ScanBookTransitionError(
+                f"no readable scanbook for {self.session_date.isoformat()} "
+                f"under {self.root}",
+                hint="a claim against a book that is not on disk records nothing",
+            )
+        return book
+
+    def _row(self, book: ScanBook, symbol: str) -> ScanBookRow:
+        wanted = symbol.strip().upper()
+        for row in book.rows:
+            if row.symbol.strip().upper() == wanted:
+                return row
+        raise ScanBookTransitionError(
+            f"the scanbook for {self.session_date.isoformat()} has no row "
+            f"for {wanted}"
+        )
+
+    def _write(self, book: ScanBook, updated: ScanBookRow) -> None:
+        rows = tuple(
+            updated if row.symbol == updated.symbol else row for row in book.rows
+        )
+        replace(
+            book, rows=rows, coverage=CoverageSummary.from_rows(rows)
+        ).write(self.root)
+
+    def mark_claimed(self, symbol: str, *, entry_id: Any, at: dt.datetime) -> bool:
+        book = self._book()
+        row = self._row(book, symbol)
+        if row.state is ScanState.CLAIMED_BY_LOGICAL_ENTRY:
+            if (row.claim_reference or "") == str(entry_id):
+                return True  # idempotent re-claim by the same entry
+            raise ScanBookTransitionError(
+                f"{row.symbol} is already claimed by {row.claim_reference!r}; "
+                "a second logical entry may not claim it"
+            )
+        if row.state is not ScanState.CANDIDATE:
+            return False
+        self._write(
+            book, claim_for_logical_entry(row, claimed_by=str(entry_id), at=at)
+        )
+        return True
+
+    def mark_superseded(self, symbol: str, *, reason: str, at: dt.datetime) -> bool:
+        book = self._book()
+        row = self._row(book, symbol)
+        if row.state not in (
+            ScanState.CANDIDATE,
+            ScanState.CLAIMED_BY_LOGICAL_ENTRY,
+        ):
+            return False
+        self._write(book, supersede(row, reason=reason, at=at))
+        return True
 
 
 # -- coverage ----------------------------------------------------------------

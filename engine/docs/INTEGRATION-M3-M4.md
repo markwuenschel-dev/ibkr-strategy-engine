@@ -742,3 +742,135 @@ heuristic conflict (§6) remains open for the wiring step.
    surface imports): the universe scanner is *structurally* incapable of
    opening risk, and the AST guard named in §9.5
    (`tests/test_options_universe.py::TestReadOnlyByConstruction`) enforces it.
+
+### 9.7 · AS SHIPPED — the wiring step landed (2026-08-01)
+
+Steps 3-5 of the audited order are live. Everything below is `[verified]`
+against the tree as of this revision; where a §1-§9.6 statement says "live
+work" or "still unbuilt", this section supersedes it.
+
+**The corridor (§3's extraction, checkpoint 1).**
+`runner._authorize_and_transmit_entry` (`runner.py:1314`) is the one span
+from a built candidate to a transmitted opening order: caller preflight →
+verifier fail-closed → binding revalidation → packet → `authorize_open` →
+record-before-send → `place_combo` → reprice ladder → outcome. Both the
+`--symbol` flow and the manager path call it; `tests/test_options_integration.py::TestNoBypass`
+pins by AST enumeration that its only `authorize_open` call sites in `src`
+are this function and the frozen `walk.py:run`. Three caller seams and only
+three: `review(packet)` between packet and authorize (the manager services
+the review lifecycle there and can only stop, never widen — `authorize_open`
+re-runs the gate itself), `before_transmit` (the manager's
+`record_physical_attempt`, before `record_open_submitted`), and
+`after_transmit(filled, detail)` (`record_physical_outcome`; `None` = leave
+EXECUTING to reconciliation). One deliberate duplication: the `--symbol`
+path runs 3b (preflight) and the "-- 4." verifier-required refusal on the
+`run_once` surface, in the historical 3b -> 4 order, then calls the corridor
+with `entry_preflight=None` — because a preflight may be budget-counted (the
+proof's is) and must fire exactly once per candidate, and because
+`test_options_verifier_gate.py` pins that the refusal text sits inside
+`run_once` strictly after reconciliation and management. The corridor's own
+copies of both gates still run for every caller (the manager path relies on
+them), so neither gate can be lost by bypassing the early copies.
+
+**The nomination bridge (§9.1's seam gap, checkpoint 2).** Owned by the
+runner-wiring step exactly as §9.1 prescribed: `_logical_entry_pass`'s
+`claim_one` (`runner.py:1715` ff.) re-qualifies the nominated con_ids through
+`chain.qualify_strikes` (recovering multiplier/exchange/trading_class,
+refusing a row whose con_ids no longer qualify as described), prices the
+pinned legs via `_intent_from_pinned_legs` (`runner.py:877` — the pinned-leg
+counterpart of `_build_candidate`: no delta selection, fresh mids, same
+sizing), takes `reservation_amount` from a what-if on a provisionally-built
+intent (throwaway uuid, never filed), and hands the manager a real
+`EntryNomination` with `nominated_at = row.evaluated_at`.
+
+**The pass shape (§3, checkpoint 3).** `run_once` gained `manager`,
+`scanbook_root`, `scanbook_writer`, `max_pending_entries` (`runner.py:2193-2202`;
+`None` manager keeps the pre-integration behaviour byte for byte).
+`manager.sweep(now)` runs at pass start — after management, before the entry
+gates, under EVERY reconciliation outcome (it only releases reservations and
+closes requests; it opens nothing). Then, gated by unresolved-order and
+reconciliation exactly as any entry: service every ACTIVE entry oldest-first
+(EXECUTING entries are skipped — reconciliation owns them), each via regime
+re-classification → pinned-leg rebuild with the stable id → the corridor with
+the `manager.service` review seam; then claim at most ONE nomination from a
+fresh `ScanBook` under the caps (≤ `max_pending_entries` = 3 in
+CLAIMED/AWAITING_REVIEW; ≤ 1 transmission+walk per pass; one entry per
+underlying via the manager's claim invariant). Loader refusals
+`SCANBOOK_MISSING`/`SCANBOOK_STALE` (staleness = the claim policy's
+`max_nomination_age` against `generated_at`, `runner.py:1673`) fall back to
+the `--symbol` flow — but ONLY when the manager is idle (no active entries):
+a fallback filed beside pending entries would mint the per-pass fresh-id
+reviews M4 exists to end
+(`TestScanbookFallback::test_no_fallback_fires_beside_pending_entries`).
+
+**ScanBook writes.** `universe.ScanBookFileWriter` (`universe.py:505`) is the
+persisted claim-writer seam: read-modify-write over the whole frozen book
+through `claim_for_logical_entry`/`supersede`, coverage recomputed, atomic
+write; CAS semantics per `RecordingScanBookWriter` (False for a lost race,
+idempotent same-entry re-claim, raise on double ownership or unknown row).
+The runner marks a claimed row `CLAIMED_BY_LOGICAL_ENTRY` at claim and
+retires it `SUPERSEDED` when a serviced revision supersedes (the
+`CLAIMED → SUPERSEDED` edge §9.2 declared). Both marks are best-effort
+bookkeeping wrapped in try/except: the entry's own ledger is authoritative.
+
+**Reservation folding (§4/§9.4, checkpoint 4).**
+`LogicalEntryManager.reservations()` (`logical.py:1098`) emits one
+`PositionExposure` per ACTIVE entry holding a reservation, with
+`strategy_id = logical_entry_id`. `runner._fold_reservations`
+(`runner.py:412`) folds them into BOTH snapshot-rebuild sites (first pass and
+the corridor's binding pass), deduped by `strategy_id` against the store's
+exposures — and additionally **excludes the candidate's own reservation**
+when the candidate IS a logical entry, because the governor already counts
+the candidate's margin as the increment; folding its own reservation too
+would charge the same buying power twice. That exclusion is a §4
+clarification this document did not state and the code needed.
+One honest consequence, observed and accepted: because the spec digest binds
+the governor's observed totals, each new claim moves every pending packet's
+numbers and supersedes their revisions on the next service (the invalidation
+rule working — the reviewed portfolio context genuinely changed). The book
+settles once claims stop; `TestConcurrentUnderlyings` drives the settle
+passes explicitly.
+
+**Pacing (§6, checkpoint 5).** `adapters.quote_priority` (`adapters.py:107`)
+resolves a quote call's priority with the explicit **per-call** priority
+outranking the two-sided heuristic; the heuristic (two-sided → EXITS_MANAGEMENT)
+survives unchanged for callers that state nothing, so the marking path is
+untouched. `IBKRLiveMarketDataAdapter.strategy_quotes` gained the per-call
+`budget_priority` kwarg; the corridor's binding re-quote passes
+`Priority.AUTHORIZATION` (`runner.py`, inside `_authorize_and_transmit_entry`),
+offered to ports through an advisory-only introspection seam
+(`_accepts_kwarg`, `runner.py:351`) so fakes and pre-seam adapters keep
+working. §8's divergence 3 narrows again: the runner path remains unbudgeted
+in production, but its acquire sites now state the audit's priority.
+`TestPacingPriority` pins both the resolution order and the corridor's
+explicit AUTHORIZATION, and every scenario asserts no `DiscoveryPaced` ever
+reaches a `RunReport`.
+
+**Typed refusal classification (§9.5's fragility, checkpoint 6).**
+`logical._gate_decision` (`logical.py:216`) classifies gate refusals: a typed
+`decision` attribute (an `ApprovalDecision`) on the exception is believed
+first; the prose fallback remains because `approval.py` is frozen for this
+integration, and the exact sentence it depends on is pinned by
+`TestGateRefusalClassification::test_the_prose_fallback_is_pinned_to_approval_py`
+— a rewording of `approval.py:1223` now breaks a test instead of silently
+rerouting refusals into the generic re-raise.
+
+**CLI (checkpoint 7).** `options-run` wires the manager over the same
+verifier gate and passes `scanbook_root=config.state_dir`
+(`cli.py:728-757`) — scanbook-consuming by default, `--symbol` the fallback.
+New read-only `logical-entries` subcommand (`cli.py:801`): id, underlying,
+state, revision, digests, handoff/approval ids, reservation and age from the
+store; `--all` includes terminal entries; no broker connection and no `--arm`
+exists on it.
+
+**Deviations from the earlier sections, gathered:** (i) the fold's
+self-exclusion rule (above); (ii) the duplicated verifier-required guard
+(above, test-pinned ordering); (iii) fallback-only-when-idle (above);
+(iv) `quoted_window` for a pinned-leg rebuild comes from strike enumeration
+(`_quoted_window_for`, `runner.py:968`) because `check_liquidity`'s
+SPARSE_CHAIN floor wants discovery-scale density, not the two binding legs;
+(v) the sweep runs under every reconciliation outcome rather than inside the
+entry section — it opens nothing and must not leave reservations held on an
+UNAVAILABLE day; (vi) `withdraw` on supersession leaves a request the
+reviewer already answered untouched (its completion note is the reviewer's),
+so the integration asserts "closed", not "closed by the builder".

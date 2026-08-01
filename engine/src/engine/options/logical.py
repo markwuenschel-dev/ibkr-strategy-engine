@@ -100,6 +100,7 @@ from uuid import UUID, uuid4
 
 from ..errors import JournalError, RefusedError
 from .approval import (
+    ApprovalDecision,
     AwaitingVerification,
     MAXIMUM_APPROVAL_LIFETIME,
     VerificationPacket,
@@ -112,6 +113,7 @@ from .domain import (
     OrderAction,
     StrategyType,
 )
+from .portfolio import PositionExposure
 
 __all__ = [
     "DEFAULT_REFUSAL_POLICY",
@@ -209,6 +211,30 @@ class StaleNominationError(RefusedError):
 
 def _refuse(message: str, *, hint: str | None = None) -> None:
     raise RefusedError(message, hint=hint)
+
+
+def _gate_decision(refusal: RefusedError) -> ApprovalDecision | None:
+    """Which recorded decision a gate refusal carries, or ``None`` for
+    everything else (which the caller re-raises).
+
+    Typed surface first: a gate that stamps its refusal with a ``decision``
+    attribute (an :class:`~engine.options.approval.ApprovalDecision`) is
+    believed outright. The shipped :class:`CollabVerifierGate` does not yet --
+    ``approval.py`` is frozen for this integration -- so the fallback matches
+    the exact prose its ``require`` composes ("the verifier answered
+    REFUSED/UNAVAILABLE for trade intent ..."). That prose is pinned by
+    ``tests/test_options_integration.py``, so a rewording breaks a test
+    loudly instead of silently rerouting refusals into the generic re-raise.
+    """
+    decision = getattr(refusal, "decision", None)
+    if isinstance(decision, ApprovalDecision):
+        return decision
+    message = str(getattr(refusal, "message", refusal))
+    if "answered REFUSED" in message:
+        return ApprovalDecision.REFUSED
+    if "answered UNAVAILABLE" in message:
+        return ApprovalDecision.UNAVAILABLE
+    return None
 
 
 def _aware(value: Any, label: str) -> dt.datetime:
@@ -1069,6 +1095,30 @@ class LogicalEntryManager:
         """Step 4: later passes load the same entry, never mint another id."""
         return self.store.active_for(underlying)
 
+    def reservations(self) -> tuple[PositionExposure, ...]:
+        """Every ACTIVE entry's reservation, as governor-shaped exposures.
+
+        The runner folds these into each portfolio snapshot beside the
+        position store's own exposures (contract section 4). ``strategy_id``
+        is the entry's ``logical_entry_id`` -- the SAME uuid the store keys on
+        once the order is submitted -- which is what makes the fold's dedupe
+        structural rather than heuristic. ``maximum_loss`` is set to the
+        reserved amount as a stand-in: the true defined loss is not known
+        until an intent is sized, and overstating is the conservative
+        direction (it can only refuse a candidate a more precise figure
+        would have allowed).
+        """
+        return tuple(
+            PositionExposure(
+                underlying=entry.normalized_underlying,
+                buying_power_reserved=entry.reservation_amount,
+                maximum_loss=entry.reservation_amount,
+                strategy_id=entry.logical_entry_id,
+            )
+            for entry in self.store.active()
+            if entry.reservation_amount is not None
+        )
+
     @staticmethod
     def _check_identity(entry: LogicalEntry, packet: VerificationPacket) -> None:
         """The packet's intent id must BE the logical identity. A packet built
@@ -1268,10 +1318,12 @@ class LogicalEntryManager:
                 ServiceOutcome.WAITING, entry, request_id=waiting.request_id
             )
         except RefusedError as refusal:
-            message = str(getattr(refusal, "message", refusal))
-            if "answered REFUSED" in message:
-                return self._record_refusal(entry, at, detail=message)
-            if "answered UNAVAILABLE" in message:
+            decision = _gate_decision(refusal)
+            if decision is ApprovalDecision.REFUSED:
+                return self._record_refusal(
+                    entry, at, detail=str(getattr(refusal, "message", refusal))
+                )
+            if decision is ApprovalDecision.UNAVAILABLE:
                 # Blocks without deciding: the entry keeps waiting and the
                 # expiry above is what eventually ends it.
                 return ServiceResult(

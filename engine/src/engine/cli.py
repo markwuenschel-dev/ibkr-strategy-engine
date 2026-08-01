@@ -173,8 +173,9 @@ def build_parser() -> argparse.ArgumentParser:
     run = subs.add_parser(
         "options-run",
         help=(
-            "one strategy pass: reconcile, manage open positions, consider one "
-            "entry. Requires --arm to transmit anything."
+            "one strategy pass: reconcile, manage open positions, service "
+            "pending logical entries, consume the session's scanbook (or fall "
+            "back to --symbol). Requires --arm to transmit anything."
         ),
     )
     run.add_argument("--symbol", default="SPY")
@@ -231,6 +232,19 @@ def build_parser() -> argparse.ArgumentParser:
         "options-positions", help="list open option structures and reconcile them"
     )
     positions.add_argument("--no-connect", action="store_true", help="read the store only")
+
+    # Read-only by construction: no broker connection, no --arm, no code path
+    # that could use one. The operator's window into the M4 logical-entry
+    # store: what is claimed, awaiting review, approved, cooling or executing.
+    logical = subs.add_parser(
+        "logical-entries",
+        help="read-only: every logical entry's state, revision, digests and reservation",
+    )
+    logical.add_argument(
+        "--all",
+        action="store_true",
+        help="include terminal entries (FILLED, EXPIRED, ABANDONED)",
+    )
 
     # Read-only by construction: there is deliberately no --arm here and no
     # code path that could use one. Marking answers "what is this worth"; acting
@@ -702,6 +716,20 @@ def cmd_options_run(args: argparse.Namespace, broker_factory: Any = Broker) -> i
         note("DRY RUN -- every gate will run and nothing will be transmitted.")
 
     _verifier, _context = _verifier_for(config, policy)
+
+    # The logical-entry manager (M4) rides on the same verifier gate the
+    # entry corridor uses. No verifier means no manager: pending entries
+    # cannot be serviced without the gate, and the runner's own
+    # OPTIONS_VERIFIER_NOT_CONFIGURED refusal already names the condition.
+    _manager = None
+    if _verifier is not None:
+        from .options.logical import LogicalEntryManager, LogicalEntryStore
+
+        _manager = LogicalEntryManager(
+            store=LogicalEntryStore(config.state_dir / "logical_entries.jsonl"),
+            gate=_verifier,
+        )
+
     with broker_factory(config, journal) as broker:
         report = run_once(
             broker,
@@ -722,6 +750,11 @@ def cmd_options_run(args: argparse.Namespace, broker_factory: Any = Broker) -> i
             verifier=_verifier,
             approval_context=_context,
             entry_preflight=_paper_day_preflight(config),
+            # Scanbook-consuming by default; a missing or stale book falls
+            # back to the --symbol single-shot behaviour, and the runner
+            # records SCANBOOK_MISSING/SCANBOOK_STALE either way.
+            manager=_manager,
+            scanbook_root=config.state_dir,
         )
 
     out(report.describe())
@@ -763,6 +796,67 @@ def _verifier_for(config: EngineConfig, policy: Any) -> tuple[Any, Any]:
         return None, None
     gate = CollabVerifierGate(root=root, ledger=config.state_dir / "verification")
     return gate, ApprovalContext.for_run(config=config, policy=policy, account=config.account_id)
+
+
+def cmd_logical_entries(args: argparse.Namespace) -> int:
+    """Read-only window into the M4 logical-entry store. Connects to nothing.
+
+    Prints, per entry: the stable id, underlying, state, proposal revision,
+    the current spec digest and handoff id, the reservation, and the entry's
+    age. There is deliberately no way to mutate anything from here -- the
+    store is append-only and its writers are the manager's, behind the
+    runner's gates.
+    """
+    import datetime as _dt
+
+    from .options.logical import LogicalEntryStore
+
+    config = config_from(args)
+    store = LogicalEntryStore(config.state_dir / "logical_entries.jsonl")
+    problems: list[str] = []
+    entries = sorted(
+        store.entries(errors=problems).values(), key=lambda e: e.created_at
+    )
+    shown = entries if args.all else [e for e in entries if e.is_active]
+    now = _dt.datetime.now(_dt.timezone.utc)
+
+    out(f"LOGICAL ENTRIES  {store.path}")
+    out(
+        f"  {len(entries)} total, {sum(1 for e in entries if e.is_active)} active"
+        + ("" if args.all else "  (terminal hidden; --all shows them)")
+    )
+    out("")
+    if not shown:
+        out("  none")
+    for entry in shown:
+        age = now - entry.created_at
+        reservation = (
+            f"{entry.reservation_amount} [{entry.reservation_id}]"
+            if entry.reservation_id is not None
+            else "released"
+        )
+        out(f"  {entry.describe()}")
+        out(
+            f"      revision {entry.proposal_revision}"
+            f"  spec {entry.current_spec_digest[:12] or '-'}"
+            f"  handoff {entry.current_handoff_id or '-'}"
+            f"  approval {entry.current_approval_id or '-'}"
+        )
+        out(
+            f"      reservation {reservation}"
+            f"  age {age}"
+            + (
+                f"  review expires {entry.review_expires_at.isoformat()}"
+                if entry.review_expires_at is not None
+                else ""
+            )
+        )
+    if problems:
+        out("")
+        out("STORE INTEGRITY")
+        for problem in problems:
+            out(f"  {problem}")
+    return EXIT_OK
 
 
 def cmd_options_cancel(args: argparse.Namespace, broker_factory: Any = Broker) -> int:
@@ -1592,6 +1686,7 @@ COMMANDS = {
     "options-universe-scan": cmd_options_universe_scan,
     "options-run": cmd_options_run,
     "options-positions": cmd_options_positions,
+    "logical-entries": cmd_logical_entries,
     "options-mark": cmd_options_mark,
     "options-cancel": cmd_options_cancel,
     "options-verify-execution": cmd_options_verify_execution,

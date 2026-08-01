@@ -39,9 +39,11 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import inspect
 from enum import Enum
 from dataclasses import dataclass, field
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -57,7 +59,16 @@ from .chain import (
     qualify_strikes,
     select_expiration,
 )
-from .domain import OptionStrategyIntent
+from .domain import (
+    OptionLegIntent,
+    OptionRight,
+    OptionStrategyIntent,
+    OrderAction,
+    PriceEffect,
+    StrategyAction,
+    StrategyType,
+    compute_maximum_loss_per_contract,
+)
 from .governor import GovernorVerdict, PortfolioGovernor
 from .ivrank import IVRankMetric, build_iv_rank, observations_from_bars
 from .lifecycle import (
@@ -67,10 +78,17 @@ from .lifecycle import (
     closing_intent_for,
     decide_management_action,
 )
+from .logical import (
+    EntryNomination,
+    LogicalEntryState,
+    ServiceOutcome,
+    StaleNominationError,
+)
 from .marketdata import Liveness
 from .marking import closing_midpoint_debit, confirmed_remaining_quantity
+from .pacing import Priority
 from .policy import RiskPolicy
-from .portfolio import PortfolioSnapshot
+from .portfolio import PortfolioSnapshot, PositionExposure
 from .ports import LiveMarketDataPort, PortfolioStatePort, StrategyQuoteSnapshot
 from .positions import (
     OpenPosition,
@@ -89,11 +107,14 @@ from .selection import (
     rights_for,
     select_short_strike,
     select_vertical,
+    size_position,
     target_delta_for,
 )
+from .universe import ScanBook, ScanBookFileWriter
 from .approval import (
     ApprovalContext,
     AwaitingVerification,
+    VerificationPacket,
     VerificationState,
     VerifierGate,
     packet_for,
@@ -327,6 +348,25 @@ def mark_from_snapshot(
     )
 
 
+def _accepts_kwarg(func: Any, name: str) -> bool:
+    """Whether ``func`` can be handed ``name`` as a keyword argument.
+
+    Used only for *advisory* parameters (the pacing priority): a port that
+    predates the seam simply is not offered it. Safety-bearing parameters
+    (``require_two_sided``) are never gated this way -- a port that cannot
+    honour those must fail loudly, not be quietly excused.
+    """
+    try:
+        parameters = inspect.signature(func).parameters
+    except (TypeError, ValueError):  # pragma: no cover - builtins/exotics
+        return False
+    if name in parameters:
+        return True
+    return any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+    )
+
+
 def _quotes_for(
     market_data: LiveMarketDataPort | None,
     *,
@@ -335,6 +375,7 @@ def _quotes_for(
     report: RunReport,
     label: str,
     require_two_sided: bool = False,
+    budget_priority: Any = None,
 ) -> StrategyQuoteSnapshot | None:
     """One snapshot, or ``None`` with the failure recorded.
 
@@ -342,18 +383,59 @@ def _quotes_for(
     predate the parameter (every test fake, and any adapter not yet updated)
     keep working on the default path -- and a port that cannot honour the
     request fails loudly here rather than silently ignoring it.
+
+    ``budget_priority`` is the pacing priority this call should draw at when
+    the port runs inside a request budget (docs/INTEGRATION-M3-M4.md section
+    6): the binding-revalidation re-quote passes ``Priority.AUTHORIZATION`` so
+    a two-sided demand for a candidate that is NOT held does not spend the
+    management reserve. Advisory, so it is offered only to ports that declare
+    the seam.
     """
     if market_data is None or not con_ids:
         return None
+    kwargs: dict[str, Any] = {}
+    if require_two_sided:
+        kwargs["require_two_sided"] = True
+    if budget_priority is not None and _accepts_kwarg(
+        market_data.strategy_quotes, "budget_priority"
+    ):
+        kwargs["budget_priority"] = budget_priority
     try:
-        if require_two_sided:
-            return market_data.strategy_quotes(
-                underlying_symbol=symbol, con_ids=con_ids, require_two_sided=True
-            )
-        return market_data.strategy_quotes(underlying_symbol=symbol, con_ids=con_ids)
+        return market_data.strategy_quotes(
+            underlying_symbol=symbol, con_ids=con_ids, **kwargs
+        )
     except Exception as exc:  # noqa: BLE001 - adapter boundary; see scan.py
         report.errors.append(f"{label}: quotes unavailable: {type(exc).__name__}: {exc}")
         return None
+
+
+def _fold_reservations(
+    exposures: tuple[PositionExposure, ...],
+    reservations: tuple[PositionExposure, ...],
+    *,
+    exclude: Any = None,
+) -> tuple[PositionExposure, ...]:
+    """Fold pending logical-entry reservations into the governor's book.
+
+    The dedupe key is the reservation's ``strategy_id``, which for a logical
+    entry IS its ``logical_entry_id`` -- the same UUID ``record_open_submitted``
+    keys the position store on once the order is sent (contract section 9.4).
+    A reservation whose id already appears in the store's exposures is dropped:
+    the store's record has taken over, and counting both would double the
+    figure.
+
+    ``exclude`` names the candidate currently being evaluated: the governor
+    already counts the candidate's own margin as the increment, so folding its
+    own reservation as well would charge the same buying power twice.
+    """
+    held = {e.strategy_id for e in exposures if e.strategy_id is not None}
+    folded = tuple(
+        r
+        for r in reservations
+        if r.strategy_id not in held
+        and (exclude is None or r.strategy_id != exclude)
+    )
+    return tuple(exposures) + folded
 
 
 def _manage_one(
@@ -761,6 +843,180 @@ def _iv_metric_for(
     return build_iv_rank(symbol, observations_from_bars(bars or []), calculated_at=now)
 
 
+def _regime_for(
+    ib: Any,
+    symbol: str,
+    *,
+    resolved_regime: VolatilityRegimePolicy,
+    now: dt.datetime,
+    report: RunReport,
+) -> tuple[Any | None, IVRankMetric | None]:
+    """Qualify the underlying, pull its IV metric, classify the regime.
+
+    Always classified, even in shadow: the decision is recorded in the report
+    and the packet evidence either way. Serviced pending entries re-run this
+    per pass too, because the packet evidence states the tier (contract
+    section 3)."""
+    underlying_contract = _qualify_underlying(ib, symbol, report)
+    if underlying_contract is None:
+        return None, None
+    iv_metric = _iv_metric_for(ib, underlying_contract, symbol, now=now)
+    report.iv_rank = iv_metric
+    report.regime = classify(
+        VolatilityAssessment(
+            symbol=symbol,
+            iv_rank=iv_metric.iv_rank if iv_metric.is_usable else None,
+            iv_percentile=iv_metric.iv_percentile,
+            current_iv=iv_metric.current_iv,
+        ),
+        resolved_regime,
+    )
+    return underlying_contract, iv_metric
+
+
+def _intent_from_pinned_legs(
+    *,
+    legs: tuple[OptionLegIntent, ...],
+    strategy_family: StrategyType,
+    strategy_id: Any,
+    expiration: dt.date,
+    market_data: LiveMarketDataPort | None,
+    symbol: str,
+    policy: RiskPolicy,
+    configuration_version: str,
+    now: dt.datetime,
+    report: RunReport,
+    label: str,
+) -> tuple[OptionStrategyIntent | None, StrategyQuoteSnapshot | None]:
+    """Rebuild a binding intent for an already-selected structure.
+
+    The logical-entry path's counterpart to ``_build_candidate``: the legs are
+    **pinned** -- they are the entry's identity -- so no delta selection runs
+    here, only fresh pricing. Priced from mids exactly as the strategy path
+    prices (``_build_candidate``), quantized the same way, sized by the same
+    ``size_position``, and carrying the caller's ``strategy_id`` -- for a
+    serviced entry that is the stable ``logical_entry_id`` the approval spec
+    digest binds (contract sections 0 and 9.1).
+    """
+    snapshot = _quotes_for(
+        market_data,
+        symbol=symbol,
+        con_ids=[leg.con_id for leg in legs],
+        report=report,
+        label=label,
+        require_two_sided=True,
+    )
+    if snapshot is None:
+        report.blockers.append(f"{label}: the structure's legs could not be quoted")
+        return None, None
+    quotes = {q.con_id: q for q in snapshot.legs}
+    credit = ZERO
+    for leg in legs:
+        quote = quotes.get(leg.con_id)
+        mid = quote.mid if quote is not None else None
+        if mid is None:
+            report.blockers.append(
+                f"{label}: no two-sided market on leg {leg.con_id}"
+            )
+            return None, snapshot
+        contribution = mid * leg.ratio
+        credit += contribution if leg.action is OrderAction.SELL else -contribution
+    credit = credit.quantize(Decimal("0.01"))
+    strikes = sorted(leg.strike for leg in legs)
+    width = strikes[-1] - strikes[0]
+    if credit <= ZERO or credit >= width:
+        report.blockers.append(
+            f"{label}: credit {credit} is not a usable price for a "
+            f"{width}-wide spread"
+        )
+        return None, snapshot
+    maximum_loss = compute_maximum_loss_per_contract(
+        strategy_type=strategy_family,
+        legs=legs,
+        credit=credit,
+        multiplier=legs[0].multiplier,
+    )
+    quantity = size_position(
+        maximum_loss_per_contract=maximum_loss,
+        risk_budget=policy.risk_budget_per_position,
+    )
+    if quantity == 0:
+        report.blockers.append(
+            f"{label}: risk budget {policy.risk_budget_per_position} does not "
+            "cover one contract"
+        )
+        return None, snapshot
+    return (
+        OptionStrategyIntent(
+            strategy_id=strategy_id,
+            strategy_type=strategy_family,
+            strategy_action=StrategyAction.OPEN,
+            underlying=symbol,
+            quantity=quantity,
+            legs=legs,
+            expiration=expiration,
+            limit_price=credit,
+            price_effect=PriceEffect.CREDIT,
+            maximum_loss_per_contract=maximum_loss,
+            configuration_version=configuration_version,
+            created_at=now,
+        ),
+        snapshot,
+    )
+
+
+def _quoted_window_for(
+    ib: Any,
+    broker: Any,
+    symbol: str,
+    *,
+    expiration: dt.date,
+    right: str,
+    strike_window: int,
+) -> int | None:
+    """The discovery-scale chain density behind a pinned-leg rebuild.
+
+    ``check_liquidity``'s SPARSE_CHAIN floor wants the *discovery window*, not
+    the two binding legs (liquidity.py's own comment on ``quoted_window``): a
+    revalidation that fetches only the selected legs must pass the window it
+    was selected from, or every serviced entry would be refused for the
+    narrowness the revalidation exists to provide. Enumeration only -- no
+    quote subscriptions are spent on it. ``None`` when the chain cannot be
+    enumerated, which fails closed downstream (the two-leg count trips the
+    floor)."""
+    try:
+        listed = enumerate_strikes(
+            ib, symbol, expiration.strftime("%Y%m%d"), right
+        )
+        window = narrow_strikes(
+            listed,
+            reference_price=_underlying_reference_price(broker, symbol),
+            width=strike_window,
+            right=right,
+        )
+    except Exception:  # noqa: BLE001 - adapter boundary; fail closed
+        return None
+    return len(window) or None
+
+
+def _transmit_disposition(result: TransmitResult) -> tuple[bool | None, str]:
+    """What a transmit outcome means for the logical entry's lineage.
+
+    ``True`` is a real fill with a usable price, ``False`` is a definitive
+    non-fill, and ``None`` is genuinely unresolved -- the logical entry stays
+    EXECUTING and reconciliation owns the question, exactly as the position
+    store's UNCERTAIN state does."""
+    snapshot = result.snapshot
+    if result.is_uncertain:
+        return None, result.message or f"unresolved ({result.state.value})"
+    if snapshot is not None and snapshot.has_position:
+        credit = abs(snapshot.average_price) if snapshot.average_price else None
+        if credit is None:
+            return None, "filled without a usable price; the credit must be reconciled"
+        return True, f"filled {snapshot.filled} at {credit}"
+    return False, f"did not fill: {result.state.value}"
+
+
 def _build_candidate(
     *,
     ib: Any,
@@ -1055,6 +1311,846 @@ def snapshot_total(snapshot: Any) -> Any:
     return getattr(snapshot, "total_buying_power_reserved", None)
 
 
+def _authorize_and_transmit_entry(
+    *,
+    ib: Any,
+    candidate: OptionStrategyIntent,
+    snapshot: StrategyQuoteSnapshot | None,
+    snapshot_state: PortfolioSnapshot | None,
+    market_data: LiveMarketDataPort | None,
+    portfolio: PortfolioStatePort | None,
+    store: PositionStore,
+    policy: RiskPolicy,
+    gate: SafetyGate,
+    journal: OrderJournal,
+    recorder: Any,
+    armed: bool,
+    account: str,
+    now: dt.datetime,
+    pinned_clock: bool,
+    verifier: VerifierGate | None,
+    approval_context: ApprovalContext | None,
+    minimum_iv_rank: Decimal,
+    entry_preflight: EntryPreflight | None,
+    reprice: RepriceLadder | None,
+    report: RunReport,
+    quoted_window: int | None = None,
+    reservations: Callable[[], tuple[PositionExposure, ...]] | None = None,
+    review: Callable[[VerificationPacket], bool] | None = None,
+    before_transmit: Callable[[], None] | None = None,
+    after_transmit: Callable[[bool | None, str], None] | None = None,
+) -> str:
+    """THE one corridor from a built candidate to a transmitted opening order.
+
+    Extracted from the single-candidate flow so that the ``--symbol`` path,
+    the logical-entry manager path, and any future caller walk the same span:
+    caller preflight -> verifier-required (fail closed) -> binding
+    revalidation -> packet -> [review seam] -> ``authorize_open`` ->
+    record-before-send -> ``place_combo`` -> reprice ladder -> outcome. There
+    is deliberately no second corridor and no bypass: the merge test pins this
+    function as the only ``authorize_open`` caller in this module (contract
+    sections 3 and 5).
+
+    The three seams a caller may hang behaviour on -- and the only three:
+
+    * ``review(packet)`` runs between the packet and ``authorize_open``. The
+      manager path services the review lifecycle here (filing, waiting,
+      supersession) and returns ``False`` to stop the pass without
+      authorizing; ``authorize_open`` still re-runs the gate itself, so a
+      hook that lies gains nothing -- the gate's digest binding, not the
+      hook's answer, is what authorizes.
+    * ``before_transmit`` runs after the authorization is minted and before
+      ``record_open_submitted`` -- the manager records PHYSICAL_SUBMITTED
+      here, enforcing one working physical order per entry. A refusal stops
+      the send.
+    * ``after_transmit(filled, detail)`` runs once the outcome is judged;
+      ``None`` means unresolved and the caller must leave the question to
+      reconciliation.
+
+    'Record the intent before transmitting' is sacred (positions.py): the
+    store write happens strictly before ``place_combo`` on every path through
+    this function, including every reprice rung.
+
+    Returns a status string: ``preflight_refused | verifier_missing |
+    binding_blocked | review_hold | awaiting | refused | transmit_failed |
+    transmitted``.
+    """
+    symbol = candidate.underlying
+
+    # -- 3b. the caller's own last word --------------------------------
+    # After every engine gate, before the token exists. A refusal here means
+    # no TransmitAuthorization is ever minted for this candidate, rather than
+    # one being minted and then not used.
+    if entry_preflight is not None:
+        try:
+            refusal = entry_preflight(
+                intent=candidate,
+                snapshot=snapshot,
+                market_data=market_data,
+                policy=policy,
+                now=now,
+                armed=armed,
+            )
+        except Exception as exc:  # noqa: BLE001 - a broken preflight refuses
+            refusal = f"the entry preflight raised {type(exc).__name__}: {exc}"
+        if refusal:
+            report.blockers.append(f"entry preflight: {refusal}")
+            report.refusal_codes.append("OPTIONS_ENTRY_PREFLIGHT_REFUSED")
+            return "preflight_refused"
+
+    # -- 4. verifier required (runs BEFORE the binding revalidation: fail
+    # closed before spending broker requests on revalidating a candidate no
+    # reviewer could ever authorize). The verifier is required for an entry
+    # and optional for the pass: a run that only reconciles and manages must
+    # not need a reviewer, and a run that wants to *open* must not proceed
+    # without one.
+    if verifier is None or approval_context is None:
+        report.blockers.append(
+            "entry refused: no independent verifier gate is configured for this "
+            "pass, so no opening trade can be authorized"
+        )
+        report.refusal_codes.append("OPTIONS_VERIFIER_NOT_CONFIGURED")
+        return "verifier_missing"
+
+    # -- 3c. binding revalidation (2026-08-01 audit) ---------------------
+    # A candidate may have been nominated from cached discovery, and even
+    # a same-pass build can be minutes old after slow management or a
+    # working-order walk. Immediately before the packet Grok reviews --
+    # and therefore immediately before authorize_open, which follows in
+    # the same breath and re-derives the spec digest from these same
+    # objects -- every binding fact is re-established from the market as
+    # it is NOW: fresh selected-leg quotes with a two-sided book demanded,
+    # fresh what-if margin, fresh portfolio snapshot, fresh risk and
+    # governor verdicts. Anything that moved moves the digest with it, so
+    # an already-reviewed packet stops matching and needs a new review --
+    # the invalidation rule working, not failing.
+    binding_now = (
+        now if pinned_clock
+        else dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    )
+    binding_quotes = _quotes_for(
+        market_data,
+        symbol=symbol,
+        con_ids=[leg.con_id for leg in candidate.legs],
+        report=report,
+        label="binding revalidation",
+        require_two_sided=True,
+        # The corridor's own acquires draw at AUTHORIZATION, never at the
+        # management reserve's priority: this two-sided demand is for a
+        # candidate that is NOT held (contract section 6).
+        budget_priority=Priority.AUTHORIZATION,
+    )
+    if binding_quotes is None:
+        report.blockers.append(
+            "binding revalidation: the selected legs could not be re-quoted, "
+            "so no packet may bind them"
+        )
+        report.refusal_codes.append("OPTIONS_BINDING_UNQUOTABLE")
+        return "binding_blocked"
+    margin = IBKRWhatIfAdapter(ib).what_if(candidate, observed_at=binding_now)
+    if portfolio is not None:
+        try:
+            fresh_state = portfolio.snapshot(as_of=binding_now)
+            snapshot_state = PortfolioSnapshot(
+                as_of=fresh_state.as_of,
+                net_liquidation=fresh_state.net_liquidation,
+                positions=_fold_reservations(
+                    store.exposures(),
+                    reservations() if reservations is not None else (),
+                    exclude=candidate.strategy_id,
+                ),
+                reported_buying_power_reserved=(
+                    fresh_state.reported_buying_power_reserved
+                ),
+            )
+            report.portfolio = snapshot_state
+        except Exception as exc:  # noqa: BLE001 - adapter boundary
+            report.blockers.append(
+                f"binding revalidation: portfolio unavailable: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            report.refusal_codes.append("OPTIONS_BINDING_UNQUOTABLE")
+            return "binding_blocked"
+    report.risk = assess_candidate(
+        candidate,
+        policy=policy,
+        quotes=binding_quotes,
+        margin=margin,
+        underlying_price=binding_quotes.underlying.mid,
+        net_liquidation=(
+            snapshot_state.net_liquidation if snapshot_state else None
+        ),
+        evaluated_at=binding_now,
+        quoted_window=(
+            quoted_window
+            if quoted_window is not None
+            else (len(snapshot.legs) if snapshot is not None else None)
+        ),
+    )
+    report.governor = PortfolioGovernor(policy).evaluate(
+        candidate,
+        snapshot=snapshot_state,
+        margin=margin,
+        decision_time=binding_now,
+    )
+    binding_refusals = [
+        *(f"binding risk: {r.detail}" for r in report.risk.refusals),
+        *(f"binding governor: {r.detail}" for r in report.governor.refusals),
+    ]
+    if binding_refusals:
+        report.blockers.extend(binding_refusals)
+        report.refusal_codes.extend(report.risk.reason_codes)
+        report.refusal_codes.extend(report.governor.reason_codes)
+        return "binding_blocked"
+
+    packet = packet_for(
+        candidate,
+        structure_digest=structure_digest(candidate),
+        risk=report.risk,
+        governor=report.governor,
+        context=approval_context,
+        order_type=COMBO_ORDER_TYPE,
+        time_in_force=COMBO_TIME_IN_FORCE,
+        now=binding_now,
+        evidence=_entry_evidence(
+            report,
+            margin=margin,
+            snapshot=binding_quotes,
+            intent=candidate,
+            minimum_iv_rank=minimum_iv_rank,
+        ),
+    )
+
+    # -- the review seam: the manager services the review lifecycle here.
+    # Everything the hook decides is re-checked by authorize_open below; the
+    # hook can only stop the pass, never widen it.
+    if review is not None and not review(packet):
+        return "review_hold"
+
+    try:
+        authorization = authorize_open(
+            candidate,
+            gate=gate,
+            risk=report.risk,
+            governor=report.governor,
+            armed=armed,
+            now=now,
+            verifier=verifier,
+            packet=packet,
+        )
+    except AwaitingVerification as exc:
+        # Not a refusal of the candidate -- a statement that the answer has
+        # not arrived. Recorded and returned, never waited on: everything
+        # else this pass did (reconciliation, management, exits) already
+        # happened above, and the next pass picks the answer up.
+        report.verification = VerificationState.AWAITING_VERIFICATION
+        report.verification_request = exc.request_id
+        report.blockers.append(f"entry awaiting verification: {exc.message}")
+        report.refusal_codes.append("OPTIONS_AWAITING_VERIFICATION")
+        return "awaiting"
+    except RefusedError as exc:
+        report.verification = VerificationState.REFUSED
+        report.blockers.append(f"entry refused: {exc.message}")
+        return "refused"
+    report.verification = VerificationState.CONSUMED
+
+    bpr = (
+        margin.initial_margin_change
+        if margin.initial_margin_change is not None
+        else ZERO
+    )
+    if before_transmit is not None:
+        try:
+            before_transmit()
+        except RefusedError as exc:
+            report.blockers.append(f"entry transmit refused: {exc.message}")
+            return "refused"
+    # Recorded BEFORE the send. A crash after this leaves an OPENING record
+    # the reconciler can resolve; the reverse leaves a live spread nothing
+    # knows about.
+    store.record_open_submitted(candidate, at=now, buying_power_reserved=bpr)
+
+    try:
+        result = place_combo(
+            ib,
+            candidate,
+            authorization=authorization,
+            account=account,
+            sink=recorder,
+        )
+    except Exception as exc:  # noqa: BLE001 - a failed send must be recorded
+        store.record_open_failed(candidate.strategy_id, at=now, reason=str(exc))
+        report.errors.append(f"entry transmission failed: {exc}")
+        if after_transmit is not None:
+            after_transmit(False, f"transmission failed: {exc}")
+        return "transmit_failed"
+
+    report.transmissions.append(result)
+    journal.record("order_placed", **result.to_record())
+
+    # -- 5. work the order, if the broker took it and did not fill it ----
+    # Runs before the outcome is judged, because until the ladder has
+    # finished there is no final outcome to judge: an order still working
+    # is not an order whose result is known, and the previous code called
+    # that "unknown" and stopped -- leaving the order resting.
+    if reprice is not None and _still_working(result):
+        outcome = work_order(
+            ib,
+            candidate,
+            result,
+            authorization=authorization,
+            gate=gate,
+            armed=armed,
+            # The ladder reprices an OPEN, and a reprice is a new opening
+            # order under the invalidation rule. It gets the same verifier
+            # the entry did, so every rung is reviewed rather than riding on
+            # the approval that covered the first price.
+            verifier=verifier,
+            approval_context=approval_context,
+            # Both ends of the deadline come from the same clock. ``now``
+            # is the pass's *logical* time and may be injected -- measuring
+            # a two-minute wall-clock deadline from it made the ladder
+            # expire before its first rung whenever the two disagreed.
+            started_at=_wall_clock(),
+            clock=_wall_clock,
+            # A cancelled rung is a real OPEN_FAILED -- nothing is in the
+            # market -- and replaying that retires the position AND releases
+            # its buying-power reservation. So the replacement needs its own
+            # submission record, carrying the same reservation, written
+            # before it is sent, exactly as the first one was above.
+            # Without it the governor would size the next decision against a
+            # book that believes this capital is free while a real order
+            # rests in the market.
+            record_submission=lambda replacement: store.record_open_submitted(
+                replacement,
+                at=dt.datetime.now(dt.timezone.utc),
+                buying_power_reserved=bpr,
+            ),
+            # And the order journal, because gate_daily_count() counts
+            # ``order_placed`` records. Every real transmission is one.
+            record_transmission=lambda sent: journal.record(
+                "order_placed", **sent.to_record()
+            ),
+            ladder=reprice,
+            envelope=envelope_for(candidate),
+            account=account,
+            sink=recorder,
+        )
+        report.reprice = outcome
+        # A summary of the ladder, under its own event name. The individual
+        # sends were already journalled as ``order_placed`` by
+        # ``record_transmission`` above -- this must NOT be another one, or
+        # the daily count would double-count every rung.
+        journal.record("order_worked", **outcome.to_record())
+        if outcome.final is not None and outcome.final is not result:
+            # Only a *different* order is a second transmission. A ladder
+            # that refused before it sent anything hands back the same
+            # result it was given, and reporting that twice would make the
+            # pass look like it placed two orders.
+            report.transmissions.append(outcome.final)
+            result = outcome.final
+        if outcome.detail:
+            report.blockers.append(f"entry order worked: {outcome.describe()}")
+
+    _record_open_outcome(candidate.strategy_id, result, store=store, now=now, report=report)
+    if after_transmit is not None:
+        after_transmit(*_transmit_disposition(result))
+    return "transmitted"
+
+
+#: run_once's transmission budget: at most this many corridor walks that
+#: actually reach the market per pass, however many entries are serviceable.
+_TRANSMITTING_STATUSES = ("transmitted", "transmit_failed")
+
+#: Logical-entry states that count against ``max_pending_entries``: the ones
+#: holding an open question with the reviewer (or about to file one).
+_PENDING_STATES = (
+    LogicalEntryState.CLAIMED,
+    LogicalEntryState.AWAITING_REVIEW,
+)
+
+
+def _load_scanbook(
+    scanbook_root: Path | None,
+    *,
+    today: dt.date,
+    now: dt.datetime,
+    manager: Any,
+    report: RunReport,
+) -> tuple[ScanBook | None, str]:
+    """The session's ScanBook, or ``None`` with the named refusal recorded.
+
+    ``SCANBOOK_MISSING`` and ``SCANBOOK_STALE`` are the two loader refusals
+    that send the pass to the ``--symbol`` fallback. Staleness mirrors the
+    claim policy's ``max_nomination_age``: a book older than the oldest
+    nomination the manager would accept cannot contain a claimable row, so
+    reading it would only discover row by row what the timestamp already says.
+    """
+    if scanbook_root is None:
+        report.refusal_codes.append("SCANBOOK_MISSING")
+        report.blockers.append(
+            "no scanbook root is configured; the --symbol path is the fallback"
+        )
+        return None, "SCANBOOK_MISSING"
+    book = ScanBook.read(Path(scanbook_root), today)
+    if book is None:
+        report.refusal_codes.append("SCANBOOK_MISSING")
+        report.blockers.append(
+            f"no scanbook for {today.isoformat()} under {scanbook_root}; "
+            "the --symbol path is the fallback"
+        )
+        return None, "SCANBOOK_MISSING"
+    age = now - book.generated_at
+    if age > manager.refusal_policy.max_nomination_age:
+        report.refusal_codes.append("SCANBOOK_STALE")
+        report.blockers.append(
+            f"the scanbook for {today.isoformat()} is {age} old, past the "
+            f"{manager.refusal_policy.max_nomination_age} nomination age; "
+            "the --symbol path is the fallback"
+        )
+        return None, "SCANBOOK_STALE"
+    return book, "OK"
+
+
+def _logical_entry_pass(
+    *,
+    manager: Any,
+    scan_writer: Any,
+    scanbook_root: Path | None,
+    broker: Any,
+    live_regime: bool,
+    resolved_regime: VolatilityRegimePolicy,
+    strike_window: int,
+    configuration_version: str,
+    enforce_iv_rank: bool,
+    max_pending_entries: int,
+    today: dt.date,
+    corridor: dict[str, Any],
+) -> bool:
+    """One pass of the logical-entry workflow (contract section 3, as landed).
+
+    Order is binding: **service pending entries first** (a pass that claimed
+    before servicing could strand an approved-and-waiting entry behind a
+    fresh review forever), then claim at most ONE new nomination from a fresh
+    ScanBook, under the caps -- at most ``max_pending_entries`` entries
+    pending verification, at most one transmission-and-walk per pass, one
+    entry per underlying (the manager's own claim invariant).
+
+    Returns ``True`` when entry consideration is handled here; ``False``
+    sends ``run_once`` to the legacy ``--symbol`` flow -- only for a
+    missing/stale book with an idle manager (no active entries), because a
+    fallback filed beside pending entries would mint the per-pass fresh-id
+    reviews the LogicalEntry exists to end.
+    """
+    ib = corridor["ib"]
+    report: RunReport = corridor["report"]
+    market_data = corridor["market_data"]
+    portfolio = corridor["portfolio"]
+    store: PositionStore = corridor["store"]
+    policy: RiskPolicy = corridor["policy"]
+    gate: SafetyGate = corridor["gate"]
+    now: dt.datetime = corridor["now"]
+    minimum_iv_rank: Decimal = corridor["minimum_iv_rank"]
+
+    def mark_superseded(entry: Any, reason: str) -> None:
+        """Retire the entry's claimed ScanBook row, when a writer is wired.
+        Best-effort bookkeeping: the entry's own ledger is authoritative."""
+        if scan_writer is None:
+            return
+        try:
+            scan_writer.mark_superseded(
+                entry.normalized_underlying, reason=reason, at=now
+            )
+        except Exception as exc:  # noqa: BLE001 - bookkeeping, never the workflow
+            report.errors.append(
+                f"scanbook row for {entry.normalized_underlying} could not be "
+                f"superseded: {type(exc).__name__}: {exc}"
+            )
+
+    def service_entry(entry: Any) -> str:
+        """Rebuild, revalidate and service one ACTIVE entry via the corridor."""
+        symbol = entry.normalized_underlying
+        label = f"logical entry {entry.logical_entry_id} ({symbol})"
+
+        # Regime re-runs per serviced entry: the packet evidence states the
+        # tier, and in live mode the tier gates and scales exactly as it does
+        # for a fresh claim. A refusal skips the entry for THIS pass only --
+        # the market may re-admit it before the review expires.
+        underlying_contract, _metric = _regime_for(
+            ib, symbol, resolved_regime=resolved_regime, now=now, report=report
+        )
+        if underlying_contract is None:
+            return "blocked"
+        effective_policy = policy
+        if live_regime:
+            if report.regime is not None and not report.regime.permits_entry:
+                report.blockers.append(
+                    f"{label}: volatility regime: {report.regime.reasons[0]}"
+                )
+                report.refusal_codes.append(report.regime.refusal_code)
+                return "blocked"
+            if report.regime is not None:
+                effective_policy = dataclasses.replace(
+                    policy,
+                    risk_budget_per_position=(
+                        policy.risk_budget_per_position * report.regime.allocation
+                    ),
+                )
+
+        candidate, snapshot = _intent_from_pinned_legs(
+            legs=entry.legs,
+            strategy_family=entry.strategy_family,
+            strategy_id=entry.logical_entry_id,
+            expiration=entry.expiration,
+            market_data=market_data,
+            symbol=symbol,
+            policy=effective_policy,
+            configuration_version=configuration_version,
+            now=now,
+            report=report,
+            label=label,
+        )
+        report.candidate = candidate
+        if candidate is None:
+            return "blocked"
+
+        right = str(entry.legs[0].right.value)
+        quoted_window = _quoted_window_for(
+            ib,
+            broker,
+            symbol,
+            expiration=entry.expiration,
+            right=right,
+            strike_window=strike_window,
+        )
+
+        def review(packet: VerificationPacket) -> bool:
+            result = manager.service(entry, packet, now=now)
+            outcome = result.outcome
+            if outcome in (
+                ServiceOutcome.APPROVED,
+                ServiceOutcome.ALREADY_APPROVED,
+            ):
+                # Proceed to authorize_open, whose own require() re-finds the
+                # same answer through the gate's digest-keyed idempotency and
+                # whose arm gate still applies. The post-approval governor
+                # re-check already ran: it IS this corridor's binding pass.
+                return True
+            if outcome in (
+                ServiceOutcome.FILED,
+                ServiceOutcome.WAITING,
+                ServiceOutcome.SUPERSEDED,
+                ServiceOutcome.REFILED,
+            ):
+                if outcome in (ServiceOutcome.SUPERSEDED, ServiceOutcome.REFILED):
+                    mark_superseded(
+                        entry,
+                        f"revision {result.entry.proposal_revision} supersedes "
+                        f"the nominated structure's reviewed facts",
+                    )
+                report.verification = VerificationState.AWAITING_VERIFICATION
+                report.verification_request = result.request_id
+                report.blockers.append(
+                    f"{label}: {outcome.value} revision "
+                    f"{result.entry.proposal_revision}; awaiting verification"
+                )
+                report.refusal_codes.append("OPTIONS_AWAITING_VERIFICATION")
+                return False
+            if outcome is ServiceOutcome.UNAVAILABLE:
+                report.verification = VerificationState.UNAVAILABLE
+                report.blockers.append(
+                    f"{label}: the reviewer answered UNAVAILABLE; the entry "
+                    "keeps waiting under its review TTL"
+                )
+                return False
+            if outcome in (
+                ServiceOutcome.REFUSED,
+                ServiceOutcome.REFUSED_TERMINAL,
+            ):
+                report.verification = VerificationState.REFUSED
+                report.blockers.append(
+                    f"{label}: {outcome.value} "
+                    f"(refusal {result.entry.refusal_count})"
+                )
+                return False
+            # COOLING, REFUSAL_STANDS, EXPIRED, ABANDONED
+            report.blockers.append(f"{label}: {outcome.value}")
+            return False
+
+        return _authorize_and_transmit_entry(
+            candidate=candidate,
+            snapshot=snapshot,
+            snapshot_state=None,
+            quoted_window=quoted_window,
+            reservations=lambda: manager.reservations(),
+            review=review,
+            before_transmit=lambda: manager.record_physical_attempt(entry, now=now),
+            after_transmit=lambda filled, detail: (
+                None
+                if filled is None
+                else manager.record_physical_outcome(
+                    entry, filled=filled, detail=detail, now=now
+                )
+            ),
+            **corridor,
+        )
+
+    def claim_one(book: ScanBook) -> Any | None:
+        """Claim at most one nomination, behind the caps and the cheap gates."""
+        pending = [
+            e for e in manager.store.active() if e.state in _PENDING_STATES
+        ]
+        if len(pending) >= max_pending_entries:
+            report.refusal_codes.append("OPTIONS_LOGICAL_PENDING_CAP")
+            report.blockers.append(
+                f"{len(pending)} logical entries already pending verification "
+                f"(cap {max_pending_entries}); no new nomination is claimed"
+            )
+            return None
+        for row in book.candidates():
+            symbol = row.symbol.strip().upper()
+            nomination_row = row.nomination
+            if nomination_row is None:  # pragma: no cover - CANDIDATE carries one
+                continue
+            if symbol not in gate.config.symbol_allowlist:
+                continue
+            if manager.store.active_for(symbol) is not None:
+                # One entry per underlying: the holder was serviced above.
+                continue
+
+            underlying_contract, _metric = _regime_for(
+                ib, symbol, resolved_regime=resolved_regime, now=now, report=report
+            )
+            if underlying_contract is None:
+                continue
+            effective_policy = policy
+            if live_regime:
+                if report.regime is not None and not report.regime.permits_entry:
+                    report.blockers.append(
+                        f"claim {symbol}: volatility regime: "
+                        f"{report.regime.reasons[0]}"
+                    )
+                    report.refusal_codes.append(report.regime.refusal_code)
+                    continue
+                if report.regime is not None:
+                    effective_policy = dataclasses.replace(
+                        policy,
+                        risk_budget_per_position=(
+                            policy.risk_budget_per_position
+                            * report.regime.allocation
+                        ),
+                    )
+            # The IV-rank wall: claim path only, shadow mode only -- exactly
+            # the --symbol path's semantics.
+            if not live_regime and (
+                report.iv_rank is None
+                or not report.iv_rank.meets(minimum_iv_rank)
+            ):
+                actual = (
+                    report.iv_rank.iv_rank
+                    if report.iv_rank and report.iv_rank.iv_rank is not None
+                    else "unavailable"
+                )
+                if enforce_iv_rank:
+                    report.blockers.append(
+                        f"claim {symbol}: IV Rank {actual} is below the "
+                        f"{minimum_iv_rank} entry filter"
+                    )
+                    continue
+                report.refusal_codes.append("OPTIONS_IV_RANK_FILTER_BYPASSED")
+
+            # Re-qualify the nominated con_ids into full legs (contract
+            # section 9.1's bridge): the nomination carries identity only,
+            # and multiplier/exchange/trading_class come from qualification,
+            # never from assumption.
+            right = nomination_row.legs[0].right.strip().upper()[:1]
+            qualified = {
+                q.con_id: q
+                for q in qualify_strikes(
+                    ib,
+                    symbol,
+                    nomination_row.expiration.strftime("%Y%m%d"),
+                    [leg.strike for leg in nomination_row.legs],
+                    right,
+                )
+            }
+            legs: list[OptionLegIntent] = []
+            for nominated in nomination_row.legs:
+                contract = qualified.get(nominated.con_id)
+                if contract is None:
+                    report.blockers.append(
+                        f"claim {symbol}: nominated leg {nominated.con_id} did "
+                        "not re-qualify; the structure the scan described no "
+                        "longer exists as described"
+                    )
+                    legs = []
+                    break
+                legs.append(
+                    OptionLegIntent(
+                        con_id=contract.con_id,
+                        symbol=contract.symbol,
+                        expiration=contract.expiration,
+                        strike=contract.strike,
+                        right=OptionRight(str(contract.right).strip().upper()[:1]),
+                        action=OrderAction(nominated.action),
+                        ratio=1,
+                        multiplier=contract.multiplier,
+                        exchange=contract.exchange,
+                        trading_class=contract.trading_class,
+                    )
+                )
+            if not legs:
+                continue
+
+            family = StrategyType(nomination_row.family)
+            provisional, snapshot = _intent_from_pinned_legs(
+                legs=tuple(legs),
+                strategy_family=family,
+                strategy_id=uuid4(),  # priced/margined only; never filed
+                expiration=nomination_row.expiration,
+                market_data=market_data,
+                symbol=symbol,
+                policy=effective_policy,
+                configuration_version=configuration_version,
+                now=now,
+                report=report,
+                label=f"claim {symbol}",
+            )
+            if provisional is None:
+                continue
+            margin = IBKRWhatIfAdapter(ib).what_if(provisional, observed_at=now)
+
+            # The cheap first risk/governor pass, claim path only: a refusal
+            # here means no reservation is taken and no review is ever filed.
+            # Reservations of the already-pending entries are folded in, which
+            # is what makes a fourth claim refusable on portfolio grounds.
+            snapshot_state: PortfolioSnapshot | None = None
+            if portfolio is not None:
+                try:
+                    fresh = portfolio.snapshot(as_of=now)
+                    snapshot_state = PortfolioSnapshot(
+                        as_of=fresh.as_of,
+                        net_liquidation=fresh.net_liquidation,
+                        positions=_fold_reservations(
+                            store.exposures(), manager.reservations()
+                        ),
+                        reported_buying_power_reserved=(
+                            fresh.reported_buying_power_reserved
+                        ),
+                    )
+                except Exception as exc:  # noqa: BLE001 - adapter boundary
+                    report.errors.append(
+                        f"portfolio unavailable: {type(exc).__name__}: {exc}"
+                    )
+            report.portfolio = snapshot_state
+            report.candidate = provisional
+            report.risk = assess_candidate(
+                provisional,
+                policy=policy,
+                quotes=snapshot,
+                margin=margin,
+                underlying_price=(
+                    snapshot.underlying.mid if snapshot is not None else None
+                ),
+                net_liquidation=(
+                    snapshot_state.net_liquidation if snapshot_state else None
+                ),
+                evaluated_at=now,
+                quoted_window=_quoted_window_for(
+                    ib,
+                    broker,
+                    symbol,
+                    expiration=nomination_row.expiration,
+                    right=right,
+                    strike_window=strike_window,
+                ),
+            )
+            report.governor = PortfolioGovernor(policy).evaluate(
+                provisional,
+                snapshot=snapshot_state,
+                margin=margin,
+                decision_time=now,
+            )
+            if not (report.risk.approved and report.governor.approved):
+                report.refusal_codes.extend(report.risk.reason_codes)
+                report.refusal_codes.extend(report.governor.reason_codes)
+                for refusal in report.risk.refusals:
+                    report.blockers.append(f"claim {symbol} risk: {refusal.detail}")
+                for refusal in report.governor.refusals:
+                    report.blockers.append(
+                        f"claim {symbol} governor: {refusal.detail}"
+                    )
+                return None
+
+            reservation_amount = (
+                margin.initial_margin_change
+                if margin is not None and margin.initial_margin_change is not None
+                else provisional.total_maximum_loss
+            )
+            try:
+                entry = manager.claim(
+                    EntryNomination(
+                        underlying=symbol,
+                        strategy_family=family,
+                        direction=nomination_row.direction,
+                        expiration=nomination_row.expiration,
+                        legs=tuple(legs),
+                        reservation_amount=reservation_amount,
+                        nominated_at=row.evaluated_at,
+                    ),
+                    now=now,
+                )
+            except StaleNominationError as exc:
+                report.blockers.append(f"claim {symbol}: {exc.message}")
+                report.refusal_codes.append("OPTIONS_NOMINATION_STALE")
+                return None
+            if scan_writer is not None:
+                try:
+                    scan_writer.mark_claimed(
+                        symbol, entry_id=entry.logical_entry_id, at=now
+                    )
+                except Exception as exc:  # noqa: BLE001 - bookkeeping only
+                    report.errors.append(
+                        f"scanbook row {symbol} could not be marked claimed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+            return entry
+        return None
+
+    # -- (a) service pending entries FIRST, oldest first ------------------
+    transmitted = False
+    for entry in manager.store.active():
+        if entry.state is LogicalEntryState.EXECUTING:
+            report.blockers.append(
+                f"logical entry {entry.logical_entry_id} "
+                f"({entry.normalized_underlying}) has a working physical "
+                "order; reconciliation owns it"
+            )
+            continue
+        status = service_entry(entry)
+        if status in _TRANSMITTING_STATUSES:
+            transmitted = True
+            break  # <= 1 transmission + walk per pass
+
+    # -- (b) then claim at most one new nomination -------------------------
+    book_status = "OK"
+    if not transmitted:
+        book, book_status = _load_scanbook(
+            scanbook_root, today=today, now=now, manager=manager, report=report
+        )
+        if book is not None:
+            claimed = claim_one(book)
+            if claimed is not None:
+                service_entry(claimed)
+
+    if book_status in ("SCANBOOK_MISSING", "SCANBOOK_STALE"):
+        # Fall back to the --symbol flow only when the manager is idle: a
+        # fallback beside pending entries would file per-pass fresh-id
+        # reviews -- the exact orphaning defect the LogicalEntry removes.
+        return transmitted or bool(manager.store.active())
+    return True
+
+
 def run_once(
     broker: Any,
     *,
@@ -1089,6 +2185,21 @@ def run_once(
     reprice: RepriceLadder | None = DEFAULT_LADDER,
     verifier: VerifierGate | None = None,
     approval_context: ApprovalContext | None = None,
+    #: The logical-entry manager (M4). ``None`` keeps the pre-integration
+    #: single-shot behaviour byte for byte. With one wired, pending logical
+    #: entries are serviced FIRST each pass, then at most one new nomination
+    #: is claimed from the session's ScanBook; the ``--symbol`` flow becomes
+    #: the fallback for a missing or stale book.
+    manager: Any = None,
+    #: Where ``ScanBook.read`` looks (the engine state dir). ``None`` with a
+    #: manager wired reads as SCANBOOK_MISSING and falls back.
+    scanbook_root: Path | None = None,
+    #: The claim-writer seam over the persisted book. Defaults to a
+    #: ``ScanBookFileWriter`` over ``scanbook_root``; injectable for tests.
+    scanbook_writer: Any = None,
+    #: At most this many logical entries may sit pending verification before
+    #: the pass stops claiming new nominations (contract section 3(b)).
+    max_pending_entries: int = 3,
 ) -> RunReport:
     """Reconcile, manage every open position, then consider one new entry.
 
@@ -1165,6 +2276,18 @@ def run_once(
                 report=report,
             )
 
+        # -- 2b. logical-entry hygiene sweep (M4) ---------------------------
+        # At pass start, before any entry consideration and under EVERY
+        # reconciliation outcome: the sweep only applies the named policy
+        # bounds -- expiring overdue reviews, abandoning stale claims -- and
+        # every ending releases its reservation and closes its request. It
+        # opens nothing, so the entry gates below do not apply to it.
+        if manager is not None:
+            for swept in manager.sweep(now=now):
+                report.blockers.append(
+                    f"logical entry {swept.outcome.value}: {swept.entry.describe()}"
+                )
+
         # -- 3. entry ------------------------------------------------------
         # An order whose outcome is unknown may be resting in the book. Opening
         # another on top of it is how one intended position becomes two, so this
@@ -1200,20 +2323,65 @@ def run_once(
         )
         resolved_regime = regime_policy or VolatilityRegimePolicy.from_env()
 
-        underlying_contract = _qualify_underlying(ib, symbol, report)
+        # Everything the corridor needs that is common to every caller in
+        # this pass. One dict, so the manager path and the --symbol path
+        # cannot drift apart one keyword at a time.
+        corridor_common: dict[str, Any] = dict(
+            ib=ib,
+            market_data=market_data,
+            portfolio=portfolio,
+            store=store,
+            policy=policy,
+            gate=gate,
+            journal=journal,
+            recorder=recorder,
+            armed=armed,
+            account=account,
+            now=now,
+            pinned_clock=pinned_clock,
+            verifier=verifier,
+            approval_context=approval_context,
+            minimum_iv_rank=minimum_iv_rank,
+            entry_preflight=entry_preflight,
+            reprice=reprice,
+            report=report,
+        )
+
+        # -- M4: service pending logical entries FIRST, then claim at most
+        # one new nomination from the session's ScanBook. The --symbol flow
+        # below remains the operator's single-shot tool and the fallback for
+        # a missing or stale book (contract sections 3 and 9.3).
+        if manager is not None:
+            handled = _logical_entry_pass(
+                manager=manager,
+                scan_writer=(
+                    scanbook_writer
+                    if scanbook_writer is not None
+                    else (
+                        ScanBookFileWriter(Path(scanbook_root), today)
+                        if scanbook_root is not None
+                        else None
+                    )
+                ),
+                scanbook_root=scanbook_root,
+                broker=broker,
+                live_regime=live_regime,
+                resolved_regime=resolved_regime,
+                strike_window=strike_window,
+                configuration_version=configuration_version,
+                enforce_iv_rank=enforce_iv_rank,
+                max_pending_entries=max_pending_entries,
+                today=today,
+                corridor=corridor_common,
+            )
+            if handled:
+                return report
+
+        underlying_contract, iv_metric = _regime_for(
+            ib, symbol, resolved_regime=resolved_regime, now=now, report=report
+        )
         if underlying_contract is None:
             return report
-        iv_metric = _iv_metric_for(ib, underlying_contract, symbol, now=now)
-        report.iv_rank = iv_metric
-        report.regime = classify(
-            VolatilityAssessment(
-                symbol=symbol,
-                iv_rank=iv_metric.iv_rank if iv_metric.is_usable else None,
-                iv_percentile=iv_metric.iv_percentile,
-                current_iv=iv_metric.current_iv,
-            ),
-            resolved_regime,
-        )
 
         effective_policy = policy
         if live_regime:
@@ -1284,10 +2452,16 @@ def run_once(
         if snapshot_state is not None:
             # The governor's concentration buckets are only meaningful once the
             # engine's own open structures are in them. This is what closes G1.
+            # Pending logical-entry reservations are folded in beside them
+            # (contract section 4), deduped by logical_entry_id.
             snapshot_state = PortfolioSnapshot(
                 as_of=snapshot_state.as_of,
                 net_liquidation=snapshot_state.net_liquidation,
-                positions=store.exposures(),
+                positions=_fold_reservations(
+                    store.exposures(),
+                    manager.reservations() if manager is not None else (),
+                    exclude=candidate.strategy_id,
+                ),
                 reported_buying_power_reserved=snapshot_state.reported_buying_power_reserved,
             )
         report.portfolio = snapshot_state
@@ -1319,9 +2493,13 @@ def run_once(
             return report
 
         # -- 3b. the caller's own last word --------------------------------
-        # After every engine gate, before the token exists. A refusal here means
-        # no TransmitAuthorization is ever minted for this candidate, rather than
-        # one being minted and then not used.
+        # Runs here, on the historical surface, BEFORE the verifier-required
+        # check below -- the 3b -> 4 ordering the execution proof depends on
+        # (an exploding preflight must refuse with its own code even on a
+        # pass with no reviewer). The corridor also honours a preflight for
+        # callers that hand it one; this path hands it None below precisely
+        # because it has already run -- a preflight may be budget-counted
+        # (the proof's is) and must fire exactly once per pass.
         if entry_preflight is not None:
             try:
                 refusal = entry_preflight(
@@ -1339,11 +2517,13 @@ def run_once(
                 report.refusal_codes.append("OPTIONS_ENTRY_PREFLIGHT_REFUSED")
                 return report
 
-        # -- 4. propose to the reviewer, authorize, transmit ----------------
-        # The verifier is required for an entry and optional for the pass: a
-        # run that only reconciles and manages must not need a reviewer, and a
-        # run that wants to *open* must not proceed without one. Fail-closed, so
-        # the missing-verifier case blocks rather than defaults to permitted.
+        # -- 4. verifier required. The corridor re-runs this same fail-closed
+        # check for every caller; this early copy keeps the refusal on the
+        # pass surface where it has always lived -- strictly AFTER
+        # reconciliation, management and the caller preflight (the ordering
+        # pinned by test_options_verifier_gate.py and the execution proof:
+        # a pass with no reviewer must still reconcile and manage, refusing
+        # only the entry), recorded as a blocker and never raised.
         if verifier is None or approval_context is None:
             report.blockers.append(
                 "entry refused: no independent verifier gate is configured for this "
@@ -1352,221 +2532,20 @@ def run_once(
             report.refusal_codes.append("OPTIONS_VERIFIER_NOT_CONFIGURED")
             return report
 
-        # -- 3c. binding revalidation (2026-08-01 audit) ---------------------
-        # A candidate may have been nominated from cached discovery, and even
-        # a same-pass build can be minutes old after slow management or a
-        # working-order walk. Immediately before the packet Grok reviews --
-        # and therefore immediately before authorize_open, which follows in
-        # the same breath and re-derives the spec digest from these same
-        # objects -- every binding fact is re-established from the market as
-        # it is NOW: fresh selected-leg quotes with a two-sided book demanded,
-        # fresh what-if margin, fresh portfolio snapshot, fresh risk and
-        # governor verdicts. Anything that moved moves the digest with it, so
-        # an already-reviewed packet stops matching and needs a new review --
-        # the invalidation rule working, not failing.
-        binding_now = (
-            now if pinned_clock
-            else dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
-        )
-        binding_quotes = _quotes_for(
-            market_data,
-            symbol=symbol,
-            con_ids=[leg.con_id for leg in candidate.legs],
-            report=report,
-            label="binding revalidation",
-            require_two_sided=True,
-        )
-        if binding_quotes is None:
-            report.blockers.append(
-                "binding revalidation: the selected legs could not be re-quoted, "
-                "so no packet may bind them"
-            )
-            report.refusal_codes.append("OPTIONS_BINDING_UNQUOTABLE")
-            return report
-        margin = IBKRWhatIfAdapter(ib).what_if(candidate, observed_at=binding_now)
-        if portfolio is not None:
-            try:
-                fresh_state = portfolio.snapshot(as_of=binding_now)
-                snapshot_state = PortfolioSnapshot(
-                    as_of=fresh_state.as_of,
-                    net_liquidation=fresh_state.net_liquidation,
-                    positions=store.exposures(),
-                    reported_buying_power_reserved=(
-                        fresh_state.reported_buying_power_reserved
-                    ),
-                )
-                report.portfolio = snapshot_state
-            except Exception as exc:  # noqa: BLE001 - adapter boundary
-                report.blockers.append(
-                    f"binding revalidation: portfolio unavailable: "
-                    f"{type(exc).__name__}: {exc}"
-                )
-                report.refusal_codes.append("OPTIONS_BINDING_UNQUOTABLE")
-                return report
-        report.risk = assess_candidate(
-            candidate,
-            policy=policy,
-            quotes=binding_quotes,
-            margin=margin,
-            underlying_price=binding_quotes.underlying.mid,
-            net_liquidation=(
-                snapshot_state.net_liquidation if snapshot_state else None
+        # -- 3c -> authorize -> transmit: THE corridor. Verifier fail-closed
+        # (re-checked), binding revalidation, packet, authorize_open,
+        # record-before-send, place, ladder -- one shared span for every
+        # caller (contract section 3's extraction). entry_preflight is None
+        # here because 3b already ran above, exactly once.
+        _authorize_and_transmit_entry(
+            candidate=candidate,
+            snapshot=snapshot,
+            snapshot_state=snapshot_state,
+            reservations=(
+                (lambda: manager.reservations()) if manager is not None else None
             ),
-            evaluated_at=binding_now,
-            quoted_window=len(snapshot.legs) if snapshot is not None else None,
+            **{**corridor_common, "entry_preflight": None},
         )
-        report.governor = PortfolioGovernor(policy).evaluate(
-            candidate,
-            snapshot=snapshot_state,
-            margin=margin,
-            decision_time=binding_now,
-        )
-        binding_refusals = [
-            *(f"binding risk: {r.detail}" for r in report.risk.refusals),
-            *(f"binding governor: {r.detail}" for r in report.governor.refusals),
-        ]
-        if binding_refusals:
-            report.blockers.extend(binding_refusals)
-            report.refusal_codes.extend(report.risk.reason_codes)
-            report.refusal_codes.extend(report.governor.reason_codes)
-            return report
-
-        packet = packet_for(
-            candidate,
-            structure_digest=structure_digest(candidate),
-            risk=report.risk,
-            governor=report.governor,
-            context=approval_context,
-            order_type=COMBO_ORDER_TYPE,
-            time_in_force=COMBO_TIME_IN_FORCE,
-            now=binding_now,
-            evidence=_entry_evidence(
-                report,
-                margin=margin,
-                snapshot=binding_quotes,
-                intent=candidate,
-                minimum_iv_rank=minimum_iv_rank,
-            ),
-        )
-
-        try:
-            authorization = authorize_open(
-                candidate,
-                gate=gate,
-                risk=report.risk,
-                governor=report.governor,
-                armed=armed,
-                now=now,
-                verifier=verifier,
-                packet=packet,
-            )
-        except AwaitingVerification as exc:
-            # Not a refusal of the candidate -- a statement that the answer has
-            # not arrived. Recorded and returned, never waited on: everything
-            # else this pass did (reconciliation, management, exits) already
-            # happened above, and the next pass picks the answer up.
-            report.verification = VerificationState.AWAITING_VERIFICATION
-            report.verification_request = exc.request_id
-            report.blockers.append(f"entry awaiting verification: {exc.message}")
-            report.refusal_codes.append("OPTIONS_AWAITING_VERIFICATION")
-            return report
-        except RefusedError as exc:
-            report.verification = VerificationState.REFUSED
-            report.blockers.append(f"entry refused: {exc.message}")
-            return report
-        report.verification = VerificationState.CONSUMED
-
-        bpr = (
-            margin.initial_margin_change
-            if margin.initial_margin_change is not None
-            else ZERO
-        )
-        # Recorded BEFORE the send. A crash after this leaves an OPENING record
-        # the reconciler can resolve; the reverse leaves a live spread nothing
-        # knows about.
-        store.record_open_submitted(candidate, at=now, buying_power_reserved=bpr)
-
-        try:
-            result = place_combo(
-                ib,
-                candidate,
-                authorization=authorization,
-                account=account,
-                sink=recorder,
-            )
-        except Exception as exc:  # noqa: BLE001 - a failed send must be recorded
-            store.record_open_failed(candidate.strategy_id, at=now, reason=str(exc))
-            report.errors.append(f"entry transmission failed: {exc}")
-            return report
-
-        report.transmissions.append(result)
-        journal.record("order_placed", **result.to_record())
-
-        # -- 5. work the order, if the broker took it and did not fill it ----
-        # Runs before the outcome is judged, because until the ladder has
-        # finished there is no final outcome to judge: an order still working
-        # is not an order whose result is known, and the previous code called
-        # that "unknown" and stopped -- leaving the order resting.
-        if reprice is not None and _still_working(result):
-            outcome = work_order(
-                ib,
-                candidate,
-                result,
-                authorization=authorization,
-                gate=gate,
-                armed=armed,
-                # The ladder reprices an OPEN, and a reprice is a new opening
-                # order under the invalidation rule. It gets the same verifier
-                # the entry did, so every rung is reviewed rather than riding on
-                # the approval that covered the first price.
-                verifier=verifier,
-                approval_context=approval_context,
-                # Both ends of the deadline come from the same clock. ``now``
-                # is the pass's *logical* time and may be injected -- measuring
-                # a two-minute wall-clock deadline from it made the ladder
-                # expire before its first rung whenever the two disagreed.
-                started_at=_wall_clock(),
-                clock=_wall_clock,
-                # A cancelled rung is a real OPEN_FAILED -- nothing is in the
-                # market -- and replaying that retires the position AND releases
-                # its buying-power reservation. So the replacement needs its own
-                # submission record, carrying the same reservation, written
-                # before it is sent, exactly as the first one was above.
-                # Without it the governor would size the next decision against a
-                # book that believes this capital is free while a real order
-                # rests in the market.
-                record_submission=lambda replacement: store.record_open_submitted(
-                    replacement,
-                    at=dt.datetime.now(dt.timezone.utc),
-                    buying_power_reserved=bpr,
-                ),
-                # And the order journal, because gate_daily_count() counts
-                # ``order_placed`` records. Every real transmission is one.
-                record_transmission=lambda sent: journal.record(
-                    "order_placed", **sent.to_record()
-                ),
-                ladder=reprice,
-                envelope=envelope_for(candidate),
-                account=account,
-                sink=recorder,
-            )
-            report.reprice = outcome
-            # A summary of the ladder, under its own event name. The individual
-            # sends were already journalled as ``order_placed`` by
-            # ``record_transmission`` above -- this must NOT be another one, or
-            # the daily count would double-count every rung.
-            journal.record("order_worked", **outcome.to_record())
-            if outcome.final is not None and outcome.final is not result:
-                # Only a *different* order is a second transmission. A ladder
-                # that refused before it sent anything hands back the same
-                # result it was given, and reporting that twice would make the
-                # pass look like it placed two orders.
-                report.transmissions.append(outcome.final)
-                result = outcome.final
-            if outcome.detail:
-                report.blockers.append(f"entry order worked: {outcome.describe()}")
-
-        _record_open_outcome(candidate.strategy_id, result, store=store, now=now, report=report)
 
     except EngineError:
         raise

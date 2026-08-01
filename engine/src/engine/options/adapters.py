@@ -104,6 +104,32 @@ NET_LIQUIDATION_TAG = "NetLiquidation"
 INITIAL_MARGIN_TAG = "FullInitMarginReq"
 
 
+def quote_priority(
+    *, require_two_sided: bool, per_call: Any = None, instance_default: Any = None
+) -> Any:
+    """Which pacing priority one ``strategy_quotes`` call draws at.
+
+    An **explicit per-call priority outranks the two-sided heuristic**. The
+    heuristic -- two-sided means a held structure's own legs, so spend at
+    ``EXITS_MANAGEMENT`` -- is only right for the management path. The runner's
+    binding revalidation also demands a two-sided book for a candidate that is
+    *not* held, and letting the heuristic win there would spend the 25%
+    management reserve at priority 1 on work the audit places at
+    ``AUTHORIZATION`` (docs/INTEGRATION-M3-M4.md section 6). The heuristic
+    stays as the default only for callers that state nothing.
+
+    Pure and module-level so the resolution order is pinned by a test rather
+    than living inline where a refactor could silently reorder it.
+    """
+    from .pacing import Priority  # noqa: PLC0415 - keeps import optional
+
+    if per_call is not None:
+        return per_call
+    if require_two_sided:
+        return Priority.EXITS_MANAGEMENT
+    return instance_default or Priority.CANDIDATE_CONSTRUCTION
+
+
 def _utcnow() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
@@ -344,6 +370,7 @@ class IBKRLiveMarketDataAdapter:
         underlying_symbol: str,
         con_ids: Sequence[int],
         require_two_sided: bool = False,
+        budget_priority: Any = None,
     ) -> StrategyQuoteSnapshot:
         from ib_async import Contract, Stock  # noqa: PLC0415 - optional dependency
 
@@ -353,12 +380,16 @@ class IBKRLiveMarketDataAdapter:
         subscribed_at = _utcnow()
 
         if self.budget is not None:
-            from .pacing import Priority, RequestKind  # noqa: PLC0415
+            from .pacing import RequestKind  # noqa: PLC0415
 
-            priority = (
-                Priority.EXITS_MANAGEMENT
-                if require_two_sided
-                else (self.budget_priority or Priority.CANDIDATE_CONSTRUCTION)
+            # Explicit per-call priority outranks the two-sided heuristic:
+            # binding revalidation demands two-sided for a candidate that is
+            # NOT held and must draw at AUTHORIZATION, not spend the
+            # management reserve. See quote_priority.
+            priority = quote_priority(
+                require_two_sided=require_two_sided,
+                per_call=budget_priority,
+                instance_default=self.budget_priority,
             )
             # One token per subscription line this call will open, acquired up
             # front: the underlying plus every leg. Acquiring before the first
