@@ -570,6 +570,7 @@ def cmd_options_run(args: argparse.Namespace, broker_factory: Any = Broker) -> i
             account=config.account_id,
             verifier=_verifier,
             approval_context=_context,
+            entry_preflight=_paper_day_preflight(config),
         )
 
     out(report.describe())
@@ -578,6 +579,19 @@ def cmd_options_run(args: argparse.Namespace, broker_factory: Any = Broker) -> i
     if not args.arm:
         note("dry run complete; nothing was transmitted. Pass --arm to trade.")
     return EXIT_OK
+
+
+def _paper_day_preflight(config: EngineConfig) -> Any:
+    """The session controller's entry gate, enforced at the runner seam.
+
+    Runs after risk and the governor and before a verification proposal is
+    filed, so a CLOSED gate stops proposals as well as orders. Management,
+    exits and cancels never pass through here -- ``run_once`` only consults the
+    preflight for entry candidates.
+    """
+    from .paperday import PaperDayPaths, entry_gate_preflight
+
+    return entry_gate_preflight(PaperDayPaths(state_dir=config.state_dir))
 
 
 
@@ -936,6 +950,7 @@ def cmd_options_verify_execution(
             account=config.account_id,
             verifier=_verifier,
             approval_context=_context,
+            entry_preflight=_paper_day_preflight(config),
         )
 
     out(report.describe())
