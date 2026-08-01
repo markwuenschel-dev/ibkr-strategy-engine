@@ -102,6 +102,8 @@ __all__ = [
     "transition",
     "claim_for_logical_entry",
     "supersede",
+    "PACING_ERROR_KINDS",
+    "penalize_on_broker_error",
     # named reason codes
     "REASON_PACING_DEFERRED",
     "REASON_REFRESH_NOT_REACHED",
@@ -141,6 +143,44 @@ REASON_EVENT_RISK = "UNIVERSE_EVENT_RISK"
 REASON_PHASE2_NOT_REACHED = "UNIVERSE_PHASE2_NOT_REACHED"
 
 ZERO = Decimal("0")
+
+# -- broker pacing errors ----------------------------------------------------
+#
+# The budget's local ledger is a prediction; the broker's error stream is the
+# verdict. When IBKR says we paced anyway, the budget's ``penalize`` halves the
+# refill and pauses discovery -- and this mapping is the one place that says
+# which error code penalizes which bucket.
+
+#: IBKR pacing error codes -> the request bucket each one meters. 162 is the
+#: historical-data pacing violation (the hard 60-per-600s ceiling); 100 is the
+#: general max-messages-per-second cap. Everything else is not a pacing signal.
+PACING_ERROR_KINDS: dict[int, RequestKind] = {
+    162: RequestKind.HISTORICAL,
+    100: RequestKind.GENERAL,
+}
+
+
+def penalize_on_broker_error(
+    budget: PacedRequestBudget, code: int
+) -> RequestKind | None:
+    """Feed one broker error into the pacing budget.
+
+    The injectable hook the CLI's ``options-universe-scan`` handler registers
+    on ``ib.errorEvent`` (the same pattern ``scan.run_scan`` uses for its error
+    collection): on a pacing code the matching bucket is penalized -- refill
+    halved, tokens dropped, discovery paused -- so the *rest of this pass*
+    defers instead of digging the hole deeper. Returns the penalized
+    :class:`~engine.options.pacing.RequestKind`, or ``None`` when the code is
+    not a pacing signal and nothing was penalized.
+    """
+    try:
+        kind = PACING_ERROR_KINDS.get(int(code))
+    except (TypeError, ValueError):
+        return None
+    if kind is None:
+        return None
+    budget.penalize(kind)
+    return kind
 
 
 class ScanState(str, Enum):

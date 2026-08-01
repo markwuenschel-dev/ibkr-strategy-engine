@@ -685,13 +685,13 @@ a `TransmitAuthorization`. New path #8 for the §5 table:
 budget, writes the ScanBook, and journals; its own note says "no handoff was
 filed and none can be from this path" `[verified in the cli diff]`.
 
-> **Missing guard:** `universe.py:11` claims "``tests/test_options_universe.py``
-> pins both facts against the AST" — **that file does not exist**; the tests
-> directory holds only `test_options_universe_support.py` and
-> `test_options_logical.py` `[verified by listing]`. The §5 source-level
-> guard (AST + grep, with the D5 caveat) must be written at merge, or the
-> docstring's claim corrected. This is the docstring-as-hypothesis failure
-> mode (LEDGER.md M9/D1) in miniature: a stated guarantee with no enforcer.
+> **Guard shipped:** `universe.py:11` claims "``tests/test_options_universe.py``
+> pins both facts against the AST" — that file now exists and does so:
+> `TestReadOnlyByConstruction.test_the_scanner_imports_no_intent_construction`
+> is the AST guard over the banned imports/names, and
+> `test_nominations_are_plain_records_not_intents` is the runtime half. The
+> earlier revision of this note flagged the guard as missing; it was written
+> before merge, so the docstring's claim has its enforcer.
 
 One fragility worth fixing at merge rather than living with:
 `service` classifies gate refusals by **substring match** on the error
@@ -740,6 +740,5 @@ heuristic conflict (§6) remains open for the wiring step.
 3. **Scanner produces data, never intents** (§1/§5, shipped as
    `StructureNomination` in `universe.py:198-291` with no authorization-
    surface imports): the universe scanner is *structurally* incapable of
-   opening risk — provided the missing AST/grep guard test named in §9.5 is
-   actually written, since `universe.py:11` currently cites a test file that
-   does not exist.
+   opening risk, and the AST guard named in §9.5
+   (`tests/test_options_universe.py::TestReadOnlyByConstruction`) enforces it.

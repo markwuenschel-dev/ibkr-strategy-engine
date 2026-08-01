@@ -101,6 +101,7 @@ from uuid import UUID, uuid4
 from ..errors import JournalError, RefusedError
 from .approval import (
     AwaitingVerification,
+    MAXIMUM_APPROVAL_LIFETIME,
     VerificationPacket,
     VerifierApproval,
     VerifierGate,
@@ -126,6 +127,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "ServiceOutcome",
     "ServiceResult",
+    "StaleNominationError",
 ]
 
 SCHEMA_VERSION = 1
@@ -195,6 +197,16 @@ class LogicalEvent(str, Enum):
     ENTRY_ABANDONED = "ENTRY_ABANDONED"
 
 
+class StaleNominationError(RefusedError):
+    """A nomination older than the policy's ``max_nomination_age`` at claim time.
+
+    A scan row nominated this morning describes this morning's market; claiming
+    it into a reservation hours later would reserve buying power against facts
+    nobody re-checked. A typed error, so the caller can distinguish "re-scan and
+    nominate again" from every other refusal.
+    """
+
+
 def _refuse(message: str, *, hint: str | None = None) -> None:
     raise RefusedError(message, hint=hint)
 
@@ -207,17 +219,36 @@ def _aware(value: Any, label: str) -> dt.datetime:
 
 @dataclass(frozen=True)
 class RefusalCooldownPolicy:
-    """The named policy for what a REFUSED review does to its entry.
+    """The named policy for what a REFUSED review does to its entry -- and, by
+    growth, the manager's whole hygiene policy: every discretionary age bound
+    the workflow applies lives here, in one reviewable place.
 
     ``cooldown`` is how long the entry sits in ``REFUSED_COOLDOWN`` before a
     new revision may be filed. ``terminal_after`` is how many refusals, in
     total, abandon the entry outright -- reaching it releases the reservation
     and ends the entry, because a reviewer refusing the same intention for the
     third time is answering the intention, not the revision.
+
+    The sweep bounds (:meth:`LogicalEntryManager.sweep`):
+
+    * ``claimed_max_age`` -- how long a CLAIMED entry may sit without filing a
+      review before the sweep abandons it and releases its reservation.
+      Defaults to the approval TTL: a claim older than the longest any review
+      could have lived was never going to file a fresh one.
+    * ``cooldown_max_age`` -- how long a REFUSED_COOLDOWN entry may wait for a
+      changed market before the sweep abandons it (default 24 hours). Without
+      it a refusal whose spec never changes holds its reservation forever.
+
+    ``max_nomination_age`` bounds how stale a nomination may be when
+    :meth:`LogicalEntryManager.claim` turns it into a reservation (default 30
+    minutes); older raises :class:`StaleNominationError`.
     """
 
     cooldown: dt.timedelta = dt.timedelta(minutes=30)
     terminal_after: int = 3
+    claimed_max_age: dt.timedelta = MAXIMUM_APPROVAL_LIFETIME
+    cooldown_max_age: dt.timedelta = dt.timedelta(hours=24)
+    max_nomination_age: dt.timedelta = dt.timedelta(minutes=30)
 
     def __post_init__(self) -> None:
         if not isinstance(self.cooldown, dt.timedelta) or self.cooldown < dt.timedelta(0):
@@ -226,6 +257,16 @@ class RefusalCooldownPolicy:
             raise ValueError("terminal_after must be an int")
         if self.terminal_after < 1:
             raise ValueError(f"terminal_after must be at least 1, got {self.terminal_after}")
+        for label in ("claimed_max_age", "cooldown_max_age", "max_nomination_age"):
+            value = getattr(self, label)
+            if not isinstance(value, dt.timedelta) or value <= dt.timedelta(0):
+                raise ValueError(f"{label} must be a positive timedelta, got {value!r}")
+        if self.cooldown_max_age < self.cooldown:
+            raise ValueError(
+                f"cooldown_max_age {self.cooldown_max_age} is shorter than the "
+                f"cooldown {self.cooldown} itself, which would sweep every "
+                "refused entry away before it could ever refile"
+            )
 
 
 DEFAULT_REFUSAL_POLICY = RefusalCooldownPolicy()
@@ -273,6 +314,12 @@ class EntryNomination:
     not to the identity. What is here is what makes two nominations the same
     intention -- the underlying, the structure family, the direction, the
     selected expiration and legs -- plus the buying power the entry reserves.
+
+    ``nominated_at`` is when the scan produced this nomination (a ScanBook
+    row's ``evaluated_at``). ``None`` means "minted at claim time" -- the
+    caller that nominates and claims in the same breath has nothing staler
+    than now to declare. When it is set, :meth:`LogicalEntryManager.claim`
+    enforces the policy's ``max_nomination_age`` against it.
     """
 
     underlying: str
@@ -281,8 +328,11 @@ class EntryNomination:
     expiration: dt.date
     legs: tuple[OptionLegIntent, ...]
     reservation_amount: Decimal
+    nominated_at: dt.datetime | None = None
 
     def __post_init__(self) -> None:
+        if self.nominated_at is not None:
+            _aware(self.nominated_at, "nominated_at")
         if not isinstance(self.underlying, str) or not self.underlying.strip():
             raise ValueError("a nomination must name its underlying")
         if not isinstance(self.strategy_family, StrategyType):
@@ -475,6 +525,18 @@ class LogicalEntryStore:
     a write that cannot be made durable raises :class:`~engine.errors.JournalError`
     and stops the workflow, because an identity that cannot be recorded must not
     file a review the next pass will not remember asking for.
+
+    **Single writer, stated as an assumption rather than discovered as a bug.**
+    Exactly one engine process appends to this log at a time -- the same
+    assumption :class:`~engine.options.positions.PositionStore` and the order
+    journal make, enforced operationally by the one-runner deployment rather
+    than by a file lock. It matters here specifically because
+    :meth:`LogicalEntryManager.claim` is check-then-append: two concurrent
+    writers could both pass the ``active_for`` check and append two ACTIVE
+    entries for one underlying, shadowing a reservation nothing can release.
+    ``entries`` therefore treats a second concurrent ACTIVE claim for an
+    underlying as an integrity error: the later entry is excluded from the
+    replayed book and the exclusion is recorded loudly, never absorbed.
     """
 
     FILENAME = "logical_entries.jsonl"
@@ -715,11 +777,37 @@ class LogicalEntryStore:
             if kind == LogicalEvent.ENTRY_CLAIMED.value:
                 try:
                     at = dt.datetime.fromisoformat(str(event.get("at")))
-                    book[entry_id] = LogicalEntry.from_claim_record(event, at=at)
+                    claimed = LogicalEntry.from_claim_record(event, at=at)
                 except (KeyError, ValueError, TypeError, InvalidOperation, RefusedError) as exc:
                     problems.append(
                         f"{entry_id}: unreadable ENTRY_CLAIMED ({type(exc).__name__}: {exc})"
                     )
+                    continue
+                # One ACTIVE entry per underlying is claim()'s invariant, held
+                # only under the single-writer assumption (class docstring). A
+                # log carrying a second concurrent ACTIVE claim is corrupt, and
+                # replaying it silently would put two entries -- and a
+                # reservation nothing can release -- in the book. The later
+                # claim is excluded and the exclusion recorded, loudly.
+                holder = next(
+                    (
+                        existing
+                        for existing in book.values()
+                        if existing.is_active
+                        and existing.normalized_underlying
+                        == claimed.normalized_underlying
+                    ),
+                    None,
+                )
+                if holder is not None:
+                    problems.append(
+                        f"{entry_id}: duplicate ACTIVE claim for "
+                        f"{claimed.normalized_underlying} while "
+                        f"{holder.logical_entry_id} holds it; the shadowed entry "
+                        f"{entry_id} is excluded from the replayed book"
+                    )
+                    continue
+                book[entry_id] = claimed
                 continue
 
             current = book.get(entry_id)
@@ -921,6 +1009,9 @@ class ServiceOutcome(str, Enum):
     COOLING = "COOLING"
     REFUSAL_STANDS = "REFUSAL_STANDS"
     REFILED = "REFILED"
+    #: Produced only by :meth:`LogicalEntryManager.sweep`: the entry outlived a
+    #: named hygiene bound and was abandoned with its reservation released.
+    ABANDONED = "ABANDONED"
 
 
 @dataclass(frozen=True)
@@ -1002,6 +1093,23 @@ class LogicalEntryManager:
                 at=at,
             )
 
+    def _withdraw_request(self, request_id: str, *, note: str) -> None:
+        """Close the builder's own review request when the question is retired.
+
+        Routed through the gate's ``withdraw`` when the gate offers one
+        (:meth:`engine.options.approval.CollabVerifierGate.withdraw`); the
+        :class:`~engine.options.approval.VerifierGate` protocol itself does not
+        require a closer, so a gate without one simply leaves the request to
+        its own lifecycle -- the capability probe is explicit here rather than
+        hidden in a try/except.
+        """
+        if not request_id:
+            return
+        withdraw = getattr(self.gate, "withdraw", None)
+        if withdraw is None:
+            return
+        withdraw(request_id, note=note)
+
     def _file_revision(
         self, entry: LogicalEntry, packet: VerificationPacket, *, revision: int, now: dt.datetime
     ) -> str:
@@ -1032,6 +1140,11 @@ class LogicalEntryManager:
         underlying: while an ACTIVE entry holds the underlying, a second
         nomination returns that entry and creates nothing.
 
+        A nomination that declares its ``nominated_at`` is refused with
+        :class:`StaleNominationError` once it is older than the policy's
+        ``max_nomination_age``: it describes a market nobody has re-checked,
+        and the fix is a fresh scan, not a fresh reservation.
+
         The entry -- identity, reservation and all -- is persisted **before**
         any review request can be filed for it (step 2 of the contract).
         """
@@ -1039,6 +1152,17 @@ class LogicalEntryManager:
         existing = self.store.active_for(nomination.underlying)
         if existing is not None:
             return existing
+
+        if nomination.nominated_at is not None:
+            age = at - nomination.nominated_at
+            if age > self.refusal_policy.max_nomination_age:
+                raise StaleNominationError(
+                    f"the nomination for {nomination.underlying.strip().upper()} is "
+                    f"{age} old, past the {self.refusal_policy.max_nomination_age} "
+                    "maximum nomination age",
+                    hint="a stale nomination describes a market nobody re-checked; "
+                    "re-scan and nominate again rather than claiming old facts",
+                )
 
         entry = LogicalEntry(
             logical_entry_id=uuid4(),
@@ -1053,6 +1177,15 @@ class LogicalEntryManager:
             reservation_id=uuid4(),
             reservation_amount=nomination.reservation_amount,
         )
+        # Re-check immediately before the append. claim() is check-then-append
+        # and safe only under the store's single-writer assumption; the
+        # re-check narrows the window in which a concurrent claimer -- or a
+        # caller re-entering through a stale first read -- could append a
+        # second ACTIVE entry for the underlying, which replay would then have
+        # to quarantine as an integrity error.
+        raced = self.store.active_for(nomination.underlying)
+        if raced is not None:
+            return raced
         self.store.record_claimed(entry, at=at)
         return entry
 
@@ -1119,19 +1252,7 @@ class LogicalEntryManager:
         # refused by the gate as expired anyway, and the reservation must not
         # outlive the review it was reserved for.
         if entry.review_expires_at is not None and at >= entry.review_expires_at:
-            # Release BEFORE the expiry event: LogicalEntry refuses a terminal
-            # state that still holds a reservation, so replay depends on this
-            # order -- which is exactly the leak-proofing working as designed.
-            self._release_reservation(entry, reason="review expired unanswered", at=at)
-            self.store.record_review_expired(
-                entry.logical_entry_id,
-                revision=entry.proposal_revision,
-                handoff_id=entry.current_handoff_id,
-                at=at,
-            )
-            return ServiceResult(
-                ServiceOutcome.EXPIRED, self._reload(entry.logical_entry_id)
-            )
+            return self._expire(entry, at)
 
         # -- a changed digest is a different order. The old approval, if one
         # exists, is deliberately never touched: not required, not consumed.
@@ -1171,6 +1292,27 @@ class LogicalEntryManager:
             request_id=entry.current_handoff_id,
         )
 
+    def _expire(self, entry: LogicalEntry, at: dt.datetime) -> ServiceResult:
+        """Expire an AWAITING_REVIEW entry whose review outlived its TTL."""
+        # Release BEFORE the expiry event: LogicalEntry refuses a terminal
+        # state that still holds a reservation, so replay depends on this
+        # order -- which is exactly the leak-proofing working as designed.
+        self._release_reservation(entry, reason="review expired unanswered", at=at)
+        self.store.record_review_expired(
+            entry.logical_entry_id,
+            revision=entry.proposal_revision,
+            handoff_id=entry.current_handoff_id,
+            at=at,
+        )
+        self._withdraw_request(
+            entry.current_handoff_id,
+            note=f"EXPIRED: logical entry {entry.logical_entry_id} revision "
+            f"{entry.proposal_revision}: review expired unanswered",
+        )
+        return ServiceResult(
+            ServiceOutcome.EXPIRED, self._reload(entry.logical_entry_id)
+        )
+
     def _supersede(
         self,
         entry: LogicalEntry,
@@ -1183,7 +1325,9 @@ class LogicalEntryManager:
 
         The entry keeps its id; the revision increments; the prior revision's
         approval (if any) is left unconsumed on disk, where the gate's digest
-        binding already makes it worthless against the new revision.
+        binding already makes it worthless against the new revision. The
+        retired revision's *request* is closed through the gate so the
+        reviewer's queue never accumulates questions nothing will act on.
         """
         self.store.record_revision_superseded(
             entry.logical_entry_id,
@@ -1191,6 +1335,12 @@ class LogicalEntryManager:
             handoff_id=entry.current_handoff_id,
             reason=reason,
             at=at,
+        )
+        self._withdraw_request(
+            entry.current_handoff_id,
+            note=f"SUPERSEDED: logical entry {entry.logical_entry_id} revision "
+            f"{entry.proposal_revision} retired ({reason}); revision "
+            f"{entry.proposal_revision + 1} replaces it",
         )
         self._file_revision(
             entry, packet_now, revision=entry.proposal_revision + 1, now=at
@@ -1212,25 +1362,46 @@ class LogicalEntryManager:
         )
         updated = self._reload(entry.logical_entry_id)
         if updated.refusal_count >= self.refusal_policy.terminal_after:
-            self._release_reservation(
-                updated,
-                reason=f"terminal after {updated.refusal_count} refusals",
-                at=at,
-            )
-            self.store.record_abandoned(
-                entry.logical_entry_id,
-                reason=f"refused {updated.refusal_count} times "
-                f"(terminal_after={self.refusal_policy.terminal_after})",
-                at=at,
-            )
-            return ServiceResult(
-                ServiceOutcome.REFUSED_TERMINAL, self._reload(entry.logical_entry_id)
-            )
+            return self._abandon_terminal_refusals(updated, at)
         return ServiceResult(ServiceOutcome.REFUSED, updated)
+
+    def _abandon_terminal_refusals(
+        self, entry: LogicalEntry, at: dt.datetime
+    ) -> ServiceResult:
+        """Enforce ``terminal_after``: release, abandon, close the request."""
+        self._release_reservation(
+            entry,
+            reason=f"terminal after {entry.refusal_count} refusals",
+            at=at,
+        )
+        self.store.record_abandoned(
+            entry.logical_entry_id,
+            reason=f"refused {entry.refusal_count} times "
+            f"(terminal_after={self.refusal_policy.terminal_after})",
+            at=at,
+        )
+        self._withdraw_request(
+            entry.current_handoff_id,
+            note=f"ABANDONED: logical entry {entry.logical_entry_id} revision "
+            f"{entry.proposal_revision}: refused {entry.refusal_count} times "
+            f"(terminal_after={self.refusal_policy.terminal_after})",
+        )
+        return ServiceResult(
+            ServiceOutcome.REFUSED_TERMINAL, self._reload(entry.logical_entry_id)
+        )
 
     def _service_cooldown(
         self, entry: LogicalEntry, packet_now: VerificationPacket, at: dt.datetime
     ) -> ServiceResult:
+        # The terminal policy outranks the cooldown clock. A crash between the
+        # REVIEW_REFUSED append and the ENTRY_ABANDONED append (they are two
+        # separate durable writes in _record_refusal) leaves a zombie: a
+        # REFUSED_COOLDOWN entry whose refusal_count already reached
+        # terminal_after, still holding its reservation. Without this check
+        # the zombie would cool down and refile -- a fourth review of an
+        # intention the policy already declared answered.
+        if entry.refusal_count >= self.refusal_policy.terminal_after:
+            return self._abandon_terminal_refusals(entry, at)
         refused_at = entry.refused_at
         if refused_at is not None and at < refused_at + self.refusal_policy.cooldown:
             return ServiceResult(ServiceOutcome.COOLING, entry)
@@ -1331,4 +1502,81 @@ class LogicalEntryManager:
             )
         self._release_reservation(entry, reason=f"abandoned: {reason}", at=at)
         self.store.record_abandoned(entry.logical_entry_id, reason=reason, at=at)
+        self._withdraw_request(
+            entry.current_handoff_id,
+            note=f"ABANDONED: logical entry {entry.logical_entry_id} revision "
+            f"{entry.proposal_revision}: {reason}",
+        )
         return self._reload(entry.logical_entry_id)
+
+    # -- hygiene: the packet-free sweep -----------------------------------
+
+    def sweep(self, *, now: dt.datetime | None = None) -> tuple[ServiceResult, ...]:
+        """Restore hygiene over every ACTIVE entry, without needing a packet.
+
+        ``service`` can only judge an entry it is handed a freshly revalidated
+        packet for -- so an entry no scan nominates again would otherwise sit
+        in its state forever, reservation and all. The sweep applies exactly
+        the named policy bounds, and nothing discretionary:
+
+        * AWAITING_REVIEW past its ``review_expires_at`` expires (the same
+          transition ``service`` would have made, packet or no packet).
+        * CLAIMED older than ``claimed_max_age`` is abandoned.
+        * REFUSED_COOLDOWN at ``terminal_after`` refusals is abandoned -- the
+          crashed-terminal zombie, ended here as well as in ``service``.
+        * REFUSED_COOLDOWN older than ``cooldown_max_age`` is abandoned.
+
+        Every ending releases the reservation and closes the outstanding
+        review request (where one exists). Intended for startup and periodic
+        hygiene in the runner's wiring; the read-only universe scanner never
+        calls it.
+        """
+        at = self._now(now)
+        results: list[ServiceResult] = []
+        for entry in self.store.active():
+            if entry.state is LogicalEntryState.AWAITING_REVIEW:
+                if entry.review_expires_at is not None and at >= entry.review_expires_at:
+                    results.append(self._expire(entry, at))
+            elif entry.state is LogicalEntryState.CLAIMED:
+                if at - entry.created_at >= self.refusal_policy.claimed_max_age:
+                    results.append(
+                        self._sweep_abandon(
+                            entry,
+                            at,
+                            reason=f"swept: CLAIMED since "
+                            f"{entry.created_at.isoformat()} without filing a "
+                            f"review (claimed_max_age="
+                            f"{self.refusal_policy.claimed_max_age})",
+                        )
+                    )
+            elif entry.state is LogicalEntryState.REFUSED_COOLDOWN:
+                if entry.refusal_count >= self.refusal_policy.terminal_after:
+                    results.append(self._abandon_terminal_refusals(entry, at))
+                    continue
+                refused_at = entry.refused_at or entry.updated_at
+                if at - refused_at >= self.refusal_policy.cooldown_max_age:
+                    results.append(
+                        self._sweep_abandon(
+                            entry,
+                            at,
+                            reason=f"swept: REFUSED_COOLDOWN since "
+                            f"{refused_at.isoformat()} with no changed spec "
+                            f"(cooldown_max_age="
+                            f"{self.refusal_policy.cooldown_max_age})",
+                        )
+                    )
+        return tuple(results)
+
+    def _sweep_abandon(
+        self, entry: LogicalEntry, at: dt.datetime, *, reason: str
+    ) -> ServiceResult:
+        self._release_reservation(entry, reason=f"abandoned: {reason}", at=at)
+        self.store.record_abandoned(entry.logical_entry_id, reason=reason, at=at)
+        self._withdraw_request(
+            entry.current_handoff_id,
+            note=f"ABANDONED: logical entry {entry.logical_entry_id} revision "
+            f"{entry.proposal_revision}: {reason}",
+        )
+        return ServiceResult(
+            ServiceOutcome.ABANDONED, self._reload(entry.logical_entry_id)
+        )

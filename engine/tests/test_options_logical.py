@@ -25,6 +25,7 @@ Organisation:
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 from decimal import Decimal
 from pathlib import Path
@@ -43,12 +44,14 @@ from engine.options.approval import (
 from engine.options.logical import (
     EntryNomination,
     LineageRecord,
+    LogicalEntry,
     LogicalEntryManager,
     LogicalEntryState,
     LogicalEntryStore,
     RefusalCooldownPolicy,
     RevisionOutcome,
     ServiceOutcome,
+    StaleNominationError,
 )
 from reviewer import ScriptedReviewer, collab_at, packet as build_packet, approval_context
 from test_options_transmit import NOW, approving_governor, approving_risk, refusing_risk, spread
@@ -703,4 +706,386 @@ class TestPersistenceDiscipline:
                 expiration=good.expiration,
                 legs=good.legs,
                 reservation_amount=D("-1"),
+            )
+
+
+# ===========================================================================
+# The crashed-terminal zombie (M1)
+# ===========================================================================
+
+
+def find_handoff(h: Harness, handoff_id: str) -> Any:
+    """One handoff, read back through collab-kit's own store."""
+    paths = load("paths", "CollabPaths").at(h.root)
+    return load("store", "HandoffStore")(paths).find(handoff_id)
+
+
+class TestZombieCooldownRecovery:
+    """A crash between the REVIEW_REFUSED append and the ENTRY_ABANDONED
+    append leaves a REFUSED_COOLDOWN entry whose refusal_count already reached
+    ``terminal_after``, reservation still held. Every service entrypoint must
+    enforce the terminal policy on it FIRST -- never cool it down and refile."""
+
+    def _zombie(self, tmp_path: Path) -> tuple[Harness, Any]:
+        """The crashed state, written as the real writer writes it: the
+        REVIEW_REFUSED line is on disk, the release and abandon lines are not."""
+        h = Harness(
+            tmp_path,
+            refusal_policy=RefusalCooldownPolicy(
+                cooldown=dt.timedelta(minutes=30), terminal_after=1
+            ),
+        )
+        entry = h.awaiting()
+        h.store.record_review_refused(
+            entry.logical_entry_id,
+            revision=entry.proposal_revision,
+            handoff_id=entry.current_handoff_id,
+            at=LATER,
+            detail="the verifier answered REFUSED",
+        )
+        zombie = h.store.get(entry.logical_entry_id)
+        assert zombie is not None
+        assert zombie.state is LogicalEntryState.REFUSED_COOLDOWN
+        assert zombie.refusal_count == 1  # == terminal_after: the zombie
+        assert zombie.reservation_id is not None
+        return h, zombie
+
+    def test_service_abandons_the_zombie_instead_of_refiling(
+        self, tmp_path: Path
+    ) -> None:
+        """MUTATION GUARD (M1): remove the terminal check at the top of
+        ``_service_cooldown`` and this fails -- the changed-digest packet after
+        the cooldown REFILES a new review (the probe's 4th review) instead of
+        abandoning."""
+        h, zombie = self._zombie(tmp_path)
+        after_cooldown = LATER + dt.timedelta(minutes=31)
+        result = h.manager.service(
+            zombie, h.packet_for(zombie, credit="1.25"), now=after_cooldown
+        )
+        assert result.outcome is ServiceOutcome.REFUSED_TERMINAL
+        assert result.entry.state is LogicalEntryState.ABANDONED
+        assert result.entry.reservation_id is None
+        assert len(h.handoffs()) == 1, "the zombie filed a new review"
+
+    def test_the_terminal_policy_outranks_the_cooldown_clock(
+        self, tmp_path: Path
+    ) -> None:
+        """Even inside the cooldown window the zombie ends -- COOLING would be
+        the mutant's answer, and it would leave the reservation held."""
+        h, zombie = self._zombie(tmp_path)
+        inside_cooldown = LATER + dt.timedelta(minutes=5)
+        result = h.manager.service(
+            zombie, h.packet_for(zombie), now=inside_cooldown
+        )
+        assert result.outcome is ServiceOutcome.REFUSED_TERMINAL
+        assert result.entry.state is LogicalEntryState.ABANDONED
+        assert result.entry.reservation_id is None
+
+    def test_sweep_ends_the_zombie_without_needing_a_packet(
+        self, tmp_path: Path
+    ) -> None:
+        h, zombie = self._zombie(tmp_path)
+        results = h.manager.sweep(now=LATER + dt.timedelta(minutes=1))
+        assert [r.outcome for r in results] == [ServiceOutcome.REFUSED_TERMINAL]
+        swept = h.manager.entry(zombie.logical_entry_id)
+        assert swept.state is LogicalEntryState.ABANDONED
+        assert swept.reservation_id is None
+
+
+# ===========================================================================
+# Duplicate ACTIVE claims are unrepresentable in the replayed book (M2)
+# ===========================================================================
+
+
+class TestDuplicateClaimIntegrity:
+    def test_a_forged_dual_active_log_replays_one_active_plus_a_loud_error(
+        self, tmp_path: Path
+    ) -> None:
+        """MUTATION GUARD (M2a): remove the duplicate-claim exclusion in
+        ``entries()`` and this fails -- the forged second ACTIVE claim would be
+        replayed silently into the book."""
+        h = Harness(tmp_path)
+        first = h.manager.claim(nomination(), now=NOW)
+
+        # Forge what a second concurrent writer would append: another
+        # ENTRY_CLAIMED for the same underlying, different identity.
+        nom = nomination()
+        shadow = LogicalEntry(
+            logical_entry_id=uuid4(),
+            underlying="SPY",
+            strategy_family=nom.strategy_family,
+            direction=nom.direction,
+            expiration=nom.expiration,
+            legs=nom.legs,
+            state=LogicalEntryState.CLAIMED,
+            created_at=LATER,
+            updated_at=LATER,
+            reservation_id=uuid4(),
+            reservation_amount=nom.reservation_amount,
+        )
+        h.store.record_claimed(shadow, at=LATER)
+
+        problems: list[str] = []
+        book = h.store.entries(errors=problems)
+        assert first.logical_entry_id in book
+        assert shadow.logical_entry_id not in book, "the shadow claim was replayed"
+        active = h.store.active_for("SPY")
+        assert active is not None
+        assert active.logical_entry_id == first.logical_entry_id
+
+        matching = [
+            p
+            for p in h.store.integrity_errors()
+            if str(shadow.logical_entry_id) in p and "duplicate ACTIVE claim" in p
+        ]
+        assert matching, "the exclusion was silent, not loud"
+
+    def test_a_claim_after_the_holder_went_terminal_is_not_a_duplicate(
+        self, tmp_path: Path
+    ) -> None:
+        """The exclusion is about *concurrent* ACTIVE holders: once the first
+        entry ends, a later claim for the underlying replays cleanly."""
+        h = Harness(tmp_path)
+        first = h.manager.claim(nomination(), now=NOW)
+        h.manager.abandon(first, reason="make way", now=NOW)
+        second = h.manager.claim(nomination(), now=LATER)
+        assert second.logical_entry_id != first.logical_entry_id
+        assert h.store.integrity_errors() == ()
+        assert len(h.store.entries()) == 2
+
+    def test_claim_rechecks_the_active_set_immediately_before_the_append(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """MUTATION GUARD (M2b): remove the re-check before
+        ``record_claimed`` and this fails -- a stale first read appends a
+        second ACTIVE entry, which replay then has to quarantine."""
+        h = Harness(tmp_path)
+        first = h.manager.claim(nomination(), now=NOW)
+
+        real = h.store.active_for
+        calls = {"n": 0}
+
+        def stale_then_real(underlying: str):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return None  # the stale first read that misses the holder
+            return real(underlying)
+
+        monkeypatch.setattr(h.store, "active_for", stale_then_real)
+        second = h.manager.claim(nomination(), now=LATER)
+        assert second.logical_entry_id == first.logical_entry_id
+        assert len(h.store.entries()) == 1
+        assert h.store.integrity_errors() == ()
+
+
+# ===========================================================================
+# The packet-free hygiene sweep (M3), and the requests it closes (M5)
+# ===========================================================================
+
+
+class TestSweep:
+    def test_sweep_expires_an_awaiting_review_past_its_ttl(
+        self, tmp_path: Path
+    ) -> None:
+        h = Harness(tmp_path)
+        entry = h.awaiting()
+        assert h.manager.sweep(now=LATER) == (), "a live review was swept"
+
+        results = h.manager.sweep(now=AFTER_EXPIRY)
+        assert [r.outcome for r in results] == [ServiceOutcome.EXPIRED]
+        swept = h.manager.entry(entry.logical_entry_id)
+        assert swept.state is LogicalEntryState.EXPIRED
+        assert swept.reservation_id is None
+        outcomes = [r.outcome for r in swept.lineage]
+        assert RevisionOutcome.RESERVATION_RELEASED in outcomes
+        assert RevisionOutcome.EXPIRED in outcomes
+
+        # M5: the orphaned request is closed, with the cause in its note.
+        request = find_handoff(h, entry.current_handoff_id)
+        assert request.status == "done"
+        assert "EXPIRED" in (request.note or "")
+        assert str(entry.logical_entry_id) in (request.note or "")
+
+    def test_sweep_abandons_a_claimed_entry_older_than_the_policy_age(
+        self, tmp_path: Path
+    ) -> None:
+        h = Harness(tmp_path)
+        entry = h.manager.claim(nomination(), now=NOW)
+        assert h.manager.sweep(now=NOW + dt.timedelta(hours=1)) == ()
+
+        # claimed_max_age defaults to the 12-hour approval TTL.
+        results = h.manager.sweep(now=NOW + dt.timedelta(hours=13))
+        assert [r.outcome for r in results] == [ServiceOutcome.ABANDONED]
+        swept = h.manager.entry(entry.logical_entry_id)
+        assert swept.state is LogicalEntryState.ABANDONED
+        assert swept.reservation_id is None
+        assert len(h.handoffs()) == 0, "a CLAIMED entry has no request to close"
+
+    def test_sweep_abandons_a_cooldown_entry_older_than_its_max_age(
+        self, tmp_path: Path
+    ) -> None:
+        h = Harness(tmp_path)  # terminal_after 3: one refusal is not terminal
+        h.reviewer.decision = ApprovalDecision.REFUSED
+        entry = h.awaiting()
+        h.reviewer.work(NOW)
+        refused = h.manager.service(entry, h.packet_for(entry), now=LATER).entry
+        assert refused.state is LogicalEntryState.REFUSED_COOLDOWN
+
+        assert h.manager.sweep(now=LATER + dt.timedelta(hours=1)) == ()
+
+        results = h.manager.sweep(now=LATER + dt.timedelta(hours=25))
+        assert [r.outcome for r in results] == [ServiceOutcome.ABANDONED]
+        swept = h.manager.entry(entry.logical_entry_id)
+        assert swept.state is LogicalEntryState.ABANDONED
+        assert swept.reservation_id is None
+
+    def test_sweep_leaves_healthy_entries_alone(self, tmp_path: Path) -> None:
+        """Approved and freshly-waiting entries are not hygiene problems."""
+        h = Harness(tmp_path)
+        spy = h.awaiting("SPY")
+        h.reviewer.work(NOW)
+        approved = h.manager.service(spy, h.packet_for(spy), now=LATER).entry
+        assert approved.state is LogicalEntryState.APPROVED_PENDING_EXECUTION
+        aapl = h.awaiting("AAPL")
+
+        assert h.manager.sweep(now=LATER) == ()
+        assert h.manager.entry(spy.logical_entry_id).state is (
+            LogicalEntryState.APPROVED_PENDING_EXECUTION
+        )
+        assert h.manager.entry(aapl.logical_entry_id).state is (
+            LogicalEntryState.AWAITING_REVIEW
+        )
+
+
+# ===========================================================================
+# Orphaned handoffs are closed when their question is retired (M5)
+# ===========================================================================
+
+
+class TestOrphanedHandoffClosure:
+    def test_supersession_closes_the_old_request_with_a_superseded_note(
+        self, tmp_path: Path
+    ) -> None:
+        """MUTATION GUARD (M5): make ``withdraw`` a no-op and this fails --
+        the retired revision's request stays pending in the reviewer's queue."""
+        h = Harness(tmp_path)
+        entry = h.awaiting(credit="1.50")
+        old_handoff = entry.current_handoff_id
+
+        result = h.manager.service(entry, h.packet_for(entry, credit="1.25"), now=LATER)
+        assert result.outcome is ServiceOutcome.SUPERSEDED
+
+        request = find_handoff(h, old_handoff)
+        assert request.status == "done"
+        assert "SUPERSEDED" in (request.note or "")
+        assert str(entry.logical_entry_id) in (request.note or "")
+        # The replacement question is open and unanswered.
+        replacement = find_handoff(h, result.entry.current_handoff_id)
+        assert replacement.status == "pending"
+
+    def test_abandon_closes_the_outstanding_request(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        entry = h.awaiting()
+        h.manager.abandon(entry, reason="operator decision", now=LATER)
+
+        request = find_handoff(h, entry.current_handoff_id)
+        assert request.status == "done"
+        assert "ABANDONED" in (request.note or "")
+        assert "operator decision" in (request.note or "")
+
+    def test_withdraw_tolerates_missing_and_already_done_requests(
+        self, tmp_path: Path
+    ) -> None:
+        h = Harness(tmp_path)
+        # Missing: suppressed, nothing recorded, no raise.
+        h.gate.withdraw("20990101T000000Z-000000-no-such-handoff", note="x")
+
+        # Already done (the reviewer answered and completed it): left exactly
+        # as the reviewer left it -- the builder's note must not overwrite the
+        # reviewer's completion note.
+        entry = h.awaiting()
+        h.reviewer.work(NOW)
+        request = find_handoff(h, entry.current_handoff_id)
+        assert request.status == "done"
+        note_before = request.note
+        h.gate.withdraw(entry.current_handoff_id, note="must not overwrite")
+        request_after = find_handoff(h, entry.current_handoff_id)
+        assert request_after.status == "done"
+        assert request_after.note == note_before
+
+    def test_terminal_refusal_leaves_the_answered_request_untouched(
+        self, tmp_path: Path
+    ) -> None:
+        """The terminal path withdraws tolerantly: the reviewer already closed
+        the request when it replied, and that closure is preserved."""
+        h = Harness(
+            tmp_path,
+            refusal_policy=RefusalCooldownPolicy(
+                cooldown=dt.timedelta(minutes=1), terminal_after=1
+            ),
+        )
+        h.reviewer.decision = ApprovalDecision.REFUSED
+        entry = h.awaiting()
+        h.reviewer.work(NOW)
+        before = find_handoff(h, entry.current_handoff_id)
+        assert before.status == "done"
+
+        result = h.manager.service(entry, h.packet_for(entry), now=LATER)
+        assert result.outcome is ServiceOutcome.REFUSED_TERMINAL
+        after = find_handoff(h, entry.current_handoff_id)
+        assert after.status == "done"
+        assert after.note == before.note
+
+
+# ===========================================================================
+# Stale nominations and the policy knobs (minors)
+# ===========================================================================
+
+
+class TestStaleNominations:
+    def test_a_stale_nomination_is_refused_with_a_typed_error(
+        self, tmp_path: Path
+    ) -> None:
+        """MUTATION GUARD (minor b): remove the age check in ``claim`` and
+        this fails -- the stale nomination would mint an entry."""
+        h = Harness(tmp_path)
+        stale = dataclasses.replace(
+            nomination(), nominated_at=NOW - dt.timedelta(minutes=31)
+        )
+        with pytest.raises(StaleNominationError) as exc:
+            h.manager.claim(stale, now=NOW)
+        assert "maximum nomination age" in exc.value.message
+        assert h.store.entries() == {}, "the stale nomination minted an entry"
+
+    def test_fresh_and_undated_nominations_claim_normally(
+        self, tmp_path: Path
+    ) -> None:
+        h = Harness(tmp_path)
+        fresh = dataclasses.replace(
+            nomination(), nominated_at=NOW - dt.timedelta(minutes=5)
+        )
+        entry = h.manager.claim(fresh, now=NOW)
+        assert entry.state is LogicalEntryState.CLAIMED
+        undated = h.manager.claim(nomination("AAPL"), now=NOW)
+        assert undated.state is LogicalEntryState.CLAIMED
+
+    def test_a_nomination_with_a_naive_timestamp_is_refused(self) -> None:
+        with pytest.raises(ValueError):
+            dataclasses.replace(
+                nomination(), nominated_at=dt.datetime(2026, 7, 29, 13, 30)
+            )
+
+    def test_the_new_policy_knobs_are_validated_at_construction(self) -> None:
+        with pytest.raises(ValueError):
+            RefusalCooldownPolicy(max_nomination_age=dt.timedelta(0))
+        with pytest.raises(ValueError):
+            RefusalCooldownPolicy(claimed_max_age=dt.timedelta(seconds=-1))
+        with pytest.raises(ValueError):
+            RefusalCooldownPolicy(cooldown_max_age=dt.timedelta(0))
+        with pytest.raises(ValueError):
+            # A max age shorter than the cooldown would sweep every refused
+            # entry away before it could ever refile.
+            RefusalCooldownPolicy(
+                cooldown=dt.timedelta(minutes=30),
+                cooldown_max_age=dt.timedelta(minutes=5),
             )

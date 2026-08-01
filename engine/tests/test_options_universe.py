@@ -58,8 +58,10 @@ from engine.options.universe import (
     ScanBookTransitionError,
     ScanState,
     StructureNomination,
+    PACING_ERROR_KINDS,
     UniverseScanConfig,
     claim_for_logical_entry,
+    penalize_on_broker_error,
     run_universe_pass,
     supersede,
     transition,
@@ -907,6 +909,171 @@ class TestUniverseScanConfig:
     def test_a_non_numeric_bound_is_a_config_error(self) -> None:
         with pytest.raises(ConfigError):
             UniverseScanConfig.from_env({"IBKR_OPTIONS_UNIVERSE_PHASE2_LIMIT": "many"})
+
+
+# ===========================================================================
+# broker pacing errors feed the budget (M6)
+# ===========================================================================
+
+
+class RecordingPenalizeBudget:
+    """Records penalize calls; refuses nothing."""
+
+    def __init__(self) -> None:
+        self.penalized: list[RequestKind] = []
+
+    def penalize(self, kind: RequestKind) -> None:
+        self.penalized.append(kind)
+
+
+class TestBrokerPacingErrors:
+    def test_the_error_code_mapping_penalizes_the_matching_bucket(self) -> None:
+        """MUTATION GUARD (M6): drop the ``budget.penalize(kind)`` call (or
+        the 162/100 entries) from ``penalize_on_broker_error`` and this fails."""
+        budget = RecordingPenalizeBudget()
+        assert penalize_on_broker_error(budget, 162) is RequestKind.HISTORICAL
+        assert penalize_on_broker_error(budget, 100) is RequestKind.GENERAL
+        assert budget.penalized == [RequestKind.HISTORICAL, RequestKind.GENERAL]
+
+    def test_a_non_pacing_code_penalizes_nothing(self) -> None:
+        budget = RecordingPenalizeBudget()
+        assert penalize_on_broker_error(budget, 200) is None  # "no security def"
+        assert penalize_on_broker_error(budget, 0) is None
+        assert budget.penalized == []
+
+    def test_the_mapping_names_exactly_the_two_pacing_codes(self) -> None:
+        assert PACING_ERROR_KINDS == {
+            162: RequestKind.HISTORICAL,
+            100: RequestKind.GENERAL,
+        }
+
+    def test_a_penalized_budget_defers_the_rest_of_the_pass(self, tmp_path) -> None:
+        """End to end on the real budget: the broker's 162 penalizes, the next
+        DISCOVERY acquire raises DiscoveryPaced (existing behaviour), and the
+        pass records the symbol DEFERRED_PACING rather than crashing."""
+        from engine.options.pacing import PacedRequestBudget
+
+        def no_sleep(seconds: float) -> None:  # pragma: no cover - must not run
+            raise AssertionError("a paused-discovery acquire must not sleep")
+
+        budget = PacedRequestBudget(clock=lambda: 1000.0, sleeper=no_sleep)
+        assert penalize_on_broker_error(budget, 162) is RequestKind.HISTORICAL
+
+        with pytest.raises(DiscoveryPaced):
+            budget.acquire(RequestKind.HISTORICAL, priority=Priority.DISCOVERY)
+
+        seed_stale(tmp_path, "AAA", rising_series())
+        book = run_pass(
+            tmp_path,
+            universe=[entry("AAA")],
+            budget=budget,  # the real, penalized budget
+            volatility_history=FakeHistory({"AAA": rising_series()}),
+        )
+        row = row_for(book, "AAA")
+        assert row.state is ScanState.DEFERRED_PACING
+        assert row.reason == REASON_PACING_DEFERRED
+
+    def test_the_universe_scan_handler_stays_read_only_wrt_entries(self) -> None:
+        """The CLI handler may register the pacing hook, but it may not touch
+        logical entries: no sweep, no manager, no logical import. The scanner
+        is read-only with respect to the entry book by contract."""
+        import inspect
+
+        from engine import cli as cli_module
+
+        source = inspect.getsource(cli_module.cmd_options_universe_scan)
+        assert "sweep" not in source
+        assert "LogicalEntryManager" not in source
+        assert "options.logical" not in source
+        assert "penalize_on_broker_error" in source, (
+            "the pacing hook is no longer wired in the handler"
+        )
+
+
+# ===========================================================================
+# survived-mutation gaps: ranking order and per-quote token spend
+# ===========================================================================
+
+
+def _candidate_named(symbol: str, score: Decimal | None) -> ScanBookRow:
+    return ScanBookRow(
+        symbol=symbol,
+        state=ScanState.CANDIDATE,
+        rank_score=score,
+        nomination=StructureNomination(
+            underlying=symbol,
+            family="SHORT_PREMIUM",
+            direction="BULLISH",
+            expiration=TODAY + dt.timedelta(days=45),
+            legs=(
+                NominatedLeg(con_id=1050, strike=D("105"), right="P", action="SELL"),
+                NominatedLeg(con_id=1000, strike=D("100"), right="P", action="BUY"),
+            ),
+            short_delta=D("-0.30"),
+            width=D("5"),
+        ),
+    )
+
+
+class TestRankingOrderIsPinned:
+    def test_candidates_rank_highest_score_first_with_alphabetical_ties(
+        self,
+    ) -> None:
+        """MUTATION GUARD (ranking): reverse the sort in
+        ``ScanBook.candidates`` and this fails. Highest score first; equal
+        scores break alphabetically; an unscored candidate ranks as zero and
+        therefore last; non-candidates never appear."""
+        rows = (
+            _candidate_named("BBB", D("90")),
+            _candidate_named("CCC", D("95")),
+            _candidate_named("AAA", D("95")),
+            _candidate_named("DDD", None),
+            ScanBookRow(symbol="EEE", state=ScanState.UNSCANNED),
+        )
+        book = ScanBook(
+            session_date=TODAY,
+            generated_at=NOW,
+            rows=rows,
+            coverage=CoverageSummary.from_rows(rows),
+        )
+        assert [row.symbol for row in book.candidates()] == [
+            "AAA",  # 95, alphabetical winner of the tie
+            "CCC",  # 95
+            "BBB",  # 90
+            "DDD",  # unscored ranks as zero, last
+        ]
+
+
+class TestQuoteTokenSpend:
+    def test_window_quotes_spend_one_general_token_per_contract_plus_one(
+        self, tmp_path
+    ) -> None:
+        """MUTATION GUARD (token spend): replace ``range(1 + len(con_ids))``
+        with ``range(1)`` at the phase-2 quote acquire and this fails. One
+        token for the underlying subscription plus one per quoted contract,
+        all at CANDIDATE_CONSTRUCTION."""
+        seed_fresh(tmp_path, "AAA", rising_series())
+        budget = FakeBudget()
+        market_data = FakeMarketData()
+
+        run_pass(
+            tmp_path,
+            universe=[entry("AAA")],
+            budget=budget,
+            contract_data=FakeContractData(),
+            market_data=market_data,
+        )
+
+        [(_, con_ids)] = market_data.calls
+        assert len(con_ids) >= 2, "the qualified window collapsed"
+        candidate_acquires = [
+            (kind, priority)
+            for kind, priority in budget.acquired
+            if priority is Priority.CANDIDATE_CONSTRUCTION
+        ]
+        assert candidate_acquires == [
+            (RequestKind.GENERAL, Priority.CANDIDATE_CONSTRUCTION)
+        ] * (1 + len(con_ids))
 
 
 class TestAugmentedUniverse:

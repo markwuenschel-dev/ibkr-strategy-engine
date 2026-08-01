@@ -575,7 +575,11 @@ def cmd_options_universe_scan(
     from .options.pacing import PacedRequestBudget
     from .options.policy import RiskPolicy
     from .options.regime import VolatilityRegimePolicy
-    from .options.universe import UniverseScanConfig, run_universe_pass
+    from .options.universe import (
+        UniverseScanConfig,
+        penalize_on_broker_error,
+        run_universe_pass,
+    )
     from .options.universe_data import augment, seed_universe
 
     config = config_from(args)
@@ -607,24 +611,45 @@ def cmd_options_universe_scan(
         # a refill is awaited.
         budget = PacedRequestBudget(sleeper=ib.sleep)
         contract_data = IBKRContractDataAdapter(ib)
-        book = run_universe_pass(
-            universe=universe,
-            session_date=_dt.date.today(),
-            iv_store=IVStore(config.state_dir / "universe" / "iv"),
-            metadata_store=SessionMetadataStore(
-                config.state_dir / "universe" / "metadata"
-            ),
-            budget=budget,
-            policy=policy,
-            regime_policy=regime_policy,
-            config=scan_config,
-            # The adapters are constructed without their own budget seams on
-            # purpose: the scanner owns every acquire for this pass, and an
-            # adapter that also acquired would double-spend each request.
-            volatility_history=IBKRVolatilityHistoryAdapter(ib, contract_data),
-            contract_data=contract_data,
-            market_data=IBKRLiveMarketDataAdapter(ib),
-        )
+
+        # The broker's pacing verdict outranks the budget's local ledger:
+        # error 162 (historical pacing) or 100 (message rate) penalizes the
+        # matching bucket, so the rest of this pass defers -- DEFERRED_PACING
+        # rows -- instead of digging deeper. Same errorEvent pattern as
+        # scan.run_scan, unhooked in a finally for the same reason.
+        def on_error(req_id: int, code: int, message: str, *_: Any) -> None:
+            kind = penalize_on_broker_error(budget, code)
+            if kind is not None:
+                note(
+                    f"broker pacing error {code} ({kind.value}): {message}; "
+                    "the budget is penalized and remaining discovery defers"
+                )
+
+        ib.errorEvent += on_error
+        try:
+            book = run_universe_pass(
+                universe=universe,
+                session_date=_dt.date.today(),
+                iv_store=IVStore(config.state_dir / "universe" / "iv"),
+                metadata_store=SessionMetadataStore(
+                    config.state_dir / "universe" / "metadata"
+                ),
+                budget=budget,
+                policy=policy,
+                regime_policy=regime_policy,
+                config=scan_config,
+                # The adapters are constructed without their own budget seams on
+                # purpose: the scanner owns every acquire for this pass, and an
+                # adapter that also acquired would double-spend each request.
+                volatility_history=IBKRVolatilityHistoryAdapter(ib, contract_data),
+                contract_data=contract_data,
+                market_data=IBKRLiveMarketDataAdapter(ib),
+            )
+        finally:
+            try:
+                ib.errorEvent -= on_error
+            except Exception:  # noqa: BLE001 - unhook must not mask the pass
+                pass
         path = book.write(config.state_dir)
 
     out(book.describe())
