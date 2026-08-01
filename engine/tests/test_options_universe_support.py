@@ -10,9 +10,16 @@ from __future__ import annotations
 import datetime as dt
 from decimal import Decimal
 
+import pytest
+
 from engine.options.ivrank import IVObservation, build_iv_rank
 from engine.options.ivstore import IVStore
-from engine.options.pacing import PacedRequestBudget, RequestKind
+from engine.options.pacing import (
+    DiscoveryPaced,
+    PacedRequestBudget,
+    Priority,
+    RequestKind,
+)
 
 D = Decimal
 NOW = dt.datetime(2026, 8, 3, 13, 0, tzinfo=dt.timezone.utc)  # a Monday
@@ -106,16 +113,19 @@ class FakeTime:
 
 
 class TestPacedRequestBudget:
-    def test_burst_up_to_capacity_never_sleeps(self) -> None:
+    def test_management_bursts_to_full_capacity_without_sleeping(self) -> None:
+        """Priorities 1-2 own the whole bucket, reserve included."""
         fake = FakeTime()
         budget = PacedRequestBudget(
             historical_per_window=5, clock=fake.clock, sleeper=fake.sleep
         )
         for _ in range(5):
-            budget.acquire(RequestKind.HISTORICAL)
+            budget.acquire(
+                RequestKind.HISTORICAL, priority=Priority.EXITS_MANAGEMENT
+            )
         assert fake.slept == []
 
-    def test_the_sixth_request_waits_for_a_refill(self) -> None:
+    def test_the_request_past_capacity_waits_for_a_refill(self) -> None:
         fake = FakeTime()
         budget = PacedRequestBudget(
             historical_per_window=5,
@@ -124,8 +134,10 @@ class TestPacedRequestBudget:
             sleeper=fake.sleep,
         )
         for _ in range(5):
-            budget.acquire(RequestKind.HISTORICAL)
-        budget.acquire(RequestKind.HISTORICAL)
+            budget.acquire(
+                RequestKind.HISTORICAL, priority=Priority.EXITS_MANAGEMENT
+            )
+        budget.acquire(RequestKind.HISTORICAL, priority=Priority.EXITS_MANAGEMENT)
         # One token refills in window/capacity = 120s; the wait must be real
         # and bounded, not a spin.
         assert 100.0 <= sum(fake.slept) <= 140.0
@@ -143,7 +155,7 @@ class TestPacedRequestBudget:
             sleeper=fake.sleep,
         )
         budget.penalize(RequestKind.HISTORICAL)
-        budget.acquire(RequestKind.HISTORICAL)
+        budget.acquire(RequestKind.HISTORICAL, priority=Priority.EXITS_MANAGEMENT)
         assert 220.0 <= sum(fake.slept) <= 260.0
 
     def test_kinds_do_not_share_tokens(self) -> None:
@@ -154,7 +166,70 @@ class TestPacedRequestBudget:
             clock=fake.clock,
             sleeper=fake.sleep,
         )
-        budget.acquire(RequestKind.HISTORICAL)
+        budget.acquire(RequestKind.HISTORICAL, priority=Priority.EXITS_MANAGEMENT)
         for _ in range(3):
-            budget.acquire(RequestKind.GENERAL)
+            budget.acquire(RequestKind.GENERAL, priority=Priority.EXITS_MANAGEMENT)
         assert fake.slept == []
+
+    def test_a_one_token_bucket_cannot_deadlock_low_priority(self) -> None:
+        """The reserve floor is capped below capacity: with a single-token
+        bucket a DISCOVERY acquire must complete (slowly), never spin --
+        pinned against the exact infinite loop found on 2026-08-01."""
+        fake = FakeTime()
+        budget = PacedRequestBudget(
+            historical_per_window=1,
+            historical_window_seconds=600.0,
+            clock=fake.clock,
+            sleeper=fake.sleep,
+        )
+        budget.acquire(RequestKind.HISTORICAL, priority=Priority.DISCOVERY)
+        budget.acquire(RequestKind.HISTORICAL, priority=Priority.DISCOVERY)
+        assert len(fake.slept) < 20  # waited, terminated
+
+
+class TestManagementReserve:
+    def test_scanner_load_cannot_consume_the_management_reserve(self) -> None:
+        """Discovery tries to drain the whole bucket -- past the reserve line
+        -- and management must STILL acquire without a single wait. Without
+        the floor, the same discovery load empties the bucket and management
+        queues behind a scan, which is the starvation this reserve forbids.
+
+        Discovery drawing more than the free portion is the load-bearing part
+        of the fixture: a test that stops politely at the reserve line passes
+        with the floor deleted (found by exactly that mutation, 2026-08-01).
+        """
+        fake = FakeTime()
+        budget = PacedRequestBudget(
+            historical_per_window=8,
+            historical_window_seconds=600.0,
+            management_reserve_fraction=0.25,  # reserve = 2 tokens
+            clock=fake.clock,
+            sleeper=fake.sleep,
+        )
+        for _ in range(6):  # the free portion: 8 - reserve 2
+            budget.acquire(RequestKind.HISTORICAL, priority=Priority.DISCOVERY)
+        assert fake.slept == []
+        for _ in range(2):  # past the line: these wait for refill above floor
+            budget.acquire(RequestKind.HISTORICAL, priority=Priority.DISCOVERY)
+        assert fake.slept, "drawing past the reserve line must wait"
+
+        before = list(fake.slept)
+        budget.acquire(RequestKind.HISTORICAL, priority=Priority.EXITS_MANAGEMENT)
+        budget.acquire(RequestKind.HISTORICAL, priority=Priority.WORKING_ORDERS)
+        assert fake.slept == before, "management must not wait behind a scan"
+
+    def test_pacing_penalty_stops_discovery_but_not_exits(self) -> None:
+        """Error 162: discovery raises DiscoveryPaced and stands down;
+        an exit acquires from the refilling reserve, slowly but surely."""
+        fake = FakeTime()
+        budget = PacedRequestBudget(
+            historical_per_window=8,
+            historical_window_seconds=600.0,
+            clock=fake.clock,
+            sleeper=fake.sleep,
+        )
+        budget.penalize(RequestKind.HISTORICAL)
+        with pytest.raises(DiscoveryPaced):
+            budget.acquire(RequestKind.HISTORICAL, priority=Priority.DISCOVERY)
+        budget.acquire(RequestKind.HISTORICAL, priority=Priority.EXITS_MANAGEMENT)
+        assert sum(fake.slept) > 0  # slower, never refused

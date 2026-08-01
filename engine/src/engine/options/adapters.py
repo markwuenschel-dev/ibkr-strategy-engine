@@ -221,9 +221,22 @@ class IBKRVolatilityHistoryAdapter:
     that is not blocked on the entitlement.
     """
 
-    def __init__(self, ib: Any, contract_data: IBKRContractDataAdapter) -> None:
+    def __init__(
+        self,
+        ib: Any,
+        contract_data: IBKRContractDataAdapter,
+        *,
+        budget: Any = None,
+        budget_priority: Any = None,
+    ) -> None:
         self.ib = ib
         self.contract_data = contract_data
+        # The connection-scoped request budget, when the caller runs inside
+        # one. Historical pulls are the hard-limited request class; a scanner
+        # constructs this adapter with DISCOVERY priority so ninety pulls
+        # queue behind anything the held book needs.
+        self.budget = budget
+        self.budget_priority = budget_priority
 
     def implied_volatility_history(
         self, symbol: str, *, duration: str = "1 Y"
@@ -231,9 +244,23 @@ class IBKRVolatilityHistoryAdapter:
         from ib_async import Stock  # noqa: PLC0415 - optional dependency
 
         key = symbol.strip().upper()
+        if self.budget is not None:
+            from .pacing import Priority, RequestKind  # noqa: PLC0415
+
+            self.budget.acquire(
+                RequestKind.GENERAL,
+                priority=self.budget_priority or Priority.DISCOVERY,
+            )
         qualified = self.ib.qualifyContracts(Stock(key, "SMART", "USD"))
         if not qualified:
             return []
+        if self.budget is not None:
+            from .pacing import Priority, RequestKind  # noqa: PLC0415
+
+            self.budget.acquire(
+                RequestKind.HISTORICAL,
+                priority=self.budget_priority or Priority.DISCOVERY,
+            )
         bars = self.ib.reqHistoricalData(
             qualified[0],
             endDateTime="",
@@ -288,8 +315,17 @@ class IBKRLiveMarketDataAdapter:
         underlying_lead_seconds: float = 2.0,
         poll_seconds: float = 0.25,
         clock: Any = time.monotonic,
+        budget: Any = None,
+        budget_priority: Any = None,
     ) -> None:
         self.ib = ib
+        # Connection-scoped pacing, when the caller runs inside a budget.
+        # A ``require_two_sided`` call is by definition about a held
+        # structure's own legs, so it draws at EXITS_MANAGEMENT priority
+        # regardless of the constructor default -- managing what exists
+        # outranks whatever this adapter instance was built for.
+        self.budget = budget
+        self.budget_priority = budget_priority
         # A seam, so the deadline can be exercised without a test spending the
         # real seconds. ``ib.sleep`` is the only thing that yields to the event
         # loop; this only measures.
@@ -315,6 +351,20 @@ class IBKRLiveMarketDataAdapter:
 
         symbol = underlying_symbol.strip().upper()
         subscribed_at = _utcnow()
+
+        if self.budget is not None:
+            from .pacing import Priority, RequestKind  # noqa: PLC0415
+
+            priority = (
+                Priority.EXITS_MANAGEMENT
+                if require_two_sided
+                else (self.budget_priority or Priority.CANDIDATE_CONSTRUCTION)
+            )
+            # One token per subscription line this call will open, acquired up
+            # front: the underlying plus every leg. Acquiring before the first
+            # request keeps a paced scan from half-subscribing a structure.
+            for _ in range(1 + len(con_ids)):
+                self.budget.acquire(RequestKind.GENERAL, priority=priority)
 
         underlying_contract = self.ib.qualifyContracts(Stock(symbol, "SMART", "USD"))
         if not underlying_contract:

@@ -1592,3 +1592,145 @@ class TestRegimeGate:
             regime_live=True,
         )
         assert starved.candidate is None, starved.describe()
+
+
+# ===========================================================================
+# Binding revalidation: the packet binds the market as it is NOW
+# ===========================================================================
+
+
+class RecordingMarketDataPort(FakeMarketDataPort):
+    """The base fake, additionally recording the two-sided demand per call.
+
+    The base class records ``(symbol, con_ids)``; the runner's binding
+    revalidation is *defined* by the third argument -- a fresh quote of the
+    selected legs with a two-sided book demanded -- so these tests need all
+    three. ``require_two_sided`` defaults ``False`` here exactly as it does on
+    the port protocol, because ``_quotes_for`` omits the keyword entirely on
+    the discovery path and a recorder that required it would miss those calls.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.quote_calls: list[tuple[str, tuple[int, ...], bool]] = []
+
+    def strategy_quotes(
+        self,
+        *,
+        underlying_symbol: str,
+        con_ids: Any,
+        require_two_sided: bool = False,
+    ) -> StrategyQuoteSnapshot:
+        self.quote_calls.append(
+            (underlying_symbol, tuple(int(c) for c in con_ids), require_two_sided)
+        )
+        return super().strategy_quotes(
+            underlying_symbol=underlying_symbol,
+            con_ids=con_ids,
+            require_two_sided=require_two_sided,
+        )
+
+
+class TestBindingRevalidation:
+    """The packet Grok reviews is bound to the market as it is *now*.
+
+    Two properties, each pinned by one test. First: the quotes the packet
+    binds are never the discovery snapshot -- the selected legs are re-quoted,
+    two-sided, immediately before the packet is built, however fresh discovery
+    looks. Second: an approval binds the spec digest of the market it was
+    granted against, so a pass whose price has moved does not consume it --
+    it files a new review request and spends nothing.
+    """
+
+    def test_selected_leg_quotes_always_refresh_before_authorization(
+        self, tmp_path: Path
+    ) -> None:
+        """The last quotes call before the packet is the two selected legs with
+        a two-sided book demanded -- in addition to, not instead of, the full
+        chain-window call discovery made earlier."""
+        market = RecordingMarketDataPort()
+        report = run_pass(
+            FakeBroker(),
+            gate_for(tmp_path),
+            store_for(tmp_path),
+            armed=False,
+            market_data=market,
+            # A plain gate with no reviewer seat: the pass files a real request
+            # and stops at AWAITING, which proves the packet was reached without
+            # anything downstream of it mattering here.
+            verifier=reviewer.gate_at(tmp_path / "verifier"),
+        )
+
+        # The pass really got as far as the packet and the verifier.
+        assert report.verification_request, report.describe()
+        assert "OPTIONS_AWAITING_VERIFICATION" in report.refusal_codes
+
+        # Discovery quoted the full strike window first...
+        assert len(market.quote_calls) >= 2, market.quote_calls
+        assert any(
+            len(con_ids) > 2 for _sym, con_ids, _two in market.quote_calls[:-1]
+        ), market.quote_calls
+        # ...and the very last call before the packet re-quoted exactly the two
+        # selected legs, demanding both sides of the book.
+        symbol, con_ids, require_two_sided = market.quote_calls[-1]
+        assert symbol == "SPY"
+        assert sorted(con_ids) == [LONG_CON_ID, SHORT_CON_ID]
+        assert require_two_sided is True
+        assert report.candidate is not None
+        assert con_ids == tuple(leg.con_id for leg in report.candidate.legs)
+
+    def test_a_price_change_after_approval_invalidates_the_packet(
+        self, tmp_path: Path
+    ) -> None:
+        """A reviewed packet is an approval of one market, not of a structure.
+
+        Pass 1 files a request and stops AWAITING. The reviewer approves that
+        exact packet. Pass 2 arrives with every option mid 10% higher, so the
+        candidate's credit -- and with it the authorization-spec digest -- has
+        moved. The gate must not spend the old approval on the new market: the
+        pass files a *new* request, stops AWAITING again, transmits nothing,
+        and the consumed-markers ledger stays empty.
+        """
+        gate = gate_for(tmp_path)
+        store = store_for(tmp_path)
+        # One gate, one collab, one ledger, shared by both passes.
+        verifier = reviewer.gate_at(tmp_path / "verifier")
+
+        first = run_pass(FakeBroker(), gate, store, armed=False, verifier=verifier)
+        assert first.verification_request, first.describe()
+        assert "OPTIONS_AWAITING_VERIFICATION" in first.refusal_codes
+
+        # The reviewer answers APPROVED for the request pass 1 filed.
+        replies = reviewer.ScriptedReviewer(root=verifier.root).work(NOW)
+        assert replies != [], "the reviewer found nothing to answer"
+
+        # The market moves before the next pass: every option mid +10%.
+        ib = FakeIB()
+        second = run_pass(
+            FakeBroker(ib=ib),
+            gate,
+            store,
+            armed=False,
+            market_data=FakeMarketDataPort(price_factor=D("1.1")),
+            verifier=verifier,
+        )
+
+        # The move reached the candidate: a different credit was priced.
+        assert first.candidate is not None and second.candidate is not None
+        assert second.candidate.limit_price != first.candidate.limit_price
+
+        # Nothing transmitted, nothing entered.
+        assert second.entered is False
+        assert second.transmissions == []
+        assert ib.placed == []
+
+        # The old approval was not consumed: the changed market produced a new
+        # spec digest, so the pass filed a new request and is AWAITING again.
+        assert "OPTIONS_AWAITING_VERIFICATION" in second.refusal_codes
+        assert second.verification_request, second.describe()
+        assert second.verification_request != first.verification_request
+
+        # And no approval anywhere was spent: the consumed-markers directory
+        # under the gate's ledger is empty.
+        consumed = verifier.ledger / "consumed"
+        assert not consumed.exists() or list(consumed.iterdir()) == []

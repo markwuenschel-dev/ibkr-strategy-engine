@@ -34,10 +34,18 @@ import tempfile
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from uuid import uuid4
 
+from .freshness import FreshnessClass, ObservationEnvelope
 from .ivrank import IVObservation, SOURCE_IBKR_OPTION_IV
 
-__all__ = ["CachedSeries", "IVStore"]
+__all__ = ["CachedSeries", "IVStore", "IVSTORE_VERSION"]
+
+IVSTORE_VERSION = "ivstore/1"
+
+#: The IV input series is a SLOW_OBSERVATION (2026-08-01 audit): it may be
+#: reused while its envelope is unexpired, and it must carry that envelope.
+DEFAULT_TTL = dt.timedelta(hours=20)
 
 
 @dataclass(frozen=True)
@@ -48,6 +56,7 @@ class CachedSeries:
     observations: tuple[IVObservation, ...]
     fetched_at: dt.datetime | None
     source: str
+    envelope: ObservationEnvelope | None = None
 
     @property
     def last_observation(self) -> dt.date | None:
@@ -86,6 +95,7 @@ class IVStore:
                 fetched_at=None,
                 source=source,
             )
+        envelope: ObservationEnvelope | None = None
         for line in lines:
             try:
                 record = json.loads(line)
@@ -101,6 +111,10 @@ class IVStore:
                     fetched_at = dt.datetime.fromisoformat(raw_fetched)
                 except ValueError:
                     fetched_at = None
+                raw_envelope = meta.get("envelope")
+                if isinstance(raw_envelope, dict):
+                    with contextlib.suppress(KeyError, ValueError, TypeError):
+                        envelope = ObservationEnvelope.from_record(raw_envelope)
                 continue
             try:
                 on = dt.date.fromisoformat(str(record.get("on", "")))
@@ -115,6 +129,7 @@ class IVStore:
             observations=tuple(observations),
             fetched_at=fetched_at,
             source=source,
+            envelope=envelope,
         )
 
     def fresh(
@@ -125,8 +140,11 @@ class IVStore:
         now: dt.datetime,
         previous_session: dt.date | None = None,
     ) -> bool:
-        """Fresh enough to skip the broker: fetched today AND the series
-        reaches at least the previous trading session.
+        """Fresh enough to skip the broker, on three conditions at once:
+        the record's envelope is unexpired (SLOW_OBSERVATION TTL), it was
+        fetched this session, and the series reaches the previous trading
+        session. A legacy record without an envelope is stale by definition
+        -- provenance that cannot be stated cannot be reused.
 
         ``previous_session`` defaults to a weekend-aware yesterday. Holidays
         make that estimate wrong by a day, in the *conservative* direction:
@@ -134,9 +152,11 @@ class IVStore:
         request rather than trading on a stale rank.
         """
         cached = self.read(symbol)
-        if cached.fetched_at is None or not cached.observations:
+        if cached.envelope is None or not cached.observations:
             return False
-        if cached.fetched_at.date() != today:
+        if not cached.envelope.fresh(now=now, session_date=today):
+            return False
+        if cached.envelope.session_date != today:
             return False
         if previous_session is None:
             previous_session = _previous_weekday(today)
@@ -152,13 +172,40 @@ class IVStore:
         *,
         fetched_at: dt.datetime,
         source: str = SOURCE_IBKR_OPTION_IV,
+        ttl: dt.timedelta = DEFAULT_TTL,
+        configuration_version: str = IVSTORE_VERSION,
     ) -> Path:
-        """Atomic whole-file rewrite. A crash mid-write leaves the old file."""
+        """Atomic whole-file rewrite. A crash mid-write leaves the old file.
+
+        Every write mints the full SLOW_OBSERVATION envelope: session date,
+        observed/expiry instants, source, a fetch-scoped generation (an
+        historical pull has no live subscription to inherit one from), and
+        the configuration version. ``market_data_type`` stays ``None`` --
+        historical bars produce no type callback, and absence is recorded
+        rather than invented.
+        """
+        envelope = ObservationEnvelope(
+            symbol=symbol.strip().upper(),
+            session_date=fetched_at.date(),
+            observed_at=fetched_at,
+            expires_at=fetched_at + ttl,
+            source=source,
+            freshness_class=FreshnessClass.SLOW_OBSERVATION,
+            configuration_version=configuration_version,
+            market_data_type=None,
+            subscription_generation=uuid4(),
+        )
         path = self._path(symbol)
         path.parent.mkdir(parents=True, exist_ok=True)
         lines = [
             json.dumps(
-                {"meta": {"source": source, "fetched_at": fetched_at.isoformat()}},
+                {
+                    "meta": {
+                        "source": source,
+                        "fetched_at": fetched_at.isoformat(),
+                        "envelope": envelope.to_record(),
+                    }
+                },
                 sort_keys=True,
             )
         ]

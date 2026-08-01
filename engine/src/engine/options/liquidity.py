@@ -61,6 +61,7 @@ def check_liquidity(
     *,
     quotes: "StrategyQuoteSnapshot | None",
     policy: "RiskPolicy",
+    quoted_window: int | None = None,
 ) -> "Any":
     """Every liquidity failure of this structure, in one named check result.
 
@@ -188,11 +189,17 @@ def check_liquidity(
                 )
             )
 
-    if len(quotes.legs) < policy.minimum_quoted_strikes:
+    # Chain density is a property of the discovery window, not of a narrow
+    # binding re-quote. A revalidation that fetches only the selected legs
+    # passes the window count it measured at discovery -- density is
+    # session-scale structure, and refusing a re-quote for being narrow would
+    # punish the freshness the revalidation exists to provide.
+    window = quoted_window if quoted_window is not None else len(quotes.legs)
+    if window < policy.minimum_quoted_strikes:
         problems.append(
             (
                 LiquidityRefusalReason.SPARSE_CHAIN,
-                f"only {len(quotes.legs)} strikes quoted in the window, below "
+                f"only {window} strikes quoted in the window, below "
                 f"the {policy.minimum_quoted_strikes} floor: too sparse a chain "
                 "to trust the strikes it did offer",
             )

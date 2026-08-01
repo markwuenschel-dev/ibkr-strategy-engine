@@ -718,6 +718,7 @@ def assess_candidate(
     underlying_price: Decimal | None,
     net_liquidation: Decimal | None,
     evaluated_at: dt.datetime,
+    quoted_window: int | None = None,
 ) -> CandidateRiskAssessment:
     """Run every candidate-level check and collect the verdicts.
 
@@ -745,7 +746,9 @@ def assess_candidate(
             underlying_price=underlying_price,
             net_liquidation=net_liquidation,
         ),
-        check_liquidity(intent, quotes=quotes, policy=policy),
+        check_liquidity(
+            intent, quotes=quotes, policy=policy, quoted_window=quoted_window
+        ),
     )
     return CandidateRiskAssessment(
         strategy_id=intent.strategy_id,

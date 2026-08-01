@@ -1121,6 +1121,10 @@ def run_once(
     run. The ladder can only lower the credit, only inside the envelope the
     risk gates approved, at most four times, and it ends by cancelling.
     """
+    # A pinned clock (tests, replays) stays pinned through the binding
+    # revalidation; a live run re-reads the wall clock there, because the
+    # whole point of revalidating is "as of now", not "as of pass start".
+    pinned_clock = now is not None
     now = now or dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
     today = today or now.date()
     report = RunReport(started_at=now, armed=armed, symbol=symbol)
@@ -1348,6 +1352,85 @@ def run_once(
             report.refusal_codes.append("OPTIONS_VERIFIER_NOT_CONFIGURED")
             return report
 
+        # -- 3c. binding revalidation (2026-08-01 audit) ---------------------
+        # A candidate may have been nominated from cached discovery, and even
+        # a same-pass build can be minutes old after slow management or a
+        # working-order walk. Immediately before the packet Grok reviews --
+        # and therefore immediately before authorize_open, which follows in
+        # the same breath and re-derives the spec digest from these same
+        # objects -- every binding fact is re-established from the market as
+        # it is NOW: fresh selected-leg quotes with a two-sided book demanded,
+        # fresh what-if margin, fresh portfolio snapshot, fresh risk and
+        # governor verdicts. Anything that moved moves the digest with it, so
+        # an already-reviewed packet stops matching and needs a new review --
+        # the invalidation rule working, not failing.
+        binding_now = (
+            now if pinned_clock
+            else dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+        )
+        binding_quotes = _quotes_for(
+            market_data,
+            symbol=symbol,
+            con_ids=[leg.con_id for leg in candidate.legs],
+            report=report,
+            label="binding revalidation",
+            require_two_sided=True,
+        )
+        if binding_quotes is None:
+            report.blockers.append(
+                "binding revalidation: the selected legs could not be re-quoted, "
+                "so no packet may bind them"
+            )
+            report.refusal_codes.append("OPTIONS_BINDING_UNQUOTABLE")
+            return report
+        margin = IBKRWhatIfAdapter(ib).what_if(candidate, observed_at=binding_now)
+        if portfolio is not None:
+            try:
+                fresh_state = portfolio.snapshot(as_of=binding_now)
+                snapshot_state = PortfolioSnapshot(
+                    as_of=fresh_state.as_of,
+                    net_liquidation=fresh_state.net_liquidation,
+                    positions=store.exposures(),
+                    reported_buying_power_reserved=(
+                        fresh_state.reported_buying_power_reserved
+                    ),
+                )
+                report.portfolio = snapshot_state
+            except Exception as exc:  # noqa: BLE001 - adapter boundary
+                report.blockers.append(
+                    f"binding revalidation: portfolio unavailable: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                report.refusal_codes.append("OPTIONS_BINDING_UNQUOTABLE")
+                return report
+        report.risk = assess_candidate(
+            candidate,
+            policy=policy,
+            quotes=binding_quotes,
+            margin=margin,
+            underlying_price=binding_quotes.underlying.mid,
+            net_liquidation=(
+                snapshot_state.net_liquidation if snapshot_state else None
+            ),
+            evaluated_at=binding_now,
+            quoted_window=len(snapshot.legs) if snapshot is not None else None,
+        )
+        report.governor = PortfolioGovernor(policy).evaluate(
+            candidate,
+            snapshot=snapshot_state,
+            margin=margin,
+            decision_time=binding_now,
+        )
+        binding_refusals = [
+            *(f"binding risk: {r.detail}" for r in report.risk.refusals),
+            *(f"binding governor: {r.detail}" for r in report.governor.refusals),
+        ]
+        if binding_refusals:
+            report.blockers.extend(binding_refusals)
+            report.refusal_codes.extend(report.risk.reason_codes)
+            report.refusal_codes.extend(report.governor.reason_codes)
+            return report
+
         packet = packet_for(
             candidate,
             structure_digest=structure_digest(candidate),
@@ -1356,11 +1439,11 @@ def run_once(
             context=approval_context,
             order_type=COMBO_ORDER_TYPE,
             time_in_force=COMBO_TIME_IN_FORCE,
-            now=now,
+            now=binding_now,
             evidence=_entry_evidence(
                 report,
                 margin=margin,
-                snapshot=snapshot,
+                snapshot=binding_quotes,
                 intent=candidate,
                 minimum_iv_rank=minimum_iv_rank,
             ),
