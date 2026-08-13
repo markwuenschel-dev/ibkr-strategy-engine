@@ -141,9 +141,33 @@ is **never rotated** — it grows forever.
 
 ## Tests
 
-```bash
-uv run pytest
+```powershell
+.\bin\run-tests.ps1                     # from the repository root
+.\bin\run-tests.ps1 tests/test_paperday.py
 ```
+
+Or directly, from `engine/`:
+
+```bash
+uv run --extra dev pytest
+```
+
+**`--extra dev` is not optional.** A bare `uv run pytest` resolves the
+environment *without* the extra, so uv tears down and rebuilds `engine/.venv` —
+dropping pytest and the editable install of `engine` itself. That venv is also
+the live runtime: `bin/start-paper-day.ps1` launches it, `spawn_detached` hands
+it to the collab watchers, and every manual `options-run` goes through it. So
+the bare form breaks a running trading session, not just the suite. Recovery is
+`uv sync --extra dev`. CI uses the same flags
+(`.github/workflows/ci.yml`).
+
+Do not add `-q` either: `addopts` already sets it, so a second one yields `-qq`
+and silently suppresses the summary line — a blank result reads as a pass.
+
+`bin/run-tests.ps1` applies both rules and additionally **refuses to run while a
+paper-day session lock is held in that checkout**, pointing you at a worktree
+instead. A worktree has its own `.venv`, which makes the isolation structural
+rather than something to remember.
 
 No test opens a socket — `tests/conftest.py` replaces `socket.socket` for the
 whole session so an accidental connection fails loudly rather than succeeding

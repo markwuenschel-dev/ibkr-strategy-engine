@@ -250,10 +250,21 @@ class _StopTheRun(Exception):
 
 
 class _ContextBroker:
-    """What ``broker_factory(config, journal)`` has to look like to the CLI."""
+    """What ``broker_factory(config, journal)`` has to look like to the CLI.
+
+    ``today`` is taken at *call* time for the same reason ``_patch_adapters``
+    stamps its quotes that way: the command supplies no ``now`` to ``run_once``,
+    so the pass resolves ``today`` from the wall clock. A chain built from the
+    suite's frozen ``TODAY`` drifts out of the proof's 35-55 DTE window as real
+    time moves, and the run then refuses with ``no expiration between 35 and 55
+    DTE`` -- for a reason none of these tests are about. That is not
+    hypothetical: with ``TODAY`` at 2026-07-29 the fixture expiries are
+    +14/+45/+80, so the usable one sits in the window only while the real date
+    is 2026-07-19..2026-08-08, and these three tests failed from 2026-08-09 on.
+    """
 
     def __init__(self, _config: Any, _journal: Any) -> None:
-        self.ib = ProofIB(low_iv=True)
+        self.ib = ProofIB(low_iv=True, today=dt.datetime.now(dt.timezone.utc).date())
 
     def __enter__(self) -> "_ContextBroker":
         return self
