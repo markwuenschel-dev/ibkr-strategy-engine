@@ -49,14 +49,13 @@ from .options.adapters import (
     read_open_orders,
 )
 from .options.catalog import UniverseCatalog
-from .options.execution_outbox import ExecutionOutbox
 from .options.freshness import SessionMetadataStore
 from .options.logical import (
     DEFAULT_REFUSAL_POLICY,
     LogicalEntryManager,
     LogicalEntryStore,
 )
-from .options.order_outbox import TransmissionBudget
+from .options.order_outbox import ExecutionOutbox, TransmissionBudget
 from .options.pacing import (
     PacedRequestBudget,
     Priority,
@@ -280,12 +279,14 @@ class _CycleRuntime:
         unresolved.
         """
 
-        unresolved = self.execution_outbox.unresolved()
-        if unresolved:
+        blocking = self.execution_outbox.blocking_records()
+        if blocking:
             return {
                 "outcome": "RECOVERY_REQUIRED",
                 "failure_code": "FAIL-BROKER-AMBIGUOUS",
-                "unresolved_execution_sagas": [item.saga_id for item in unresolved],
+                "unresolved_execution_sagas": [
+                    item.get("attempt_id") for item in blocking
+                ],
             }
         try:
             from .options.positions import PositionStore, ReconciliationOutcome
@@ -774,7 +775,7 @@ def run_options_cycle(
             job_allowed=lambda job, moment: _window_allowed(policy, job, moment),
             heartbeat=heartbeat,
             recovery_required=lambda: bool(runtime.scan_receipts.unmatched())
-            or bool(runtime.execution_outbox.unresolved())
+            or bool(runtime.execution_outbox.blocking_records())
             or schedule.unresolved(),
         )
         worker.run_forever(
