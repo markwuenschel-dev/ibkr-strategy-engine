@@ -95,7 +95,7 @@ from dataclasses import dataclass, fields as dataclass_fields
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Protocol
 from uuid import UUID, uuid4
 
 from ..errors import JournalError, RefusedError
@@ -123,6 +123,7 @@ __all__ = [
     "LogicalEntryManager",
     "LogicalEntryState",
     "LogicalEntryStore",
+    "ScanBookClaimWriter",
     "LogicalEvent",
     "RefusalCooldownPolicy",
     "RevisionOutcome",
@@ -207,6 +208,15 @@ class StaleNominationError(RefusedError):
     nobody re-checked. A typed error, so the caller can distinguish "re-scan and
     nominate again" from every other refusal.
     """
+
+
+class ScanBookClaimWriter(Protocol):
+    """The narrow persisted CAS seam owned by the logical-entry manager."""
+
+    def mark_claimed(
+        self, symbol: str, *, entry_id: UUID, at: dt.datetime
+    ) -> bool:
+        """Return false when another owner already claimed the row."""
 
 
 def _refuse(message: str, *, hint: str | None = None) -> None:
@@ -1184,7 +1194,11 @@ class LogicalEntryManager:
     # -- step 1: claim ----------------------------------------------------
 
     def claim(
-        self, nomination: EntryNomination, *, now: dt.datetime | None = None
+        self,
+        nomination: EntryNomination,
+        *,
+        now: dt.datetime | None = None,
+        claim_writer: ScanBookClaimWriter | None = None,
     ) -> LogicalEntry:
         """Claim a nomination into a persistent identity. Idempotent per
         underlying: while an ACTIVE entry holds the underlying, a second
@@ -1196,7 +1210,10 @@ class LogicalEntryManager:
         and the fix is a fresh scan, not a fresh reservation.
 
         The entry -- identity, reservation and all -- is persisted **before**
-        any review request can be filed for it (step 2 of the contract).
+        any review request can be filed for it (step 2 of the contract). When
+        a claim writer is supplied, the persisted ScanBook CAS is part of this
+        claim boundary. A lost CAS is compensated with a durable terminal
+        entry, so a failed admission cannot leave a live reservation behind.
         """
         at = self._now(now)
         existing = self.store.active_for(nomination.underlying)
@@ -1237,7 +1254,42 @@ class LogicalEntryManager:
         if raced is not None:
             return raced
         self.store.record_claimed(entry, at=at)
-        return entry
+        if claim_writer is not None:
+            try:
+                claimed = claim_writer.mark_claimed(
+                    entry.normalized_underlying,
+                    entry_id=entry.logical_entry_id,
+                    at=at,
+                )
+            except Exception as exc:  # noqa: BLE001 - persistence boundary
+                reason = (
+                    f"ScanBook claim for {entry.normalized_underlying} failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                self._release_reservation(entry, reason=reason, at=at)
+                self.store.record_abandoned(
+                    entry.logical_entry_id, reason=reason, at=at
+                )
+                _refuse(
+                    reason,
+                    hint="the ScanBook row was not admitted; retry only from a "
+                    "fresh persisted scan",
+                )
+            if not claimed:
+                reason = (
+                    f"ScanBook claim for {entry.normalized_underlying} lost the "
+                    "compare-and-set race"
+                )
+                self._release_reservation(entry, reason=reason, at=at)
+                self.store.record_abandoned(
+                    entry.logical_entry_id, reason=reason, at=at
+                )
+                _refuse(
+                    reason,
+                    hint="another logical entry owns the nomination; do not "
+                    "create a second reservation",
+                )
+        return self._reload(entry.logical_entry_id)
 
     # -- step 3: propose --------------------------------------------------
 

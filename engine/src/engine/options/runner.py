@@ -110,7 +110,7 @@ from .selection import (
     size_position,
     target_delta_for,
 )
-from .universe import ScanBook, ScanBookFileWriter
+from .universe import ScanBook, ScanBookAdmission, ScanBookFileWriter
 from .approval import (
     ApprovalContext,
     AwaitingVerification,
@@ -1680,16 +1680,16 @@ def _load_scanbook(
 ) -> tuple[ScanBook | None, str]:
     """The session's ScanBook, or ``None`` with the named refusal recorded.
 
-    ``SCANBOOK_MISSING`` and ``SCANBOOK_STALE`` are the two loader refusals
-    that send the pass to the ``--symbol`` fallback. Staleness mirrors the
-    claim policy's ``max_nomination_age``: a book older than the oldest
-    nomination the manager would accept cannot contain a claimable row, so
-    reading it would only discover row by row what the timestamp already says.
+    The manager path is ScanBook-admitted. Missing, malformed, stale, future,
+    or wrong-session persistence is a refusal, never a route into the legacy
+    ``--symbol`` corridor. Staleness mirrors the claim policy's
+    ``max_nomination_age``: a book older than the oldest nomination the manager
+    would accept cannot contain a claimable row.
     """
     if scanbook_root is None:
         report.refusal_codes.append("SCANBOOK_MISSING")
         report.blockers.append(
-            "no scanbook root is configured; the --symbol path is the fallback"
+            "no scanbook root is configured; logical-entry admission is refused"
         )
         return None, "SCANBOOK_MISSING"
     book = ScanBook.read(Path(scanbook_root), today)
@@ -1697,18 +1697,21 @@ def _load_scanbook(
         report.refusal_codes.append("SCANBOOK_MISSING")
         report.blockers.append(
             f"no scanbook for {today.isoformat()} under {scanbook_root}; "
-            "the --symbol path is the fallback"
+            "logical-entry admission is refused"
         )
         return None, "SCANBOOK_MISSING"
-    age = now - book.generated_at
-    if age > manager.refusal_policy.max_nomination_age:
-        report.refusal_codes.append("SCANBOOK_STALE")
+    admission = book.admit(
+        session_date=today,
+        now=now,
+        max_age=manager.refusal_policy.max_nomination_age,
+    )
+    if admission is not ScanBookAdmission.ACCEPTED:
+        report.refusal_codes.append(admission.value)
         report.blockers.append(
-            f"the scanbook for {today.isoformat()} is {age} old, past the "
-            f"{manager.refusal_policy.max_nomination_age} nomination age; "
-            "the --symbol path is the fallback"
+            f"the scanbook for {today.isoformat()} failed logical-entry "
+            f"admission ({admission.value}); no legacy symbol input is admitted"
         )
-        return None, "SCANBOOK_STALE"
+        return None, admission.value
     return book, "OK"
 
 
@@ -1736,11 +1739,9 @@ def _logical_entry_pass(
     pending verification, at most one transmission-and-walk per pass, one
     entry per underlying (the manager's own claim invariant).
 
-    Returns ``True`` when entry consideration is handled here; ``False``
-    sends ``run_once`` to the legacy ``--symbol`` flow -- only for a
-    missing/stale book with an idle manager (no active entries), because a
-    fallback filed beside pending entries would mint the per-pass fresh-id
-    reviews the LogicalEntry exists to end.
+    Returns ``True`` whenever the manager is wired. This keeps a missing or
+    stale ScanBook fail-closed at the integration boundary; it must never
+    switch to the legacy ``--symbol`` flow.
     """
     ib = corridor["ib"]
     report: RunReport = corridor["report"]
@@ -2099,21 +2100,16 @@ def _logical_entry_pass(
                         nominated_at=row.evaluated_at,
                     ),
                     now=now,
+                    claim_writer=scan_writer,
                 )
             except StaleNominationError as exc:
                 report.blockers.append(f"claim {symbol}: {exc.message}")
                 report.refusal_codes.append("OPTIONS_NOMINATION_STALE")
                 return None
-            if scan_writer is not None:
-                try:
-                    scan_writer.mark_claimed(
-                        symbol, entry_id=entry.logical_entry_id, at=now
-                    )
-                except Exception as exc:  # noqa: BLE001 - bookkeeping only
-                    report.errors.append(
-                        f"scanbook row {symbol} could not be marked claimed: "
-                        f"{type(exc).__name__}: {exc}"
-                    )
+            except RefusedError as exc:
+                report.blockers.append(f"claim {symbol}: {exc.message}")
+                report.refusal_codes.append("OPTIONS_SCANBOOK_CLAIM_REFUSED")
+                return None
             return entry
         return None
 
@@ -2143,11 +2139,11 @@ def _logical_entry_pass(
             if claimed is not None:
                 service_entry(claimed)
 
-    if book_status in ("SCANBOOK_MISSING", "SCANBOOK_STALE"):
-        # Fall back to the --symbol flow only when the manager is idle: a
-        # fallback beside pending entries would file per-pass fresh-id
-        # reviews -- the exact orphaning defect the LogicalEntry removes.
-        return transmitted or bool(manager.store.active())
+    if book_status != "OK":
+        # Admission failure is terminal for this manager path. Existing
+        # entries may have been serviced above, but no symbol fallback is
+        # allowed to mint a fresh identity beside the persisted lifecycle.
+        return True
     return True
 
 
@@ -2188,11 +2184,11 @@ def run_once(
     #: The logical-entry manager (M4). ``None`` keeps the pre-integration
     #: single-shot behaviour byte for byte. With one wired, pending logical
     #: entries are serviced FIRST each pass, then at most one new nomination
-    #: is claimed from the session's ScanBook; the ``--symbol`` flow becomes
-    #: the fallback for a missing or stale book.
+    #: is claimed from the session's admitted ScanBook. A missing or stale
+    #: book refuses this manager path; it never falls back to ``--symbol``.
     manager: Any = None,
     #: Where ``ScanBook.read`` looks (the engine state dir). ``None`` with a
-    #: manager wired reads as SCANBOOK_MISSING and falls back.
+    #: manager wired reads as SCANBOOK_MISSING and refuses the manager path.
     scanbook_root: Path | None = None,
     #: The claim-writer seam over the persisted book. Defaults to a
     #: ``ScanBookFileWriter`` over ``scanbook_root``; injectable for tests.
@@ -2348,9 +2344,8 @@ def run_once(
         )
 
         # -- M4: service pending logical entries FIRST, then claim at most
-        # one new nomination from the session's ScanBook. The --symbol flow
-        # below remains the operator's single-shot tool and the fallback for
-        # a missing or stale book (contract sections 3 and 9.3).
+        # one new nomination from the session's admitted ScanBook. The
+        # manager path never falls back to the legacy --symbol flow.
         if manager is not None:
             handled = _logical_entry_pass(
                 manager=manager,

@@ -90,6 +90,7 @@ __all__ = [
     "RANK_VERSION",
     "UNIVERSE_SCAN_VERSION",
     "ScanState",
+    "ScanBookAdmission",
     "ObservationProvenance",
     "ScanBookTransitionError",
     "NominatedLeg",
@@ -199,6 +200,22 @@ class ScanState(str, Enum):
     CANDIDATE = "CANDIDATE"
     CLAIMED_BY_LOGICAL_ENTRY = "CLAIMED_BY_LOGICAL_ENTRY"
     SUPERSEDED = "SUPERSEDED"
+
+
+class ScanBookAdmission(str, Enum):
+    """The persisted-book admission result consumed by the runner.
+
+    The scanner may write a book, but only a book for the requested session,
+    inside the claim-age window, and not from the future may feed a logical
+    entry.  These values are refusal codes as well as a typed boundary: the
+    manager path reports them and stops, rather than silently changing input
+    sources.
+    """
+
+    ACCEPTED = "OK"
+    STALE = "SCANBOOK_STALE"
+    FUTURE = "SCANBOOK_FUTURE"
+    SESSION_MISMATCH = "SCANBOOK_SESSION_MISMATCH"
 
 
 #: States that count as *rejections* in the coverage summary. DEFERRED_PACING
@@ -375,6 +392,8 @@ class ScanBookRow:
     def __post_init__(self) -> None:
         if not self.symbol.strip():
             raise ValueError("a scan book row must name its symbol")
+        if self.evaluated_at is not None and self.evaluated_at.tzinfo is None:
+            raise ValueError(f"{self.symbol}: evaluated_at must be timezone-aware")
         if self.state is ScanState.CANDIDATE and self.nomination is None:
             raise ValueError(
                 f"{self.symbol}: a CANDIDATE row must carry its nomination"
@@ -680,6 +699,61 @@ class ScanBook:
     universe_version: str = UNIVERSE_VERSION
     rank_version: str = RANK_VERSION
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.session_date, dt.date) or isinstance(
+            self.session_date, dt.datetime
+        ):
+            raise ValueError("session_date must be a date")
+        if self.generated_at.tzinfo is None:
+            raise ValueError("generated_at must be timezone-aware")
+        if self.version != SCANBOOK_VERSION:
+            raise ValueError(
+                f"unsupported scanbook version {self.version!r}; expected "
+                f"{SCANBOOK_VERSION!r}"
+            )
+        if self.universe_version != UNIVERSE_VERSION:
+            raise ValueError(
+                f"unsupported universe version {self.universe_version!r}; expected "
+                f"{UNIVERSE_VERSION!r}"
+            )
+        if self.rank_version != RANK_VERSION:
+            raise ValueError(
+                f"unsupported rank version {self.rank_version!r}; expected "
+                f"{RANK_VERSION!r}"
+            )
+        if not isinstance(self.rows, tuple):
+            raise ValueError("rows must be a tuple")
+        symbols = [row.symbol.strip().upper() for row in self.rows]
+        if len(symbols) != len(set(symbols)):
+            raise ValueError("a scanbook may contain only one row per symbol")
+
+    def admit(
+        self,
+        *,
+        session_date: dt.date,
+        now: dt.datetime,
+        max_age: dt.timedelta,
+    ) -> ScanBookAdmission:
+        """Admit this persisted book for a claim pass.
+
+        ``generated_at`` is the freshness witness for the whole book.  Row
+        ``evaluated_at`` remains the nomination-age witness used by the
+        manager at claim time.  A future-dated book is refused explicitly so
+        a clock or persistence error cannot manufacture freshness.
+        """
+        if now.tzinfo is None:
+            raise ValueError("now must be timezone-aware")
+        if not isinstance(max_age, dt.timedelta) or max_age <= dt.timedelta(0):
+            raise ValueError("max_age must be a positive timedelta")
+        if self.session_date != session_date:
+            return ScanBookAdmission.SESSION_MISMATCH
+        age = now - self.generated_at
+        if age < dt.timedelta(0):
+            return ScanBookAdmission.FUTURE
+        if age > max_age:
+            return ScanBookAdmission.STALE
+        return ScanBookAdmission.ACCEPTED
+
     @staticmethod
     def path_for(root: Path, session_date: dt.date) -> Path:
         return root / "universe" / f"scanbook-{session_date.isoformat()}.json"
@@ -738,13 +812,11 @@ class ScanBook:
                     ScanBookRow.from_record(row) for row in record.get("rows", [])
                 ),
                 coverage=CoverageSummary.from_record(record["coverage"]),
-                version=str(record.get("version", SCANBOOK_VERSION)),
-                universe_version=str(
-                    record.get("universe_version", UNIVERSE_VERSION)
-                ),
-                rank_version=str(record.get("rank_version", RANK_VERSION)),
+                version=str(record["version"]),
+                universe_version=str(record["universe_version"]),
+                rank_version=str(record["rank_version"]),
             )
-        except (KeyError, ValueError, TypeError):
+        except (AttributeError, KeyError, ValueError, TypeError):
             return None
 
     def describe(self, *, top: int = 10) -> str:

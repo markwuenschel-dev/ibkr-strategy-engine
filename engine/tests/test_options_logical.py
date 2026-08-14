@@ -135,6 +135,18 @@ class Harness:
         return self.manager.propose(entry, self.packet_for(entry, credit=credit), now=NOW)
 
 
+class ClaimWriter:
+    def __init__(self, result: bool = True) -> None:
+        self.result = result
+        self.calls: list[tuple[str, Any, dt.datetime]] = []
+
+    def mark_claimed(
+        self, symbol: str, *, entry_id: Any, at: dt.datetime
+    ) -> bool:
+        self.calls.append((symbol, entry_id, at))
+        return self.result
+
+
 # ===========================================================================
 # Identity across passes
 # ===========================================================================
@@ -610,6 +622,33 @@ class TestConcurrencyInvariants:
 
 
 class TestPersistenceDiscipline:
+    def test_claim_persists_the_scanbook_cas_inside_the_manager_boundary(
+        self, tmp_path: Path
+    ) -> None:
+        h = Harness(tmp_path)
+        writer = ClaimWriter()
+
+        entry = h.manager.claim(nomination(), now=NOW, claim_writer=writer)
+
+        assert writer.calls == [("SPY", entry.logical_entry_id, NOW)]
+        assert h.store.active_for("SPY").logical_entry_id == entry.logical_entry_id
+
+    def test_a_lost_scanbook_claim_releases_the_persisted_reservation(
+        self, tmp_path: Path
+    ) -> None:
+        h = Harness(tmp_path)
+        writer = ClaimWriter(result=False)
+
+        with pytest.raises(RefusedError, match="compare-and-set race"):
+            h.manager.claim(nomination(), now=NOW, claim_writer=writer)
+
+        assert h.store.active_for("SPY") is None
+        entries = h.store.entries()
+        assert len(entries) == 1
+        abandoned = next(iter(entries.values()))
+        assert abandoned.state is LogicalEntryState.ABANDONED
+        assert abandoned.reservation_id is None
+
     def test_the_entry_is_persisted_before_any_review_request_is_filed(
         self, tmp_path: Path
     ) -> None:

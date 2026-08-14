@@ -34,6 +34,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import datetime as dt
+import json
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -776,30 +777,56 @@ class TestGateRefusalClassification:
 
 
 # ===========================================================================
-# scanbook loader refusals and the --symbol fallback
+# scanbook loader refusals: no --symbol fallback
 # ===========================================================================
 
 
-class TestScanbookFallback:
-    def test_a_missing_book_falls_back_to_the_symbol_path(
-        self, tmp_path: Path
+class TestScanbookAdmission:
+    @pytest.mark.parametrize(
+        ("scenario", "expected_code"),
+        (
+            ("missing", "SCANBOOK_MISSING"),
+            ("stale", "SCANBOOK_STALE"),
+            ("future", "SCANBOOK_FUTURE"),
+            ("session-mismatched", "SCANBOOK_SESSION_MISMATCH"),
+        ),
+    )
+    def test_refusal_cases_do_not_resurrect_the_symbol_fallback(
+        self, tmp_path: Path, scenario: str, expected_code: str
     ) -> None:
+        """Mutation guard: if the refusal branch falls through to legacy
+        ``--symbol`` handling, any case here would mint a candidate or handoff."""
         rig = Rig(tmp_path, write_book=False)
-        report = rig.run()
-        assert "SCANBOOK_MISSING" in report.refusal_codes
-        # The fallback ran the legacy single-candidate flow: a candidate was
-        # built (fresh id, --symbol semantics) and its review filed.
-        assert report.candidate is not None
-        assert rig.lstore.entries() == {}, "the fallback must not mint entries"
+        if scenario == "stale":
+            write_scanbook(rig.state_dir, ("SPY",), at=NOW - dt.timedelta(hours=2))
+        elif scenario == "future":
+            write_scanbook(rig.state_dir, ("SPY",), at=NOW + dt.timedelta(minutes=1))
+        elif scenario == "session-mismatched":
+            stale_session = TODAY - dt.timedelta(days=1)
+            rows = (
+                ScanBookRow(
+                    symbol="SPY",
+                    state=ScanState.CANDIDATE,
+                    nomination=put_vertical_nomination("SPY"),
+                    rank_score=D("100"),
+                    evaluated_at=NOW,
+                ),
+            )
+            book = ScanBook(
+                session_date=stale_session,
+                generated_at=NOW,
+                rows=rows,
+                coverage=CoverageSummary.from_rows(rows),
+            )
+            path = ScanBook.path_for(rig.state_dir, TODAY)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(book.to_record()), encoding="utf-8")
 
-    def test_a_stale_book_falls_back_with_its_own_code(self, tmp_path: Path) -> None:
-        rig = Rig(tmp_path, write_book=False)
-        write_scanbook(
-            rig.state_dir, ("SPY",), at=NOW - dt.timedelta(hours=2)
-        )
         report = rig.run()
-        assert "SCANBOOK_STALE" in report.refusal_codes
-        assert rig.lstore.entries() == {}
+        assert expected_code in report.refusal_codes
+        assert report.candidate is None
+        assert rig.lstore.entries() == {}, "a refused book must not mint entries"
+        assert rig.handoffs() == []
 
     def test_no_fallback_fires_beside_pending_entries(self, tmp_path: Path) -> None:
         """A fallback filed beside pending entries would mint per-pass
@@ -812,7 +839,7 @@ class TestScanbookFallback:
         (ScanBook.path_for(rig.state_dir, TODAY)).unlink()
         report = rig.run()
         assert "SCANBOOK_MISSING" in report.refusal_codes
-        assert len(rig.handoffs()) == 1, "the fallback filed a fresh-id review"
+        assert len(rig.handoffs()) == 1, "a missing book filed a fresh-id review"
         assert report.candidate is not None  # the serviced entry's rebuild
 
 

@@ -17,7 +17,9 @@ Two of these tests are named mutation guards:
 from __future__ import annotations
 
 import ast
+import dataclasses
 import datetime as dt
+import json
 from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
@@ -54,6 +56,7 @@ from engine.options.universe import (
     NominatedLeg,
     ObservationProvenance,
     ScanBook,
+    ScanBookAdmission,
     ScanBookRow,
     ScanBookTransitionError,
     ScanState,
@@ -747,6 +750,43 @@ class TestCoverageAndPersistence:
         assert loaded.universe_version == book.universe_version
 
     def test_reading_an_absent_book_returns_none(self, tmp_path) -> None:
+        assert ScanBook.read(tmp_path, TODAY) is None
+
+    def test_persisted_book_admission_is_fail_closed_on_age_and_clock(self, tmp_path) -> None:
+        book = self._mixed_book(tmp_path)
+        assert (
+            book.admit(
+                session_date=TODAY,
+                now=NOW,
+                max_age=dt.timedelta(minutes=30),
+            )
+            is ScanBookAdmission.ACCEPTED
+        )
+        assert (
+            book.admit(
+                session_date=TODAY,
+                now=NOW + dt.timedelta(hours=1),
+                max_age=dt.timedelta(minutes=30),
+            )
+            is ScanBookAdmission.STALE
+        )
+        future = dataclasses.replace(book, generated_at=NOW + dt.timedelta(minutes=1))
+        assert (
+            future.admit(
+                session_date=TODAY,
+                now=NOW,
+                max_age=dt.timedelta(minutes=30),
+            )
+            is ScanBookAdmission.FUTURE
+        )
+
+    def test_persisted_book_rejects_a_naive_timestamp(self, tmp_path) -> None:
+        book = self._mixed_book(tmp_path)
+        record = book.to_record()
+        record["generated_at"] = NOW.replace(tzinfo=None).isoformat()
+        path = ScanBook.path_for(tmp_path, TODAY)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record), encoding="utf-8")
         assert ScanBook.read(tmp_path, TODAY) is None
 
     def test_candidates_are_ordered_by_score(self, tmp_path) -> None:

@@ -174,8 +174,8 @@ def build_parser() -> argparse.ArgumentParser:
         "options-run",
         help=(
             "one strategy pass: reconcile, manage open positions, service "
-            "pending logical entries, consume the session's scanbook (or fall "
-            "back to --symbol). Requires --arm to transmit anything."
+            "pending logical entries, and consume the session's admitted "
+            "scanbook. Requires --arm to transmit anything."
         ),
     )
     run.add_argument("--symbol", default="SPY")
@@ -750,9 +750,8 @@ def cmd_options_run(args: argparse.Namespace, broker_factory: Any = Broker) -> i
             verifier=_verifier,
             approval_context=_context,
             entry_preflight=_paper_day_preflight(config),
-            # Scanbook-consuming by default; a missing or stale book falls
-            # back to the --symbol single-shot behaviour, and the runner
-            # records SCANBOOK_MISSING/SCANBOOK_STALE either way.
+            # The manager path is ScanBook-admitted. A missing or stale book
+            # is recorded as a refusal; it never falls back to --symbol.
             manager=_manager,
             scanbook_root=config.state_dir,
         )
