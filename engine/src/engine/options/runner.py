@@ -99,6 +99,8 @@ from .approval import (
 )
 from .execution import COMBO_ORDER_TYPE, COMBO_TIME_IN_FORCE
 from .transmit import (
+    SESSION_LEASE_LOST,
+    SessionLease,
     TransmitResult,
     authorize_close,
     authorize_open,
@@ -107,13 +109,16 @@ from .transmit import (
 )
 
 __all__ = [
+    "EntryMode",
     "RunReport",
     "run_once",
     "mark_from_snapshot",
     "CONFIG_VERSION",
     "EntryPreflight",
     "EntryPricing",
+    "SessionLease",
 ]
+
 
 class EntryPricing(str, Enum):
     """Where on the book an opening credit is asked for.
@@ -125,6 +130,22 @@ class EntryPricing(str, Enum):
 
     MIDPOINT = "MIDPOINT"
     NATURAL = "NATURAL"
+
+
+class EntryMode(str, Enum):
+    """The entry mandate granted to one runner pass.
+
+    ``MANAGE_ONLY`` is the safe boundary default: the pass may reconcile the
+    broker book and manage positions that already exist, but it has no mandate
+    to discover, propose, reserve, or transmit opening risk. ``FULL`` is an
+    explicit opt-in for the strategy path that owns the complete entry proof.
+    Keeping this as an enum rather than a boolean makes an omitted mandate
+    observable and prevents a future caller from accidentally treating a
+    truthy value as permission to open.
+    """
+
+    MANAGE_ONLY = "MANAGE_ONLY"
+    FULL = "FULL"
 
 
 CONFIG_VERSION = "options-runner/1"
@@ -143,6 +164,13 @@ ZERO = Decimal("0")
 #: entry the engine was otherwise willing to make.
 EntryPreflight = Callable[..., "str | None"]
 
+# :data:`engine.options.transmit.SessionLease` -- ``Callable[[], str | None]``,
+# imported above and re-exported here -- is the second port of this shape and is
+# defined next to the door that enforces it. It answers a different question:
+# not "is this candidate acceptable" but "does the caller still hold the session
+# it began this pass under". ``run_once`` consults it once before authorization
+# and hands it to ``place_combo``, which consults it again at the door.
+
 
 @dataclass
 class RunReport:
@@ -151,6 +179,9 @@ class RunReport:
     started_at: dt.datetime
     armed: bool
     symbol: str
+    #: The entry mandate used by this pass. Defaults fail-closed at the runner
+    #: boundary; callers must explicitly opt into the full opening pipeline.
+    entry_mode: EntryMode = EntryMode.MANAGE_ONLY
     finished_at: dt.datetime | None = None
     reconciliation: ReconciliationReport | None = None
     #: Defaults to UNAVAILABLE, not to a permissive value. A report that has not
@@ -178,12 +209,17 @@ class RunReport:
     verification_request: str = ""
     blockers: list[str] = field(default_factory=list)
     refusal_codes: list[str] = field(default_factory=list)
+    #: A single machine-readable reason for why the entry half did not run.
+    #: Existing ``refusal_codes`` remains the complete history; this field is
+    #: the stable report slot for consumers that need one entry decision.
+    entry_refusal_code: str | None = None
     errors: list[str] = field(default_factory=list)
 
     def describe(self) -> str:
         lines = [
             f"symbol           {self.symbol}",
             f"armed            {'YES' if self.armed else 'NO (dry run)'}",
+            f"entry mode       {self.entry_mode.value}",
             "",
             f"RECONCILIATION   {self.reconciliation_outcome.value}",
             self.reconciliation.describe()
@@ -231,6 +267,7 @@ class RunReport:
             "event": "options_run",
             "symbol": self.symbol,
             "armed": self.armed,
+            "entry_mode": self.entry_mode.value,
             "started_at": self.started_at.isoformat(),
             "finished_at": self.finished_at.isoformat() if self.finished_at else None,
             "reconciliation": self.reconciliation.to_record() if self.reconciliation else None,
@@ -245,6 +282,7 @@ class RunReport:
             "entered": self.entered,
             "blockers": list(self.blockers),
             "refusal_codes": list(self.refusal_codes),
+            "entry_refusal_code": self.entry_refusal_code,
             "errors": list(self.errors),
         }
 
@@ -1007,14 +1045,23 @@ def run_once(
     entry_pricing: EntryPricing = EntryPricing.MIDPOINT,
     account: str = "",
     configuration_version: str = CONFIG_VERSION,
+    entry_mode: EntryMode = EntryMode.MANAGE_ONLY,
     enforce_iv_rank: bool = True,
     entry_preflight: EntryPreflight | None = None,
+    session_lease: SessionLease | None = None,
     sink: Any = None,
     reprice: RepriceLadder | None = DEFAULT_LADDER,
     verifier: VerifierGate | None = None,
     approval_context: ApprovalContext | None = None,
 ) -> RunReport:
-    """Reconcile, manage every open position, then consider one new entry.
+    """Reconcile and manage positions, optionally running the entry pipeline.
+
+    The default ``MANAGE_ONLY`` mandate is intentional. A caller that wants to
+    open risk must say ``entry_mode=EntryMode.FULL``; omission is not an entry
+    permission. In either mode reconciliation and management happen first.
+    ``MANAGE_ONLY`` then returns before candidate construction and every entry
+    side effect: IV/chain discovery, what-if, reviewer proposals, logical
+    claims, reservations, and opening transmission.
 
     Returns a report rather than raising, except for the kill switch -- a halted
     engine stops before it does anything at all, and that is the one condition
@@ -1031,7 +1078,33 @@ def run_once(
     runs unconditionally below, whatever this is set to.
 
     ``entry_preflight`` runs after every risk and governor check has passed and
-    before the authorization token is minted, and can only refuse. ``sink``
+    before the authorization token is minted, and can only refuse.
+
+    ``session_lease`` is the **session fence**, and it is checked twice: here,
+    after the preflight and before the verification packet is filed, and again
+    inside :func:`~engine.options.transmit.place_combo` immediately before the
+    order is armed. It answers one question -- does the caller still hold the
+    session mandate it started this pass under -- and a lost lease refuses the
+    entry with the reason code
+    :data:`~engine.options.transmit.SESSION_LEASE_LOST`.
+
+    Two checks rather than one because they close different windows. The first
+    means a pass whose session went away proposes nothing to the reviewer and
+    consumes no approval -- filing a proposal on behalf of a dead session would
+    leave an unanswerable request in the reviewer's queue and burn a
+    single-use approval nobody can spend. The second closes the gap between
+    "authorized" and "transmitted", which is the only gap left once the first
+    one exists. Neither is a substitute for the other, and a supervisor's drain
+    timeout is a substitute for neither: bounding how long a pass may keep
+    running is not the same as refusing to let it send.
+
+    **Exits are never fenced.** ``session_lease`` is not passed to the exits in
+    ``_manage_one``, and ``place_combo`` refuses to apply it to a close even if
+    a caller does. A stale session is a reason to stop opening risk and never a
+    reason to trap a position -- the same asymmetry the reconciliation outcomes
+    and ``authorize_close`` already follow.
+
+    ``sink``
     replaces the default :class:`~engine.options.sink.LifecycleRecorder` -- a
     caller that supplies one is responsible for it still reaching the store,
     which is why the proof wraps rather than replaces the recorder.
@@ -1047,7 +1120,14 @@ def run_once(
     """
     now = now or dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
     today = today or now.date()
-    report = RunReport(started_at=now, armed=armed, symbol=symbol)
+    try:
+        entry_mode = EntryMode(entry_mode)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"unsupported entry mode: {entry_mode!r}") from exc
+
+    report = RunReport(
+        started_at=now, armed=armed, symbol=symbol, entry_mode=entry_mode
+    )
     ib = broker.ib
 
     gate.assert_not_halted()
@@ -1084,6 +1164,16 @@ def run_once(
                 configuration_version=configuration_version,
                 report=report,
             )
+
+        if entry_mode is EntryMode.MANAGE_ONLY:
+            code = "RUNNER_MANAGE_ONLY"
+            report.entry_refusal_code = code
+            report.refusal_codes.append(code)
+            report.blockers.append(
+                "entry mandate is MANAGE_ONLY; reconciliation and management "
+                "completed, but opening discovery and transmission were not run"
+            )
+            return report
 
         # -- 3. entry ------------------------------------------------------
         # An order whose outcome is unknown may be resting in the book. Opening
@@ -1213,6 +1303,37 @@ def run_once(
                 report.refusal_codes.append("OPTIONS_ENTRY_PREFLIGHT_REFUSED")
                 return report
 
+        # -- 3c. does the caller still hold the session? --------------------
+        # After every gate that judges the *candidate*, and before anything is
+        # filed on its behalf. A scheduler-driven pass that lost its session
+        # mid-flight has no standing to open new risk, and until this existed
+        # the only thing bounding it was the supervisor's drain timeout -- which
+        # limits how long such a pass may run without ever refusing what it
+        # does. A timeout is a bound; this is a refusal.
+        #
+        # Placed *before* ``packet_for`` deliberately: filing a proposal would
+        # put an unanswerable request in the reviewer's queue on behalf of a
+        # session that no longer exists, and reaching ``authorize_open`` would
+        # spend a single-use approval on an order that cannot be sent.
+        #
+        # Nothing above this line is affected. Reconciliation and management
+        # have already run, so a lost lease refuses the entry and not the pass
+        # -- the same shape as every other entry refusal here.
+        if session_lease is not None:
+            try:
+                lease_refusal = session_lease()
+            except Exception as exc:  # noqa: BLE001 - a lease that cannot answer is lost
+                lease_refusal = (
+                    f"the session lease check raised {type(exc).__name__}: {exc}"
+                )
+            if lease_refusal:
+                report.blockers.append(
+                    f"the session this pass began under is no longer held "
+                    f"({lease_refusal}); refusing to open new risk"
+                )
+                report.refusal_codes.append(SESSION_LEASE_LOST)
+                return report
+
         # -- 4. propose to the reviewer, authorize, transmit ----------------
         # The verifier is required for an entry and optional for the pass: a
         # run that only reconciles and manages must not need a reviewer, and a
@@ -1288,6 +1409,12 @@ def run_once(
                 authorization=authorization,
                 account=account,
                 sink=recorder,
+                # Checked again at the door, because the lease can be lost in
+                # the interval this line spans: proposing to the reviewer,
+                # waiting for an answer, minting the token and writing the
+                # submission record are not instantaneous, and the fence above
+                # only proves the session was held before all of that.
+                session_lease=session_lease,
             )
         except Exception as exc:  # noqa: BLE001 - a failed send must be recorded
             store.record_open_failed(candidate.strategy_id, at=now, reason=str(exc))
@@ -1344,6 +1471,7 @@ def run_once(
                 envelope=envelope_for(candidate),
                 account=account,
                 sink=recorder,
+                session_lease=session_lease,
             )
             report.reprice = outcome
             # A summary of the ladder, under its own event name. The individual

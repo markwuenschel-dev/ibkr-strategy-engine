@@ -1617,11 +1617,17 @@ class FakeMarketData:
     def __init__(self, *, snapshot: StrategyQuoteSnapshot | None = None) -> None:
         self.snapshot = snapshot if snapshot is not None else book()
         self.calls: list[tuple[str, tuple[int, ...]]] = []
+        self.two_sided_requests: list[bool] = []
 
     def strategy_quotes(
-        self, *, underlying_symbol: str, con_ids: Any
+        self,
+        *,
+        underlying_symbol: str,
+        con_ids: Any,
+        require_two_sided: bool = False,
     ) -> StrategyQuoteSnapshot:
         self.calls.append((underlying_symbol, tuple(int(c) for c in con_ids)))
+        self.two_sided_requests.append(require_two_sided)
         return self.snapshot
 
 
@@ -1629,12 +1635,29 @@ class ExplodingMarketData:
     def __init__(self) -> None:
         self.calls = 0
 
-    def strategy_quotes(self, *, underlying_symbol: str, con_ids: Any) -> Any:
+    def strategy_quotes(
+        self,
+        *,
+        underlying_symbol: str,
+        con_ids: Any,
+        require_two_sided: bool = False,
+    ) -> Any:
         self.calls += 1
         raise RuntimeError("the socket went away")
 
 
 class TestMarkingTheWholeBook:
+    def test_held_structure_requests_two_sided_wait(self) -> None:
+        pos = position()
+        port = FakeMarketData()
+
+        mark_open_positions(
+            [pos], market_data=port, policy=RiskPolicy(), now=NOW
+        )
+
+        assert port.calls == [("SPY", (SHORT_CON_ID, LONG_CON_ID))]
+        assert port.two_sided_requests == [True]
+
     def test_only_the_positions_own_underlying_and_legs_are_subscribed(self) -> None:
         """Not a chain window. A marking pass has no strike to select, so every
         extra subscription is quota spent for nothing."""

@@ -151,8 +151,19 @@ class LiveMarketDataPort(Protocol):
         *,
         underlying_symbol: str,
         con_ids: Sequence[int],
+        require_two_sided: bool = False,
     ) -> StrategyQuoteSnapshot:
-        """One coherent snapshot of the underlying and every leg."""
+        """One coherent snapshot of the underlying and every leg.
+
+        ``require_two_sided`` asks the port to hold its settle window open
+        until every requested leg carries both a bid and an ask. Callers
+        pricing an exact selected structure, including a held position, pass
+        ``True``. Chain-wide scans leave it ``False``: deep wings without a
+        complete book must not pin the scan's bounded wait. The flag changes
+        patience, never truthfulness; at the deadline a one-sided snapshot is
+        still returned for the downstream freshness, liveness, provenance, and
+        pricing gates to classify independently.
+        """
         ...
 
 

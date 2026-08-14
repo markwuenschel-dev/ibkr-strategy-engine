@@ -62,7 +62,7 @@ from engine.options.proof import (
     observed_credit,
     vertical_width,
 )
-from engine.options.runner import run_once
+from engine.options.runner import EntryMode, run_once
 from engine.options.selection import Bias
 
 from reviewer import reviewed  # noqa: E402 - sibling test module, see docstring
@@ -223,6 +223,7 @@ def run_proof(
         store=store,
         policy=profile.derive_policy({}),
         armed=armed,
+        entry_mode=EntryMode.FULL,
         symbol=profile.symbol,
         bias=Bias.BULLISH,
         market_data=market_data if market_data is not None else FakeMarketDataPort(),
@@ -1076,6 +1077,7 @@ class TestTheProofRefusesWhenABoundWouldBeBroken:
             store=store_for(tmp_path),
             policy=proof_profile().derive_policy({}),
             armed=True,
+            entry_mode=EntryMode.FULL,
             symbol="SPY",
             bias=Bias.BULLISH,
             market_data=FakeMarketDataPort(),
@@ -1278,6 +1280,7 @@ class TestTheStrategyPathIsUnchanged:
             store=store_for(tmp_path),
             policy=proof_profile().derive_policy({}),
             armed=True,
+            entry_mode=EntryMode.FULL,
             symbol="SPY",
             bias=Bias.BULLISH,
             market_data=FakeMarketDataPort(),

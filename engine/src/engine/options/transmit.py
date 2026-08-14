@@ -64,6 +64,34 @@ What a cancel still needs, and why:
 * a strategy id -- so the cancellation lands in the same position's history as
   the send it retracts, rather than as an orphan event.
 
+**A pass can lose the mandate it started under, and the door checks.**
+:func:`place_combo` takes an optional ``session_lease`` -- a
+:data:`SessionLease`, a callable that answers "do you still hold the session you
+began this pass under?" with a refusal string or ``None``. It is consulted as
+late as anything can be, immediately before the order is armed and handed to
+``placeOrder``, so the window between "authorized" and "transmitted" is the one
+window it closes. A supervisor's drain timeout only *bounds* how long a pass
+that has lost its session may keep running; it does not refuse the send, and
+those are different properties.
+
+It is a callable rather than an import for the reason
+``tests/test_architecture_boundaries.py`` enforces: the thing that knows about
+sessions is the operational tier, and the options domain must not be able to
+name it. The same shape as ``EntryPreflight`` in
+:mod:`engine.options.runner`, injected the same way, and defaulting to ``None``
+so a caller that has no session concept is unaffected.
+
+**The lease fences opens and nothing else, structurally.** The check in
+``place_combo`` is guarded on ``StrategyAction.OPEN``, so a closing or rolling
+order transmits even when the lease is lost -- and even when a caller passes a
+lease that refuses. This is the same asymmetry ``authorize_close`` and
+``authorize_cancel`` already argue for one paragraph up: a stale session is a
+reason to stop *taking on* risk and never a reason to stop *shedding* it. A
+fence that could trap an exit would turn "the scheduler stopped" into "the
+position cannot be closed", which is strictly worse than the thing being
+prevented. Enforcing it here rather than by asking every caller to remember not
+to pass a lease on the exit path is what makes it a property of the code.
+
 **A replace is a new send, and is authorized as one.** :func:`authorize_reprice`
 mints an ordinary :class:`TransmitAuthorization`, so the repriced order goes out
 through :func:`place_combo` past the same digest check as any other -- and, when
@@ -84,7 +112,7 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 from uuid import UUID
 
 from ..errors import RefusedError
@@ -116,6 +144,8 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle avoidance only
 __all__ = [
     "CancelAuthorization",
     "RepricedOrder",
+    "SESSION_LEASE_LOST",
+    "SessionLease",
     "TransmitAuthorization",
     "TransmitResult",
     "authorize_cancel",
@@ -131,6 +161,41 @@ __all__ = [
 # The only object that makes a TransmitAuthorization constructible. Module
 # private, never exported, and held solely by the two authorize_* functions.
 _AUTHORIZATION_KEY = object()
+
+#: Does the caller still hold the session mandate it began this pass under?
+#:
+#: Returns a refusal string naming what was lost, or ``None`` when the mandate
+#: is still held. A **port**, deliberately -- the answer lives in the
+#: operational tier (a scheduler, a session controller, a supervisor) and the
+#: options domain is forbidden by ``tests/test_architecture_boundaries.py`` from
+#: importing any of it. So the answer is injected as a callable, exactly as
+#: :data:`engine.options.runner.EntryPreflight` is.
+#:
+#: Like the preflight, it can only ever *refuse*. There is no return value that
+#: widens anything, and ``None`` -- no lease supplied -- means no fence.
+SessionLease = Callable[[], "str | None"]
+
+#: The refusal code a lost lease produces, at both fences.
+#:
+#: One string, greppable, distinct from every other refusal in the engine: an
+#: operator seeing it knows the pass was stopped because its session went away
+#: mid-flight rather than because a risk gate or a reviewer said no.
+SESSION_LEASE_LOST = "OPTIONS_SESSION_LEASE_LOST"
+
+
+def _lease_refusal(session_lease: SessionLease | None) -> str | None:
+    """Ask the lease, treating any failure to answer as a lost lease.
+
+    Fail-closed for the same reason ``run_once`` treats a raising preflight as a
+    refusal: a lease that cannot say whether the session is still held has, for
+    every purpose that matters here, not said yes.
+    """
+    if session_lease is None:
+        return None
+    try:
+        return session_lease() or None
+    except Exception as exc:  # noqa: BLE001 - a lease that cannot answer is lost
+        return f"the session lease check raised {type(exc).__name__}: {exc}"
 
 
 def _digest_payload(intent: OptionStrategyIntent) -> dict[str, Any]:
@@ -842,6 +907,7 @@ def place_combo(
     poll_seconds: float = 0.5,
     observed_at: dt.datetime | None = None,
     sink: OrderLifecycleSink | None = None,
+    session_lease: SessionLease | None = None,
 ) -> TransmitResult:
     """Transmit a combo order. **The only transmitting call in this package.**
 
@@ -852,6 +918,20 @@ def place_combo(
     The identity check below is not redundant with the token's own validation:
     the token proves *some* strategy was approved, and this proves it was **this**
     one. Without it, an approval for a 1-lot could transmit a 10-lot.
+
+    ``session_lease`` is the last fence, and it is about *time* rather than
+    about the order. Every other check here asks "is this the structure that was
+    approved"; this one asks "does the caller still hold the session it was
+    approved under". A scheduler-driven pass that loses its session between
+    authorization and this line is authorized to send an order on behalf of a
+    session that no longer exists, and refusing that is not the same thing as
+    the supervisor eventually timing the pass out. Defaults to ``None``, which
+    is no fence and byte-for-byte the previous behaviour.
+
+    **It fences opens only.** A CLOSE or a ROLL transmits regardless of what the
+    lease says, and the guard below says so structurally rather than relying on
+    callers not to pass one -- see the module docstring. A lost session must
+    never be the reason a position cannot be exited.
     """
     if not isinstance(authorization, TransmitAuthorization):
         raise RefusedError(
@@ -908,6 +988,25 @@ def place_combo(
             raise RefusedError(
                 "the order about to be sent is not the order that was approved",
                 hint="; ".join(drift),
+            )
+
+    # The session fence, and it is deliberately the last thing checked. Every
+    # gate above is about the order; this one is about whether the caller still
+    # has standing to send it at all. Placed here -- after the order object
+    # exists, before it is armed -- so the window it closes is as small as the
+    # code can make it. Nothing has reached the broker yet, so refusing costs
+    # exactly the local objects built above.
+    #
+    # Opens only. A close or a roll is exempt by construction: see the module
+    # docstring, and ``authorize_close``'s exemption from the governor and the
+    # daily cap, which this is the transmission-time twin of.
+    if intent.strategy_action is StrategyAction.OPEN:
+        lost = _lease_refusal(session_lease)
+        if lost is not None:
+            raise RefusedError(
+                f"{SESSION_LEASE_LOST}: {lost}",
+                hint="the session this order was authorized under is no longer "
+                "held; nothing was sent, and the authorization is spent",
             )
 
     # Set explicitly rather than relying on ib_async's default. This is the one

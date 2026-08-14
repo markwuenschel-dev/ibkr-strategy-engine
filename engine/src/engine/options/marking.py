@@ -987,7 +987,9 @@ def mark_open_positions(
         else:
             try:
                 snapshot = market_data.strategy_quotes(
-                    underlying_symbol=position.underlying, con_ids=con_ids
+                    underlying_symbol=position.underlying,
+                    con_ids=con_ids,
+                    require_two_sided=True,
                 )
             except Exception as exc:  # noqa: BLE001 - adapter boundary, see scan.py
                 error = exc

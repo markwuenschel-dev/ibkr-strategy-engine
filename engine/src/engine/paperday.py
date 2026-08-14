@@ -40,8 +40,6 @@ import json
 import os
 import platform
 import re
-import socket
-import subprocess
 import sys
 import tempfile
 import time
@@ -52,6 +50,13 @@ from typing import Any, Callable
 
 from . import _collabkit
 from .errors import EngineError
+from .runtime import (
+    EngineCommandResult,
+    EngineCommandRunner,
+    SubprocessProcessPort,
+    _engine_dir,
+    default_tcp_probe,
+)
 
 __all__ = [
     "PaperDayPaths",
@@ -68,9 +73,20 @@ __all__ = [
     "GATE_OPEN",
     "GATE_PROOF_ONLY",
     "GATE_CLOSED",
+    "GATE_SCHEMA_VERSION",
+    "GATE_CONFIGURATION_FINGERPRINT",
+    "MANDATE_MANAGE_ONLY",
+    "MANDATE_FULL",
     "main_start",
     "main_stop",
     "main_status",
+    # Re-exported from :mod:`engine.runtime`, which now owns the shared process
+    # primitives so a scheduler can use them without importing this module.
+    # Callers that imported them from here keep working.
+    "SubprocessProcessPort",
+    "EngineCommandResult",
+    "EngineCommandRunner",
+    "default_tcp_probe",
 ]
 
 READY = "PAPER_DAY_READY"
@@ -86,6 +102,11 @@ STOPPED = "PAPER_DAY_STOPPED"
 GATE_OPEN = "OPEN"
 GATE_PROOF_ONLY = "PROOF_ONLY"
 GATE_CLOSED = "CLOSED"
+GATE_SCHEMA_VERSION = 1
+GATE_CONFIGURATION_FINGERPRINT = "configuration_fingerprint"
+MANDATE_MANAGE_ONLY = "MANAGE_ONLY"
+MANDATE_FULL = "FULL"
+_MANDATES = frozenset({MANDATE_MANAGE_ONLY, MANDATE_FULL})
 
 EXIT_READY = 0
 EXIT_DEGRADED = 10
@@ -102,15 +123,11 @@ _REVIEWER_NEEDLES = ("watch-for-grok-handoffs.py", "autonomous-reviewer-watch.py
 # ---------------------------------------------------------------------------
 
 
-def _engine_dir() -> Path:
-    """The ``engine/`` directory, located from this file -- never from cwd.
-
-    The state directory defaulting to ``Path.cwd()/.engine`` has already
-    produced one split-brain book (2026-07-31: a doctor run from the repo root
-    invented a fresh empty ``.engine``). The controller refuses to repeat that:
-    every path it derives is anchored to the installed package location.
-    """
-    return Path(__file__).resolve().parents[2]
+# ``_engine_dir`` now lives in ``engine.runtime`` (imported above) because
+# ``EngineCommandRunner`` needs it and that module may not import this one.
+# ``runtime.py`` sits in the same package directory as this file, so
+# ``Path(__file__).resolve().parents[2]`` resolves to the identical ``engine/``
+# directory -- the anchor, and therefore the state dir, is unchanged.
 
 
 def _repo_root() -> Path:
@@ -179,6 +196,30 @@ def _read_json(path: Path) -> dict[str, Any] | None:
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Publish controller state without exposing a torn JSON record."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            json.dump(payload, stream, indent=2, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
 
 
 @dataclass
@@ -269,118 +310,13 @@ class StatusReport:
 
 # ---------------------------------------------------------------------------
 # ports -- everything the tests need to fake lives behind one of these
+#
+# ``SubprocessProcessPort``, ``EngineCommandResult``, ``EngineCommandRunner``
+# and ``default_tcp_probe`` now live in :mod:`engine.runtime` and are imported
+# at the top of this module. They moved so a scheduler can reuse them without
+# importing this controller; they are re-exported here (see ``__all__``) so
+# every existing caller and test import keeps working unchanged.
 # ---------------------------------------------------------------------------
-
-
-class SubprocessProcessPort:
-    """Real process management, Windows-flavoured.
-
-    ``cmdline`` matters as much as liveness: a PID alone can be reused by the
-    OS, and killing or trusting a stranger's process because it inherited a
-    number is exactly the stale-PID failure this controller exists to prevent.
-    """
-
-    def pids_matching(self, needle: str) -> list[int]:
-        script = (
-            "Get-CimInstance Win32_Process | "
-            f"Where-Object {{ $_.CommandLine -like '*{needle}*' }} | "
-            "Select-Object -ExpandProperty ProcessId"
-        )
-        out = self._powershell(script)
-        return [int(token) for token in out.split() if token.strip().isdigit()]
-
-    def cmdline(self, pid: int) -> str:
-        script = (
-            f"(Get-CimInstance Win32_Process -Filter \"ProcessId={int(pid)}\").CommandLine"
-        )
-        return self._powershell(script).strip()
-
-    def alive(self, pid: int) -> bool:
-        return bool(self.cmdline(pid))
-
-    def spawn_detached(
-        self, args: list[str], *, env: dict[str, str], cwd: Path, log: Path
-    ) -> int:
-        log.parent.mkdir(parents=True, exist_ok=True)
-        detached = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-        with open(log, "ab") as stream:
-            process = subprocess.Popen(  # noqa: S603 - args are module-controlled
-                args,
-                stdout=stream,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                env=env,
-                cwd=str(cwd),
-                creationflags=detached if os.name == "nt" else 0,
-            )
-        return int(process.pid)
-
-    def terminate(self, pid: int) -> None:
-        if os.name == "nt":
-            subprocess.run(  # noqa: S603
-                ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
-                capture_output=True,
-                check=False,
-            )
-        else:  # pragma: no cover - non-Windows fallback
-            with contextlib.suppress(OSError):
-                os.kill(int(pid), 15)
-
-    def _powershell(self, script: str) -> str:
-        completed = subprocess.run(  # noqa: S603
-            ["powershell", "-NoProfile", "-Command", script],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        return completed.stdout or ""
-
-
-@dataclass
-class EngineCommandResult:
-    code: int
-    stdout: str
-
-
-class EngineCommandRunner:
-    """Runs one engine CLI command in a subprocess with the state dir pinned.
-
-    A subprocess rather than an in-process call so each command owns its broker
-    connection and its failure exits cleanly; ``IBKR_STATE_DIR`` is pinned
-    explicitly so the command operates on the same book regardless of cwd.
-    """
-
-    def __init__(self, state_dir: Path) -> None:
-        self.state_dir = state_dir
-
-    def run(self, args: list[str], *, timeout: float = 300.0) -> EngineCommandResult:
-        env = {**os.environ, "IBKR_STATE_DIR": str(self.state_dir)}
-        completed = subprocess.run(  # noqa: S603
-            [
-                sys.executable,
-                "-c",
-                "import sys; from engine.cli import main; sys.exit(main(sys.argv[1:]))",
-                *args,
-            ],
-            capture_output=True,
-            text=True,
-            env=env,
-            cwd=str(_engine_dir()),
-            timeout=timeout,
-            check=False,
-        )
-        return EngineCommandResult(
-            code=completed.returncode,
-            stdout=(completed.stdout or "") + (completed.stderr or ""),
-        )
-
-
-def default_tcp_probe(host: str, port: int, *, timeout: float = 3.0) -> bool:
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
 
 
 # ---------------------------------------------------------------------------
@@ -392,25 +328,49 @@ def read_gate(paths: PaperDayPaths) -> dict[str, Any] | None:
     return _read_json(paths.gate)
 
 
-def write_gate(paths: PaperDayPaths, *, entry_gate: str, state: str, session_id: str,
-               now: dt.datetime) -> None:
-    _write_json(
-        paths.gate,
-        {
-            "entry_gate": entry_gate,
-            "state": state,
-            "session_id": session_id,
-            "as_of": now.isoformat(),
-        },
-    )
+def write_gate(
+    paths: PaperDayPaths,
+    *,
+    entry_gate: str,
+    state: str,
+    session_id: str,
+    now: dt.datetime,
+    fencing_token: str | None = None,
+    mandate: str = MANDATE_MANAGE_ONLY,
+    configuration_fingerprint: str | None = None,
+) -> None:
+    if mandate not in _MANDATES:
+        raise ValueError(f"unknown paper-day mandate {mandate!r}")
+    if configuration_fingerprint is not None and not configuration_fingerprint.strip():
+        raise ValueError("paper-day configuration fingerprint must be non-empty when supplied")
+    payload = {
+        "schema_version": GATE_SCHEMA_VERSION,
+        "entry_gate": entry_gate,
+        "state": state,
+        "session_id": session_id,
+        "mandate": mandate,
+        "fencing_token": fencing_token,
+        "as_of": now.isoformat(),
+    }
+    if configuration_fingerprint is not None:
+        payload[GATE_CONFIGURATION_FINGERPRINT] = configuration_fingerprint
+    _atomic_write_json(paths.gate, payload)
 
 
-def entry_gate_preflight(paths: PaperDayPaths | None = None) -> Callable[..., str | None]:
+def entry_gate_preflight(
+    paths: PaperDayPaths | None = None,
+    *,
+    expected_configuration_fingerprint: str | None = None,
+) -> Callable[..., str | None]:
     """The runner ``entry_preflight`` that makes the session gate real.
 
     Refusal semantics (the preflight runs before a verification proposal is
     filed, so refusing here prevents both proposals and orders):
 
+    - an unknown schema, mandate or gate value -> refuse armed entries
+    - MANAGE_ONLY -> refuse armed entries regardless of health
+    - FULL with a supplied expected config/policy fingerprint -> refuse armed
+      entries when the session recorded no fingerprint or a different one
     - gate file says CLOSED           -> refuse always
     - gate file says PROOF_ONLY       -> refuse only armed entries
     - gate file says OPEN             -> allow, *unless* the session lock is
@@ -427,13 +387,58 @@ def entry_gate_preflight(paths: PaperDayPaths | None = None) -> Callable[..., st
                   policy: Any = None, now: Any = None, armed: bool = False) -> str | None:
         gate = read_gate(resolved)
         if gate is None:
+            if resolved.gate.exists():
+                return (
+                    "paper-day gate exists but is unreadable; entry consideration "
+                    "refuses until start-paper-day rewrites it"
+                )
             if armed:
                 return (
                     "no paper-day session gate exists; armed opening entries require "
                     "PAPER_DAY_READY -- run bin\\start-paper-day.ps1"
                 )
             return None
-        entry_gate = str(gate.get("entry_gate", GATE_CLOSED))
+        schema = gate.get("schema_version")
+        mandate = gate.get("mandate")
+        entry_gate = gate.get("entry_gate")
+        if schema != GATE_SCHEMA_VERSION:
+            return (
+                "ENTRY_REFUSED_BY_MANAGE_ONLY: paper-day gate schema is unknown "
+                "or stale; run start-paper-day again"
+            )
+        if mandate not in _MANDATES:
+            return (
+                "ENTRY_REFUSED_BY_MANAGE_ONLY: paper-day mandate is unknown; "
+                "opening risk is refused until the session is restarted"
+            )
+        if armed and mandate == MANDATE_MANAGE_ONLY:
+            return (
+                "ENTRY_REFUSED_BY_MANAGE_ONLY: this paper-day session is "
+                "management-only; exits and reconciliation remain enabled"
+            )
+        if armed and mandate == MANDATE_FULL and expected_configuration_fingerprint is not None:
+            expected = expected_configuration_fingerprint.strip()
+            if not expected:
+                return (
+                    "ENTRY_REFUSED_BY_FINGERPRINT: the live configuration "
+                    "fingerprint is missing; armed opening entries refuse"
+                )
+            recorded = gate.get(GATE_CONFIGURATION_FINGERPRINT)
+            if not isinstance(recorded, str) or not recorded.strip():
+                return (
+                    "ENTRY_REFUSED_BY_FINGERPRINT: this FULL paper-day session "
+                    "recorded no risk/configuration fingerprint; restart the "
+                    "paper day under the current config and policy"
+                )
+            if recorded != expected:
+                return (
+                    "ENTRY_REFUSED_BY_FINGERPRINT: this FULL paper-day session "
+                    "was armed under a different risk/configuration fingerprint; "
+                    "restart the paper day before opening new risk"
+                )
+        if entry_gate not in {GATE_OPEN, GATE_PROOF_ONLY, GATE_CLOSED}:
+            return "paper-day gate value is unknown; entry consideration refuses"
+        entry_gate = str(entry_gate)
         state = str(gate.get("state", "?"))
         if entry_gate == GATE_CLOSED:
             return (
@@ -441,11 +446,22 @@ def entry_gate_preflight(paths: PaperDayPaths | None = None) -> Callable[..., st
                 "no new entry proposals or orders until the next start-paper-day"
             )
         if entry_gate == GATE_OPEN:
-            if armed and not resolved.lock.exists():
+            lock = _read_json(resolved.lock)
+            if lock is None:
                 return (
                     "the paper-day gate says OPEN but no session lock exists -- "
-                    "treating as a crashed session; armed entries refuse until "
+                    "treating as a crashed session; entry consideration refuses until "
                     "start-paper-day runs again"
+                )
+            if (
+                lock.get("session_id") != gate.get("session_id")
+                or not isinstance(gate.get("fencing_token"), str)
+                or not gate.get("fencing_token")
+                or lock.get("fencing_token") != gate.get("fencing_token")
+            ):
+                return (
+                    "the paper-day gate identity does not match the active session "
+                    "lock; refusing stale entry authority"
                 )
             return None
         if armed:
@@ -481,8 +497,36 @@ class PaperDayController:
     #: Overridable config source, so tests can inject a stub or a refusing
     #: config without touching the operator's real .env.
     config_loader: Callable[[], Any] | None = None
+    #: The scheduler policy, or None for no scheduler at all.
+    #:
+    #: There is deliberately no default :class:`~engine.scheduler.SchedulerSpec`.
+    #: Cadence and the command to run are policy, and a policy nobody stated is
+    #: the kind of thing that gets inherited by accident and discovered in a
+    #: fill. ``None`` means a paper day behaves exactly as it did before the
+    #: scheduler existed.
+    scheduler: Any = None  # SchedulerSpec | None
+    #: Overridable so a test gets a deterministic scheduler nonce.
+    nonce_factory: Callable[[], str] = lambda: uuid.uuid4().hex[:8]
+    #: How long stop waits for an in-flight tick before forcing the issue.
+    scheduler_drain_timeout: float = 120.0
+    #: How long start waits for the scheduler's readiness handshake.
+    scheduler_ready_timeout: float = 30.0
+    #: New sessions are safe by default. FULL is an explicit caller choice and
+    #: is never inferred from a healthy broker or an OPEN gate.
+    mandate: str = MANDATE_MANAGE_ONLY
+    #: Optional live config+policy fingerprint supplied by the caller that owns
+    #: those objects. The controller records it but deliberately does not invent
+    #: policy defaults to compute one for itself.
+    configuration_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
+        if self.mandate not in _MANDATES:
+            raise ValueError(f"unknown paper-day mandate {self.mandate!r}")
+        if (
+            self.configuration_fingerprint is not None
+            and not self.configuration_fingerprint.strip()
+        ):
+            raise ValueError("paper-day configuration fingerprint must be non-empty")
         if self.engine is None:
             self.engine = EngineCommandRunner(self.paths.state_dir)
 
@@ -640,9 +684,28 @@ class PaperDayController:
             payload["mechanics_proof_at"] = now.isoformat()
             _write_json(self.paths.last_verification, payload)
 
-        # -- 13. decide, write the gate, done ------------------------------
+        # -- 13. decide, write the gate ------------------------------------
         report.decide()
         self._write_gate_for(report, now)
+
+        # -- 14. only now may a scheduler exist ----------------------------
+        #
+        # Deliberately last, and after the gate write at step 13. The scheduler
+        # runs ``options-run --arm``; its very first tick reads whatever
+        # ``gate.json`` says at that instant. Started any earlier it would be
+        # reading the *previous* session's gate -- which may say OPEN -- while
+        # this session is still reconciling, marking and proving the verifier.
+        # An armed child acting on a stale opening licence is precisely the
+        # stale-gate race, and starting it beside the builder watcher for
+        # symmetry reintroduced it.
+        #
+        # A scheduler that fails to start still only degrades the day, so this
+        # cannot turn a healthy book into a refused one -- but the state was
+        # already decided above, so a degrading failure here is recorded and
+        # re-decided rather than silently ignored.
+        if self._ensure_scheduler(report):
+            report.decide()
+            self._write_gate_for(report, now)
         return report
 
     # -- start helpers -----------------------------------------------------
@@ -664,7 +727,45 @@ class PaperDayController:
             state=report.state,
             session_id=report.session_id,
             now=now,
+            fencing_token=self._current_fencing_token(),
+            mandate=self._current_mandate(),
+            configuration_fingerprint=self._current_configuration_fingerprint(),
         )
+
+    def _current_mandate(self) -> str:
+        existing = read_gate(self.paths)
+        if (
+            existing is not None
+            and existing.get("session_id") == self._session_id_from_lock()
+            and existing.get("mandate") in _MANDATES
+        ):
+            return str(existing["mandate"])
+        return self.mandate
+
+    def _current_configuration_fingerprint(self) -> str | None:
+        existing = read_gate(self.paths)
+        session_id = self._session_id_from_lock()
+        existing_fingerprint = (
+            existing.get(GATE_CONFIGURATION_FINGERPRINT) if existing is not None else None
+        )
+        if (
+            existing is not None
+            and existing.get("session_id") == session_id
+            and isinstance(existing_fingerprint, str)
+            and existing_fingerprint.strip()
+        ):
+            return existing_fingerprint
+        return self.configuration_fingerprint
+
+    def _session_id_from_lock(self) -> str | None:
+        lock = _read_json(self.paths.lock)
+        value = lock.get("session_id") if lock else None
+        return value if isinstance(value, str) else None
+
+    def _current_fencing_token(self) -> str | None:
+        lock = _read_json(self.paths.lock)
+        token = lock.get("fencing_token") if lock else None
+        return token if isinstance(token, str) and token else None
 
     def _acquire_lock(self, report: StartReport, now: dt.datetime) -> str | None:
         """Returns "fresh", "already", or None (blocked)."""
@@ -696,14 +797,15 @@ class PaperDayController:
             )
             with contextlib.suppress(OSError):
                 self.paths.lock.unlink()
-        payload = json.dumps(
-            {
-                "session_id": report.session_id,
-                "started_at": now.isoformat(),
-                "controller_pid": os.getpid(),
-            },
-            indent=2,
-        )
+        lock_payload = {
+            "session_id": report.session_id,
+            "started_at": now.isoformat(),
+            "controller_pid": os.getpid(),
+            "fencing_token": uuid.uuid4().hex,
+        }
+        if self.configuration_fingerprint is not None:
+            lock_payload[GATE_CONFIGURATION_FINGERPRINT] = self.configuration_fingerprint
+        payload = json.dumps(lock_payload, indent=2)
         try:
             handle = os.open(self.paths.lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except OSError as exc:
@@ -770,6 +872,226 @@ class PaperDayController:
         )
         report.watcher_pid = new_pid
         report.add("builder watcher", True, f"started, pid {new_pid}")
+
+    def _scheduler_identity(self, session_id: str) -> Any:
+        """This session's scheduler identity, reusing the nonce if one exists.
+
+        Minting a fresh nonce on every start would break idempotent restart: the
+        running child carries the *old* nonce, adoption compares the new one,
+        the match fails, and a perfectly healthy scheduler is reported as a
+        stranger while the day degrades. The nonce identifies the scheduler for
+        the life of the session, not the life of a ``start`` call.
+        """
+        from .scheduler import SchedulerIdentity, SchedulerPaths, read_scheduler_record
+
+        record = read_scheduler_record(SchedulerPaths(root=self.paths.root)) or {}
+        if record.get("session_id") == session_id:
+            nonce = record.get("nonce")
+            if isinstance(nonce, str) and nonce.strip():
+                return SchedulerIdentity(session_id=session_id, nonce=nonce)
+        return SchedulerIdentity(session_id=session_id, nonce=self.nonce_factory())
+
+    def _ensure_scheduler(self, report: StartReport) -> bool:
+        """Adopt or start this session's scheduler, if the day was given one.
+
+        Returns whether a check was added, so the caller can re-decide the
+        session state -- this runs after ``decide()`` on purpose (see step 14).
+
+        Absent policy, this is a no-op that adds no check at all -- a paper day
+        without a :class:`SchedulerSpec` is exactly the day that existed before
+        this module. A scheduler that will not start is *degrading*: the book
+        stays trustworthy and every manual command still works, so refusing the
+        whole day over it would be the wrong trade.
+        """
+        if self.scheduler is None:
+            return False
+
+        from .scheduler import SchedulerPaths, adopt_or_spawn
+
+        identity = self._scheduler_identity(report.session_id)
+        pid, detail = adopt_or_spawn(
+            processes=self.processes,
+            paths=SchedulerPaths(root=self.paths.root),
+            identity=identity,
+            spec=self.scheduler,
+            cwd=_engine_dir(),
+            env={**os.environ, "IBKR_STATE_DIR": str(self.paths.state_dir)},
+            clock=self.clock,
+            sleep=self.sleep,
+            python=sys.executable,
+            monotonic=time.monotonic,
+            ready_timeout=self.scheduler_ready_timeout,
+        )
+        report.add("scheduler", pid is not None, detail, severity="degrading")
+        return True
+
+    def _stop_lock_identity(self, lock: dict[str, Any] | None) -> tuple[str, ...]:
+        """Return the session/fencing identity represented by a lock snapshot."""
+        if lock is None:
+            return ("no-session",)
+        session_id = str(lock.get("session_id", ""))
+        token = lock.get("fencing_token")
+        if not isinstance(token, str) or not token:
+            # Keep recovery of legacy locks possible while still distinguishing
+            # their session metadata from a replacement lock.
+            token = "legacy:" + json.dumps(
+                {
+                    "session_id": session_id,
+                    "started_at": lock.get("started_at"),
+                    "controller_pid": lock.get("controller_pid"),
+                },
+                sort_keys=True,
+            )
+        return ("session", session_id, token)
+
+    def _current_stop_lock_identity(self) -> tuple[str, ...]:
+        if not self.paths.lock.exists():
+            return ("no-session",)
+        lock = _read_json(self.paths.lock)
+        return ("invalid-lock",) if lock is None else self._stop_lock_identity(lock)
+
+    def _stop_owns(self, expected: tuple[str, ...]) -> bool:
+        return self._current_stop_lock_identity() == expected
+
+    def _taken_over_by_another_session(self, expected: tuple[str, ...]) -> bool:
+        """Whether a DIFFERENT, readable session demonstrably holds the lock now.
+
+        Deliberately narrower than ``not _stop_owns(...)``, and the difference is
+        a safety property rather than a nicety. Two situations are not the same:
+
+        * **We cannot prove who owns this** -- the lock is absent, truncated or
+          unparseable. Ownership is unknown.
+        * **Somebody else provably owns this** -- a readable lock naming another
+          session.
+
+        Only the second is a takeover. Conflating them made a *corrupt* lock
+        abandon ``stop`` before it wrote the gate, so a crash mid-lock-write left
+        the entry gate in whatever position the day held -- possibly OPEN. That
+        is a fail-*open*, and the gate-closes-first ordering exists precisely so
+        no downstream failure can leave a standing opening licence.
+
+        Closing the gate is risk-reducing: it can only refuse new entries, and
+        never traps a position. So it proceeds whenever ownership is merely
+        unknown. The risk-bearing steps -- draining, cancelling, unlinking --
+        still demand positive proof via :meth:`_stop_owns`.
+        """
+        current = self._current_stop_lock_identity()
+        if not current or current[0] != "session":
+            return False
+        return current != expected
+
+    def _require_stop_ownership(
+        self, report: StopReport, expected: tuple[str, ...], phase: str
+    ) -> bool:
+        if self._stop_owns(expected):
+            return True
+        report.add(
+            "session ownership",
+            False,
+            f"stop abandoned before {phase}; lock/fencing identity changed, "
+            "so replacement session state was left untouched",
+        )
+        return False
+
+    def _publish_last_shutdown(
+        self,
+        report: StopReport,
+        expected: tuple[str, ...],
+        payload: dict[str, Any],
+    ) -> bool:
+        """Publish shutdown proof only while the released lease is still free.
+
+        Releasing the old lock is not the end of the ownership protocol.  A
+        replacement can acquire it before the old controller writes its
+        shutdown marker.  The marker is therefore a compare-and-swap boundary:
+        require the lock to be absent, publish atomically, then check again and
+        remove only our marker if a replacement won the race.
+        """
+        del expected  # the post-release state is intentionally ``no-session``
+        free = ("no-session",)
+        if self._current_stop_lock_identity() != free:
+            report.add(
+                "session ownership",
+                False,
+                "replacement session acquired the lock before last shutdown; "
+                "old shutdown proof was not published",
+            )
+            return False
+
+        _atomic_write_json(self.paths.last_shutdown, payload)
+        if self._current_stop_lock_identity() != free:
+            if _read_json(self.paths.last_shutdown) == payload:
+                with contextlib.suppress(OSError):
+                    self.paths.last_shutdown.unlink()
+            report.add(
+                "session ownership",
+                False,
+                "replacement session acquired the lock during last-shutdown "
+                "publication; old shutdown proof was withdrawn",
+            )
+            return False
+        return True
+
+    def _stop_scheduler(
+        self, report: StopReport, now: dt.datetime, expected: tuple[str, ...]
+    ) -> None:
+        """Quiesce the scheduler and wait for its tick, before anything cancels.
+
+        The identity comes from the scheduler's own record rather than from this
+        controller, because stop must be able to reach a scheduler started by a
+        *previous* invocation. A record that cannot be identified terminates
+        nothing: an unidentifiable process is a stranger.
+        """
+        from .scheduler import (
+            SchedulerPaths,
+            drain_and_stop,
+            identity_from_record,
+            read_scheduler_record,
+            request_quiesce,
+        )
+
+        if not self._require_stop_ownership(report, expected, "scheduler drain"):
+            return
+        paths = SchedulerPaths(root=self.paths.root)
+        record = read_scheduler_record(paths)
+        if record is None:
+            return
+
+        # Fail closed. The quiesce flag goes down BEFORE any identity reasoning
+        # that could bail out, because every later branch here can return
+        # without stopping anything -- and stop then goes on to cancel working
+        # orders with --arm and release the session lock. A scheduler we could
+        # not identify is exactly the one we most need to have asked to stop:
+        # the flag is read at the top of every tick, so even an unidentifiable
+        # child halts at its next boundary.
+        if not self._require_stop_ownership(report, expected, "scheduler quiesce"):
+            return
+        request_quiesce(paths, reason="paper-day stop", now=now)
+
+        identity = identity_from_record(record)
+        if identity is None:
+            report.add(
+                "scheduler",
+                False,
+                f"scheduler record at {paths.pid} names no session/nonce -- "
+                "quiesce requested, nothing terminated; a live tick will stop at "
+                "its next boundary, but its shutdown is unproven. Reconcile, and "
+                "remove the record by hand once you know what it was",
+            )
+            return
+
+        if not self._require_stop_ownership(report, expected, "scheduler termination"):
+            return
+        clean, detail = drain_and_stop(
+            processes=self.processes,
+            paths=paths,
+            identity=identity,
+            now=now,
+            drain_timeout=self.scheduler_drain_timeout,
+            sleep=self.sleep,
+            monotonic=time.monotonic,
+        )
+        report.add("scheduler", clean, detail)
 
     def _recover_handoffs(self, report: StartReport, now: dt.datetime) -> None:
         try:
@@ -913,23 +1235,59 @@ class PaperDayController:
         report = StopReport()
         now = self.clock()
         lock = _read_json(self.paths.lock)
+        expected_owner = self._stop_lock_identity(lock)
+        expected_watcher = _read_json(self.paths.watcher_pid)
         session_id = str((lock or {}).get("session_id", "unknown-session"))
 
         # -- 1. gate first: no new proposals from this instant --------------
+        #
+        # Guarded by takeover, NOT by strict ownership. Closing the gate is the
+        # one risk-reducing act in this whole sequence, so it is withheld only
+        # when another readable session provably owns the lock -- never merely
+        # because we could not read it. See _taken_over_by_another_session.
+        if self._taken_over_by_another_session(expected_owner):
+            report.add(
+                "session ownership",
+                False,
+                "stop abandoned before entry gate; another session now holds the "
+                "lock, so its gate and state were left untouched",
+            )
+            return report
         write_gate(
-            self.paths, entry_gate=GATE_CLOSED, state=STOPPED, session_id=session_id, now=now
+            self.paths,
+            entry_gate=GATE_CLOSED,
+            state=STOPPED,
+            session_id=session_id,
+            now=now,
+            fencing_token=(lock or {}).get("fencing_token") if lock else None,
         )
         report.add("entry gate", True, "CLOSED before anything else")
         if lock is None:
             report.add("session lock", True, "no active session -- verifying stopped state")
 
+        # -- 1b. drain the scheduler, before anything transmits --------------
+        #
+        # Deliberately here and not beside the builder watcher at step 7. Step 2
+        # cancels working entries with --arm and the session lock is not
+        # released until step 8, so a scheduler still ticking through those
+        # steps could have a pass in flight while stop is cancelling. Closing
+        # the gate first bounds what a live tick may still *open*; it does not
+        # stop one that already passed the gate.
+        self._stop_scheduler(report, now, expected_owner)
+        if not self._require_stop_ownership(report, expected_owner, "working-order cancel"):
+            return report
+
         # -- 2. working entry orders ----------------------------------------
-        self._cancel_working_entries(report)
+        self._cancel_working_entries(report, expected_owner)
+        if not self._require_stop_ownership(report, expected_owner, "handoff settlement"):
+            return report
 
         # -- 3. outstanding handoffs ----------------------------------------
         pending_reviews = self._settle_handoffs(report, now)
 
         # -- 4. reconcile and mark ------------------------------------------
+        if not self._require_stop_ownership(report, expected_owner, "final reconcile"):
+            return report
         recon = self.engine.run(["options-positions"])
         report.add(
             "final reconcile",
@@ -937,6 +1295,8 @@ class PaperDayController:
             "broker agrees" if "broker agrees" in recon.stdout
             else f"exit {recon.code} -- resolve before the next session",
         )
+        if not self._require_stop_ownership(report, expected_owner, "final mark"):
+            return report
         mark = self.engine.run(["options-mark"])
         marked = mark.code == 0 and bool(re.search(r"MARKED|COMMISSION_INCOMPLETE", mark.stdout))
         report.add(
@@ -947,27 +1307,57 @@ class PaperDayController:
         )
 
         # -- 5. session summary ---------------------------------------------
+        if not self._require_stop_ownership(report, expected_owner, "session summary"):
+            return report
         summary_path = self._write_summary(report, now, session_id, pending_reviews)
         report.add("session summary", True, str(summary_path))
 
         # -- 6. ask the reviewer to stop ------------------------------------
+        if not self._require_stop_ownership(report, expected_owner, "reviewer shutdown"):
+            return report
         self._reviewer_shutdown(report, now)
 
         # -- 7. builder watcher ---------------------------------------------
-        self._stop_watcher(report)
+        self._stop_watcher(report, expected_owner, expected_watcher)
 
         # -- 8. clear only what is ours and valid ---------------------------
-        if self.paths.lock.exists():
-            with contextlib.suppress(OSError):
+        if not self._require_stop_ownership(report, expected_owner, "session release"):
+            return report
+        released = expected_owner == ("no-session",)
+        current_lock = _read_json(self.paths.lock)
+        if current_lock is not None:
+            if self._stop_lock_identity(current_lock) != expected_owner:
+                report.add(
+                    "session lock",
+                    False,
+                    "lock identity changed before release -- replacement lock retained",
+                )
+                return report
+            try:
                 self.paths.lock.unlink()
+            except OSError as exc:
+                report.add("session lock", False, f"could not release: {exc}")
+                return report
+            released = True
             report.add("session lock", True, "released")
-        _write_json(
-            self.paths.last_shutdown,
-            {"at": now.isoformat(), "clean": report.clean, "session_id": session_id},
-        )
+        if released:
+            self._publish_last_shutdown(
+                report,
+                expected_owner,
+                {
+                    "at": now.isoformat(),
+                    "clean": report.clean,
+                    "session_id": session_id,
+                    "fencing_token": (lock or {}).get("fencing_token") if lock else None,
+                },
+            )
         return report
 
-    def _cancel_working_entries(self, report: StopReport) -> None:
+    def _cancel_working_entries(
+        self, report: StopReport, expected: tuple[str, ...]
+    ) -> None:
+        if not self._require_stop_ownership(report, expected, "working-order listing"):
+            return
         listing = self.engine.run(["options-positions"])
         working = set(
             re.findall(
@@ -981,6 +1371,8 @@ class PaperDayController:
             return
         failures = 0
         for strategy_id in sorted(working):
+            if not self._require_stop_ownership(report, expected, "working-order cancel"):
+                return
             cancelled = self.engine.run(
                 [
                     "options-cancel",
@@ -1104,8 +1496,22 @@ class PaperDayController:
             "proceeding; the reviewer can close the request later",
         )
 
-    def _stop_watcher(self, report: StopReport) -> None:
+    def _stop_watcher(
+        self,
+        report: StopReport,
+        expected: tuple[str, ...],
+        expected_record: dict[str, Any] | None,
+    ) -> None:
+        if not self._require_stop_ownership(report, expected, "watcher stop"):
+            return
         recorded = _read_json(self.paths.watcher_pid)
+        if recorded != expected_record:
+            report.add(
+                "builder watcher",
+                False,
+                "watcher record changed during stop -- replacement watcher retained",
+            )
+            return
         if recorded is None:
             report.add("builder watcher", True, "no pid file -- nothing to stop")
             return
@@ -1119,8 +1525,17 @@ class PaperDayController:
                 f"pid {pid} belongs to another process now -- not killed, record discarded",
             )
         else:
+            if not self._require_stop_ownership(report, expected, "watcher termination"):
+                return
             self.processes.terminate(pid)
             report.add("builder watcher", True, f"terminated pid {pid}")
+        if not self._stop_owns(expected) or _read_json(self.paths.watcher_pid) != expected_record:
+            report.add(
+                "builder watcher",
+                False,
+                "watcher ownership changed before record removal -- record retained",
+            )
+            return
         with contextlib.suppress(OSError):
             self.paths.watcher_pid.unlink()
 
@@ -1368,19 +1783,45 @@ def _consumption_mechanics_proof() -> tuple[bool, str]:
 
 def _controller_from_args(argv: list[str]) -> tuple[PaperDayController, list[str]]:
     timeout = 180.0
+    schedule_config: Path | None = None
+    schedule_config_sha256: str | None = None
     rest: list[str] = []
     iterator = iter(argv)
     for token in iterator:
         if token == "--timeout":
             timeout = float(next(iterator, "180"))
+        elif token == "--schedule-config":
+            schedule_config = Path(next(iterator, ""))
+        elif token == "--schedule-config-sha256":
+            schedule_config_sha256 = next(iterator, "")
         else:
             rest.append(token)
     controller = PaperDayController(liveness_timeout=timeout)
+    if (schedule_config is None) != (schedule_config_sha256 is None):
+        raise ValueError(
+            "--schedule-config and --schedule-config-sha256 must be supplied together"
+        )
+    if schedule_config is not None and schedule_config_sha256 is not None:
+        from .scheduler_bootstrap import build_scheduler_spec
+
+        controller.scheduler = build_scheduler_spec(
+            schedule_config=schedule_config,
+            schedule_config_sha256=schedule_config_sha256,
+            state_dir=controller.paths.state_dir,
+            entry_script=Path(__file__).with_name("scheduler_main.py"),
+        )
     return controller, rest
 
 
 def main_start(argv: list[str] | None = None) -> int:
-    controller, _ = _controller_from_args(list(argv or []))
+    try:
+        controller, _ = _controller_from_args(list(argv or []))
+    except EngineError as exc:
+        print(f"CONFIG: {exc}")
+        return exc.exit_code
+    except ValueError as exc:
+        print(f"CONFIG: {exc}")
+        return EXIT_BLOCKED
     report = controller.start()
     print(report.render())
     return report.exit_code

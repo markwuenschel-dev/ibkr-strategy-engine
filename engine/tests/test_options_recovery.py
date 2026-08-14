@@ -62,7 +62,7 @@ from engine.options.positions import (
     PositionState,
     PositionStore,
 )
-from engine.options.runner import RunReport, run_once
+from engine.options.runner import EntryMode, RunReport, run_once
 from engine.options.selection import Bias
 from engine.options.sink import LifecycleRecorder
 from engine.safety import SafetyGate
@@ -897,6 +897,7 @@ def run_pass(
         store=store,
         policy=policy if policy is not None else RiskPolicy(),
         armed=armed,
+        entry_mode=EntryMode.FULL,
         symbol="SPY",
         bias=Bias.BULLISH,
         market_data=market_data if market_data is not None else FakeMarketDataPort(),
@@ -2452,6 +2453,7 @@ class TestAWorkingEntryIsNotLeftResting:
             store=store,
             policy=RiskPolicy(),
             armed=True,
+            entry_mode=EntryMode.FULL,
             symbol="SPY",
             bias=Bias.BULLISH,
             market_data=FakeMarketDataPort(),

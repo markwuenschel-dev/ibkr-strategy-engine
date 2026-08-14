@@ -62,7 +62,7 @@ from engine.options.positions import (
     PositionStore,
     ReconciliationOutcome,
 )
-from engine.options.runner import RunReport, mark_from_snapshot, run_once
+from engine.options.runner import EntryMode, RunReport, mark_from_snapshot, run_once
 from engine.options.selection import Bias
 from engine.safety import SafetyGate
 
@@ -533,6 +533,7 @@ def run_pass(
         store=store,
         policy=policy if policy is not None else RiskPolicy(),
         armed=armed,
+        entry_mode=EntryMode.FULL,
         symbol="SPY",
         bias=Bias.BULLISH,
         market_data=market_data if market_data is not None else FakeMarketDataPort(),

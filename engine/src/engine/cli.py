@@ -145,7 +145,8 @@ def build_parser() -> argparse.ArgumentParser:
         "options-run",
         help=(
             "one strategy pass: reconcile, manage open positions, consider one "
-            "entry. Requires --arm to transmit anything."
+            "entry. Management-only unless --enable-entry is explicit; "
+            "--arm is still required to transmit."
         ),
     )
     run.add_argument("--symbol", default="SPY")
@@ -175,6 +176,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "actually transmit. Without this the pass runs every gate and shows "
             "exactly what it would have sent, and sends nothing."
+        ),
+    )
+    run.add_argument(
+        "--enable-entry",
+        action="store_true",
+        help=(
+            "explicitly run the FULL opening pipeline. Without this flag, "
+            "every pass is MANAGE_ONLY even when --arm is present."
         ),
     )
 
@@ -533,7 +542,7 @@ def cmd_options_run(args: argparse.Namespace, broker_factory: Any = Broker) -> i
     from .options.adapters import IBKRLiveMarketDataAdapter, IBKRPortfolioStateAdapter
     from .options.policy import RiskPolicy
     from .options.positions import PositionStore
-    from .options.runner import EntryPricing, run_once
+    from .options.runner import EntryMode, EntryPricing, run_once
     from .options.selection import Bias
 
     config = config_from(args)
@@ -552,6 +561,12 @@ def cmd_options_run(args: argparse.Namespace, broker_factory: Any = Broker) -> i
 
     _verifier, _context = _verifier_for(config, policy)
     with broker_factory(config, journal) as broker:
+        paper_preflight = _paper_day_preflight(
+            config,
+            expected_configuration_fingerprint=(
+                _context.configuration_fingerprint if _context is not None else None
+            ),
+        )
         report = run_once(
             broker,
             gate=gate,
@@ -559,6 +574,10 @@ def cmd_options_run(args: argparse.Namespace, broker_factory: Any = Broker) -> i
             store=store,
             policy=policy,
             armed=bool(args.arm),
+            entry_mode=(
+                EntryMode.FULL if getattr(args, "enable_entry", False)
+                else EntryMode.MANAGE_ONLY
+            ),
             symbol=args.symbol.strip().upper(),
             bias=Bias(args.bias),
             market_data=IBKRLiveMarketDataAdapter(
@@ -570,7 +589,8 @@ def cmd_options_run(args: argparse.Namespace, broker_factory: Any = Broker) -> i
             account=config.account_id,
             verifier=_verifier,
             approval_context=_context,
-            entry_preflight=_paper_day_preflight(config),
+            entry_preflight=paper_preflight,
+            session_lease=lambda: paper_preflight(armed=True),
         )
 
     out(report.describe())
@@ -581,7 +601,11 @@ def cmd_options_run(args: argparse.Namespace, broker_factory: Any = Broker) -> i
     return EXIT_OK
 
 
-def _paper_day_preflight(config: EngineConfig) -> Any:
+def _paper_day_preflight(
+    config: EngineConfig,
+    *,
+    expected_configuration_fingerprint: str | None = None,
+) -> Any:
     """The session controller's entry gate, enforced at the runner seam.
 
     Runs after risk and the governor and before a verification proposal is
@@ -591,8 +615,27 @@ def _paper_day_preflight(config: EngineConfig) -> Any:
     """
     from .paperday import PaperDayPaths, entry_gate_preflight
 
-    return entry_gate_preflight(PaperDayPaths(state_dir=config.state_dir))
+    return entry_gate_preflight(
+        PaperDayPaths(state_dir=config.state_dir),
+        expected_configuration_fingerprint=expected_configuration_fingerprint,
+    )
 
+
+def _entry_preflights(*preflights: Any) -> Any:
+    """Run entry preflights in order, stopping at the first refusal."""
+
+    active = tuple(preflight for preflight in preflights if preflight is not None)
+    if not active:
+        return None
+
+    def preflight(**kwargs: Any) -> str | None:
+        for check in active:
+            refusal = check(**kwargs)
+            if refusal:
+                return refusal
+        return None
+
+    return preflight
 
 
 def _verifier_for(config: EngineConfig, policy: Any) -> tuple[Any, Any]:
@@ -907,7 +950,7 @@ def cmd_options_verify_execution(
     from .options.adapters import IBKRLiveMarketDataAdapter, IBKRPortfolioStateAdapter
     from .options.policy import RiskPolicy
     from .options.positions import PositionStore
-    from .options.runner import EntryPricing, run_once
+    from .options.runner import EntryMode, EntryPricing, run_once
     from .options.selection import Bias
 
     config = config_from(args)
@@ -932,6 +975,12 @@ def cmd_options_verify_execution(
 
     _verifier, _context = _verifier_for(config, policy)
     with broker_factory(config, journal) as broker:
+        paper_preflight = _paper_day_preflight(
+            config,
+            expected_configuration_fingerprint=(
+                _context.configuration_fingerprint if _context is not None else None
+            ),
+        )
         report = run_once(
             broker,
             gate=gate,
@@ -939,6 +988,7 @@ def cmd_options_verify_execution(
             store=store,
             policy=policy,
             armed=bool(args.arm),
+            entry_mode=EntryMode.FULL,
             symbol=args.symbol.strip().upper(),
             bias=Bias(args.bias),
             market_data=IBKRLiveMarketDataAdapter(
@@ -950,7 +1000,8 @@ def cmd_options_verify_execution(
             account=config.account_id,
             verifier=_verifier,
             approval_context=_context,
-            entry_preflight=_paper_day_preflight(config),
+            entry_preflight=paper_preflight,
+            session_lease=lambda: paper_preflight(armed=True),
         )
 
     out(report.describe())
@@ -1026,7 +1077,7 @@ def cmd_options_execution_proof(
         RecordingLifecycleSink,
         new_proof_session_id,
     )
-    from .options.runner import EntryPricing, run_once
+    from .options.runner import EntryMode, EntryPricing, run_once
     from .options.selection import Bias
     from .options.sink import LifecycleRecorder
 
@@ -1075,6 +1126,7 @@ def cmd_options_execution_proof(
             store=store,
             policy=policy,
             armed=bool(args.arm),
+            entry_mode=EntryMode.FULL,
             symbol=profile.symbol,
             bias=Bias(args.bias),
             market_data=IBKRLiveMarketDataAdapter(

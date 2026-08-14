@@ -118,6 +118,7 @@ from .proof import PriceEnvelope, envelope_for
 from .approval import ApprovalContext, VerifierGate
 from .transmit import (
     RepricedOrder,
+    SessionLease,
     TransmitAuthorization,
     TransmitResult,
     authorize_cancel,
@@ -392,6 +393,7 @@ def work_order(
     closing: bool = False,
     verifier: VerifierGate | None = None,
     approval_context: ApprovalContext | None = None,
+    session_lease: SessionLease | None = None,
 ) -> RepriceOutcome:
     """Work a transmitted order that is still alive, then stop -- flat or filled.
 
@@ -418,6 +420,11 @@ def work_order(
     Returns a :class:`RepriceOutcome`; raises only what the kill switch raises.
     Every broker interaction is already recorded by the sink as it happens --
     this function's own return value is a report, never the record.
+
+    ``session_lease`` is threaded to every replacement transmission. A reprice
+    is a new OPEN order, so it must re-read the same session fence at the same
+    chokepoint as the initial order. The transmission layer applies the guard
+    only to ``StrategyAction.OPEN``; closing/management work remains unfenced.
     """
     envelope = envelope if envelope is not None else envelope_for(intent)
     tick = tick_size(intent.underlying, intent.limit_price)
@@ -571,6 +578,7 @@ def work_order(
                 timeout=ladder.attempt_timeout,
                 poll_seconds=ladder.poll_seconds,
                 sink=sink,
+                session_lease=session_lease,
             )
         except Exception as exc:  # noqa: BLE001 - a failed replace reports, it does not crash
             return done(

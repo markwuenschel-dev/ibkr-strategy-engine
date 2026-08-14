@@ -141,6 +141,24 @@ class FakeIB:
         self.cancelled.append(int(contract.conId))
 
 
+class TwoSidedFakeIB(FakeIB):
+    """FakeIB whose option books become two-sided on scheduled polls."""
+
+    def __init__(
+        self, *, greek_after: dict[int, int], bid_ask_after: dict[int, int]
+    ) -> None:
+        super().__init__(greek_after=greek_after)
+        self.bid_ask_after = bid_ask_after
+
+    def sleep(self, seconds: float) -> None:
+        super().sleep(seconds)
+        for ticker in self.wrapper.reqId2Ticker.values():
+            due = self.bid_ask_after.get(int(ticker.contract.conId))
+            if due is not None and self._ticks >= due:
+                ticker.bid = 1.00
+                ticker.ask = 1.05
+
+
 def _adapter(ib: FakeIB, **kwargs: Any) -> IBKRLiveMarketDataAdapter:
     return IBKRLiveMarketDataAdapter(
         ib, clock=ib.clock, underlying_lead_seconds=0.0, **kwargs
@@ -238,6 +256,53 @@ class TestTheWaitIsOnDataNotOnAClock:
         _snapshot(ib, settle_seconds=10.0, poll_seconds=1.0)
 
         assert set(ib.cancelled) == {UNDERLYING_CON_ID, *LEG_CON_IDS}
+
+
+class TestTwoSidedWait:
+    def test_chain_scan_default_does_not_wait_for_deep_wings(self) -> None:
+        """Greeks finish the default scan wait; a one-sided wing is returned."""
+        ib = TwoSidedFakeIB(
+            greek_after={101: 1, 102: 1, 103: 1},
+            bid_ask_after={101: 30, 102: 30, 103: 30},
+        )
+        snapshot = _snapshot(ib, settle_seconds=60.0, poll_seconds=1.0)
+
+        assert ib.now - 1000.0 < 10.0
+        assert all(leg.bid is None and leg.ask is None for leg in snapshot.legs)
+
+    def test_selected_structure_waits_for_every_two_sided_leg(self) -> None:
+        """The opt-in wait applies to the exact selected/held structure only."""
+        ib = TwoSidedFakeIB(
+            greek_after={101: 1, 102: 1, 103: 1},
+            bid_ask_after={101: 2, 102: 4, 103: 8},
+        )
+        snapshot = _adapter(ib, settle_seconds=60.0, poll_seconds=1.0).strategy_quotes(
+            underlying_symbol="SPY",
+            con_ids=LEG_CON_IDS,
+            require_two_sided=True,
+        )
+
+        # The zero-second underlying head start still advances the fake's poll
+        # counter once, so the leg scheduled at tick 8 is observed at t+7.
+        assert ib.now - 1000.0 >= 7.0
+        assert all(
+            leg.bid is not None and leg.ask is not None for leg in snapshot.legs
+        )
+
+    def test_selected_structure_deadline_returns_truthfully_one_sided(self) -> None:
+        """Timeout changes patience, not the observed book or downstream gates."""
+        ib = TwoSidedFakeIB(
+            greek_after={101: 1, 102: 1, 103: 1},
+            bid_ask_after={},
+        )
+        snapshot = _adapter(ib, settle_seconds=10.0, poll_seconds=1.0).strategy_quotes(
+            underlying_symbol="SPY",
+            con_ids=LEG_CON_IDS,
+            require_two_sided=True,
+        )
+
+        assert ib.now - 1000.0 <= 11.0
+        assert all(leg.bid is None and leg.ask is None for leg in snapshot.legs)
 
 
 # ---------------------------------------------------------------------------

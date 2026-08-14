@@ -10,6 +10,7 @@ so the liveness round-trip in every test is the shipped lifecycle end to end.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +23,7 @@ NOW = dt.datetime(2026, 8, 1, 13, 0, tzinfo=dt.timezone.utc)
 
 WATCHER_CMD = "python.exe tools/watch-for-claude-handoffs.py"
 REVIEWER_CMD = "python.exe tools/watch-for-grok-handoffs.py"
+WORKING_STRATEGY_ID = "11111111-2222-4333-8444-555555555555"
 
 
 @dataclass
@@ -82,7 +84,10 @@ class FakeEngine:
         self.results: dict[str, EngineCommandResult] = {
             "status": EngineCommandResult(0, "connected to TWS paper as DU1234567"),
             "options-positions": EngineCommandResult(
-                0, "  reconciled: 1 open position(s), broker agrees"
+                0,
+                "  reconciled: 1 open position(s), broker agrees\n"
+                f"  working entry order strategy_id={WORKING_STRATEGY_ID} "
+                "status=Submitted",
             ),
             "options-mark": EngineCommandResult(
                 0, "  MARKED  [MARK_OK] SPY x1 marked from a live two-sided book"
@@ -143,8 +148,18 @@ def harness(
     reviewer_answers: bool = True,
     config: StubConfig | Exception | None = None,
     liveness_timeout: float = 5.0,
+    watcher_running: bool = False,
 ) -> Harness:
-    """A controller wired to fakes plus a REAL collab store in ``tmp_path``."""
+    """A controller wired to fakes plus a REAL collab store in ``tmp_path``.
+
+    ``watcher_running`` pre-registers a live builder watcher and its pid record.
+    It is opt-in, and must stay that way: pre-registering one for every harness
+    changes the default world. ``_ensure_watcher`` then *adopts* instead of
+    spawning, so a test that injects a spawn failure never reaches the spawn and
+    reports READY where it demanded DEGRADED, and the idempotence tests count
+    zero spawns instead of one. Only the teardown-ownership tests need a watcher
+    that already exists.
+    """
     collab_root = reviewer_support.collab_at(tmp_path)
     paths_module = reviewer_support.load("paths", "CollabPaths")
     store = reviewer_support.load("store", "HandoffStore")(paths_module.at(collab_root))
@@ -154,6 +169,13 @@ def harness(
         processes.add(REVIEWER_CMD)
     engine = FakeEngine()
     paths = PaperDayPaths(state_dir=tmp_path / "state")
+    if watcher_running:
+        watcher_pid = processes.add(WATCHER_CMD)
+        paths.root.mkdir(parents=True, exist_ok=True)
+        paths.watcher_pid.write_text(
+            json.dumps({"pid": watcher_pid}),
+            encoding="utf-8",
+        )
 
     resolved_config = config if config is not None else StubConfig()
 

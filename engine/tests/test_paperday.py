@@ -14,6 +14,7 @@ from engine.paperday import (
     GATE_CLOSED,
     GATE_OPEN,
     GATE_PROOF_ONLY,
+    MANDATE_FULL,
     READY,
     _consumption_mechanics_proof,
     entry_gate_preflight,
@@ -67,7 +68,7 @@ class TestEntryGateEnforcement:
     def test_proof_only_gate_allows_unarmed_refuses_armed(self, tmp_path: Path) -> None:
         h = harness(tmp_path)
         write_gate(h.paths, entry_gate=GATE_PROOF_ONLY, state="PAPER_DAY_DEGRADED",
-                   session_id="s", now=NOW)
+                   session_id="s", now=NOW, mandate=MANDATE_FULL)
         preflight = entry_gate_preflight(h.paths)
         assert preflight(armed=False) is None
         refusal = preflight(armed=True)
@@ -81,9 +82,16 @@ class TestEntryGateEnforcement:
     def test_open_gate_without_lock_refuses_armed(self, tmp_path: Path) -> None:
         """A crashed session must not leave a standing armed licence."""
         h = harness(tmp_path)
-        write_gate(h.paths, entry_gate=GATE_OPEN, state=READY, session_id="s", now=NOW)
+        write_gate(
+            h.paths,
+            entry_gate=GATE_OPEN,
+            state=READY,
+            session_id="s",
+            now=NOW,
+            mandate=MANDATE_FULL,
+        )
         preflight = entry_gate_preflight(h.paths)
-        assert preflight(armed=False) is None
+        assert preflight(armed=False) is not None
         refusal = preflight(armed=True)
         assert refusal is not None and "crashed" in refusal
 

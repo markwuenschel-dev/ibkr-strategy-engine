@@ -17,7 +17,9 @@ How long to wait for the reviewer's liveness reply (default 180).
 #>
 [CmdletBinding()]
 param(
-    [int]$TimeoutSeconds = 180
+    [int]$TimeoutSeconds = 180,
+    [string]$ScheduleConfig,
+    [string]$ScheduleConfigSha256
 )
 
 $ErrorActionPreference = "Stop"
@@ -40,6 +42,17 @@ foreach ($required in @(
     }
 }
 
-& $python -c "import sys; from engine.paperday import main_start; sys.exit(main_start(sys.argv[1:]))" `
-    --timeout $TimeoutSeconds
+$controllerArgs = @("--timeout", $TimeoutSeconds)
+if (($null -eq $ScheduleConfig) -xor ($null -eq $ScheduleConfigSha256)) {
+    Write-Error "-ScheduleConfig and -ScheduleConfigSha256 must be supplied together."
+    exit 20
+}
+if ($ScheduleConfig) {
+    $controllerArgs += @(
+        "--schedule-config", $ScheduleConfig,
+        "--schedule-config-sha256", $ScheduleConfigSha256
+    )
+}
+
+& $python -c "import sys; from engine.paperday import main_start; sys.exit(main_start(sys.argv[1:]))" @controllerArgs
 exit $LASTEXITCODE

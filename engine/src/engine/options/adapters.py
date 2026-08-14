@@ -287,6 +287,7 @@ class IBKRLiveMarketDataAdapter:
         *,
         underlying_symbol: str,
         con_ids: Sequence[int],
+        require_two_sided: bool = False,
     ) -> StrategyQuoteSnapshot:
         from ib_async import Contract, Stock  # noqa: PLC0415 - optional dependency
 
@@ -343,11 +344,27 @@ class IBKRLiveMarketDataAdapter:
             # each run, and strike selection becomes a race. Polling the
             # recorder (rather than ``waitOnUpdate``, which drops ticks) lets a
             # good run finish early and a slow one keep waiting.
+            #
+            # ``require_two_sided`` is only for an exact selected structure.
+            # A chain scan must not wait for every deep wing to acquire both
+            # sides, because one illiquid contract would consume the entire
+            # scan deadline. At the deadline this deliberately returns the
+            # observed one-sided book; truthfulness belongs to the snapshot's
+            # downstream gates, not to this bounded wait.
             deadline = self.clock() + self.settle_seconds
             while self.clock() < deadline:
                 self.ib.sleep(self.poll_seconds)
-                if all(recorder.latest_greeks.get(c) is not None for c in option_ids):
-                    break
+                if not all(
+                    recorder.latest_greeks.get(c) is not None for c in option_ids
+                ):
+                    continue
+                if require_two_sided and not all(
+                    _price(getattr(tickers.get(c), "bid", None)) is not None
+                    and _price(getattr(tickers.get(c), "ask", None)) is not None
+                    for c in option_ids
+                ):
+                    continue
+                break
 
             observed_at = _utcnow()
             for con_id, subscription in subscriptions.items():
