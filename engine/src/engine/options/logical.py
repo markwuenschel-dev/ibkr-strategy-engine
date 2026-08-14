@@ -113,6 +113,7 @@ from .domain import (
     OrderAction,
     StrategyType,
 )
+from .execution_outbox import ReceiptJournal, ReceiptKind, exclusive_file_lock, utc_instant
 from .portfolio import PositionExposure
 
 __all__ = [
@@ -123,6 +124,7 @@ __all__ = [
     "LogicalEntryManager",
     "LogicalEntryState",
     "LogicalEntryStore",
+    "LogicalEntryConflict",
     "ScanBookClaimWriter",
     "LogicalEvent",
     "RefusalCooldownPolicy",
@@ -194,6 +196,7 @@ class LogicalEvent(str, Enum):
     REVIEW_APPROVED = "REVIEW_APPROVED"
     REVIEW_REFUSED = "REVIEW_REFUSED"
     REVIEW_EXPIRED = "REVIEW_EXPIRED"
+    APPROVAL_EXPIRED = "APPROVAL_EXPIRED"
     RESERVATION_RELEASED = "RESERVATION_RELEASED"
     PHYSICAL_SUBMITTED = "PHYSICAL_SUBMITTED"
     PHYSICAL_RESOLVED = "PHYSICAL_RESOLVED"
@@ -208,6 +211,10 @@ class StaleNominationError(RefusedError):
     nobody re-checked. A typed error, so the caller can distinguish "re-scan and
     nominate again" from every other refusal.
     """
+
+
+class LogicalEntryConflict(RefusedError):
+    """A logical transition lost its compare-and-swap race."""
 
 
 class ScanBookClaimWriter(Protocol):
@@ -411,11 +418,13 @@ class LogicalEntry:
     current_handoff_id: str = ""
     current_approval_id: str = ""
     review_expires_at: dt.datetime | None = None
+    current_approval_expires_at: dt.datetime | None = None
     reservation_id: UUID | None = None
     reservation_amount: Decimal | None = None
     refused_at: dt.datetime | None = None
     refusal_count: int = 0
     lineage: tuple[LineageRecord, ...] = ()
+    version: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.logical_entry_id, UUID):
@@ -434,6 +443,13 @@ class LogicalEntry:
             _refuse("created_at must be a timezone-aware datetime")
         if not isinstance(self.updated_at, dt.datetime) or self.updated_at.tzinfo is None:
             _refuse("updated_at must be a timezone-aware datetime")
+        if self.review_expires_at is not None and self.review_expires_at.tzinfo is None:
+            _refuse("review_expires_at must be timezone-aware")
+        if (
+            self.current_approval_expires_at is not None
+            and self.current_approval_expires_at.tzinfo is None
+        ):
+            _refuse("current_approval_expires_at must be timezone-aware")
         if self.reservation_amount is not None and (
             not isinstance(self.reservation_amount, Decimal) or self.reservation_amount < 0
         ):
@@ -442,6 +458,20 @@ class LogicalEntry:
             _refuse(f"lineage must be a tuple, got {type(self.lineage).__name__}")
         if not isinstance(self.refusal_count, int) or self.refusal_count < 0:
             _refuse(f"refusal_count must be a non-negative int, got {self.refusal_count!r}")
+        if not isinstance(self.version, int) or isinstance(self.version, bool) or self.version < 0:
+            _refuse(f"version must be a non-negative int, got {self.version!r}")
+        object.__setattr__(self, "created_at", utc_instant(self.created_at, "created_at"))
+        object.__setattr__(self, "updated_at", utc_instant(self.updated_at, "updated_at"))
+        if self.review_expires_at is not None:
+            object.__setattr__(
+                self, "review_expires_at", utc_instant(self.review_expires_at, "review_expires_at")
+            )
+        if self.current_approval_expires_at is not None:
+            object.__setattr__(
+                self,
+                "current_approval_expires_at",
+                utc_instant(self.current_approval_expires_at, "current_approval_expires_at"),
+            )
         # An entry in a state that owns a reservation must actually hold one.
         # The reverse -- a terminal entry still holding a reservation -- is the
         # leak this module exists to prevent, so it is refused outright.
@@ -535,6 +565,7 @@ class LogicalEntry:
                 if record.get("reservation_amount") is not None
                 else None
             ),
+            version=int(record.get("version", 1)),
         )
 
 
@@ -582,9 +613,40 @@ class LogicalEntryStore:
         if self.path.suffix != ".jsonl":
             self.path = self.path / self.FILENAME
 
+    @property
+    def lock_path(self) -> Path:
+        return self.path.with_name(self.path.name + ".lock")
+
     # -- writing ----------------------------------------------------------
 
-    def _append(self, record: dict[str, Any]) -> dict[str, Any]:
+    def _version_unlocked(self, entry_id: UUID | None) -> int:
+        if entry_id is None:
+            return 0
+        current = 0
+        try:
+            text = self.path.read_text(encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            return 0
+        for line in text.splitlines():
+            try:
+                event = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if str(event.get("logical_entry_id", "")) != str(entry_id):
+                continue
+            raw = event.get("version")
+            current = max(current + 1 if raw is None else int(raw), current)
+        return current
+
+    def _append(
+        self,
+        record: dict[str, Any],
+        *,
+        entry_id: UUID | None = None,
+        expected_version: int | None = None,
+        underlying: str = "",
+        enforce_underlying: bool = False,
+    ) -> dict[str, Any]:
         payload = {"v": SCHEMA_VERSION, **record}
         try:
             line = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
@@ -597,17 +659,40 @@ class LogicalEntryStore:
 
         data = (line + "\n").encode("utf-8")
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(str(self.path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-            try:
-                written = os.write(fd, data)
-                if written != len(data):  # pragma: no cover - short append
-                    raise JournalError(
-                        f"short write to the logical-entry store ({written}/{len(data)} bytes)"
+            with exclusive_file_lock(self.lock_path):
+                current = self._version_unlocked(entry_id)
+                expected = current if expected_version is None else expected_version
+                if expected != current:
+                    raise LogicalEntryConflict(
+                        f"logical entry {entry_id} is at version {current}, expected {expected}",
+                        hint="reload the logical entry; a stale process must not append a second review",
                     )
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+                if entry_id is not None:
+                    if enforce_underlying and record.get("event") == LogicalEvent.ENTRY_CLAIMED.value:
+                        if underlying:
+                            for existing in self.entries().values():
+                                if existing.is_active and existing.normalized_underlying == underlying:
+                                    raise LogicalEntryConflict(
+                                        f"{underlying} is already claimed by {existing.logical_entry_id}",
+                                        hint="reuse the existing active logical entry",
+                                    )
+                    payload["version"] = current + 1
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                fd = os.open(str(self.path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                try:
+                    written = os.write(fd, data if entry_id is None else (
+                        json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str) + "\n"
+                    ).encode("utf-8"))
+                    expected_bytes = len(data if entry_id is None else (
+                        json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str) + "\n"
+                    ).encode("utf-8"))
+                    if written != expected_bytes:  # pragma: no cover - short append
+                        raise JournalError(
+                            f"short write to the logical-entry store ({written}/{expected_bytes} bytes)"
+                        )
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
         except JournalError:
             raise
         except OSError as exc:
@@ -618,7 +703,14 @@ class LogicalEntryStore:
             ) from exc
         return payload
 
-    def record_claimed(self, entry: LogicalEntry, *, at: dt.datetime) -> dict[str, Any]:
+    def record_claimed(
+        self,
+        entry: LogicalEntry,
+        *,
+        at: dt.datetime,
+        expected_version: int | None = 0,
+        enforce_underlying: bool = False,
+    ) -> dict[str, Any]:
         """Persist the identity. Written **before** any review request exists,
         so a crash between the two leaves an entry that remembers itself rather
         than a handoff nobody claims."""
@@ -627,7 +719,11 @@ class LogicalEntryStore:
                 "event": LogicalEvent.ENTRY_CLAIMED.value,
                 "at": at.isoformat(),
                 **entry.to_record(),
-            }
+            },
+            entry_id=entry.logical_entry_id,
+            expected_version=expected_version,
+            underlying=entry.normalized_underlying,
+            enforce_underlying=enforce_underlying,
         )
 
     def record_review_filed(
@@ -639,6 +735,7 @@ class LogicalEntryStore:
         handoff_id: str,
         expires_at: dt.datetime,
         at: dt.datetime,
+        expected_version: int | None = None,
     ) -> dict[str, Any]:
         return self._append(
             {
@@ -649,7 +746,9 @@ class LogicalEntryStore:
                 "spec_digest": spec_digest,
                 "handoff_id": handoff_id,
                 "expires_at": expires_at.isoformat(),
-            }
+            },
+            entry_id=entry_id,
+            expected_version=expected_version,
         )
 
     def record_revision_superseded(
@@ -660,6 +759,7 @@ class LogicalEntryStore:
         handoff_id: str,
         reason: str,
         at: dt.datetime,
+        expected_version: int | None = None,
     ) -> dict[str, Any]:
         return self._append(
             {
@@ -669,11 +769,20 @@ class LogicalEntryStore:
                 "revision": revision,
                 "handoff_id": handoff_id,
                 "reason": reason,
-            }
+            },
+            entry_id=entry_id,
+            expected_version=expected_version,
         )
 
     def record_review_approved(
-        self, entry_id: UUID, *, revision: int, response_id: str, at: dt.datetime
+        self,
+        entry_id: UUID,
+        *,
+        revision: int,
+        response_id: str,
+        at: dt.datetime,
+        expires_at: dt.datetime | None = None,
+        expected_version: int | None = None,
     ) -> dict[str, Any]:
         return self._append(
             {
@@ -682,7 +791,10 @@ class LogicalEntryStore:
                 "logical_entry_id": str(entry_id),
                 "revision": revision,
                 "response_id": response_id,
-            }
+                **({"expires_at": expires_at.isoformat()} if expires_at is not None else {}),
+            },
+            entry_id=entry_id,
+            expected_version=expected_version,
         )
 
     def record_review_refused(
@@ -693,6 +805,7 @@ class LogicalEntryStore:
         handoff_id: str,
         at: dt.datetime,
         detail: str = "",
+        expected_version: int | None = None,
     ) -> dict[str, Any]:
         return self._append(
             {
@@ -702,11 +815,19 @@ class LogicalEntryStore:
                 "revision": revision,
                 "handoff_id": handoff_id,
                 "detail": detail,
-            }
+            },
+            entry_id=entry_id,
+            expected_version=expected_version,
         )
 
     def record_review_expired(
-        self, entry_id: UUID, *, revision: int, handoff_id: str, at: dt.datetime
+        self,
+        entry_id: UUID,
+        *,
+        revision: int,
+        handoff_id: str,
+        at: dt.datetime,
+        expected_version: int | None = None,
     ) -> dict[str, Any]:
         return self._append(
             {
@@ -715,11 +836,40 @@ class LogicalEntryStore:
                 "logical_entry_id": str(entry_id),
                 "revision": revision,
                 "handoff_id": handoff_id,
-            }
+            },
+            entry_id=entry_id,
+            expected_version=expected_version,
+        )
+
+    def record_approval_expired(
+        self,
+        entry_id: UUID,
+        *,
+        revision: int,
+        approval_id: str,
+        at: dt.datetime,
+        expected_version: int | None = None,
+    ) -> dict[str, Any]:
+        return self._append(
+            {
+                "event": LogicalEvent.APPROVAL_EXPIRED.value,
+                "at": at.isoformat(),
+                "logical_entry_id": str(entry_id),
+                "revision": revision,
+                "approval_id": approval_id,
+            },
+            entry_id=entry_id,
+            expected_version=expected_version,
         )
 
     def record_reservation_released(
-        self, entry_id: UUID, *, reservation_id: UUID, reason: str, at: dt.datetime
+        self,
+        entry_id: UUID,
+        *,
+        reservation_id: UUID,
+        reason: str,
+        at: dt.datetime,
+        expected_version: int | None = None,
     ) -> dict[str, Any]:
         return self._append(
             {
@@ -728,11 +878,19 @@ class LogicalEntryStore:
                 "logical_entry_id": str(entry_id),
                 "reservation_id": str(reservation_id),
                 "reason": reason,
-            }
+            },
+            entry_id=entry_id,
+            expected_version=expected_version,
         )
 
     def record_physical_submitted(
-        self, entry_id: UUID, *, revision: int, handoff_id: str, at: dt.datetime
+        self,
+        entry_id: UUID,
+        *,
+        revision: int,
+        handoff_id: str,
+        at: dt.datetime,
+        expected_version: int | None = None,
     ) -> dict[str, Any]:
         return self._append(
             {
@@ -741,11 +899,19 @@ class LogicalEntryStore:
                 "logical_entry_id": str(entry_id),
                 "revision": revision,
                 "handoff_id": handoff_id,
-            }
+            },
+            entry_id=entry_id,
+            expected_version=expected_version,
         )
 
     def record_physical_resolved(
-        self, entry_id: UUID, *, filled: bool, detail: str, at: dt.datetime
+        self,
+        entry_id: UUID,
+        *,
+        filled: bool,
+        detail: str,
+        at: dt.datetime,
+        expected_version: int | None = None,
     ) -> dict[str, Any]:
         return self._append(
             {
@@ -754,11 +920,18 @@ class LogicalEntryStore:
                 "logical_entry_id": str(entry_id),
                 "filled": bool(filled),
                 "detail": detail,
-            }
+            },
+            entry_id=entry_id,
+            expected_version=expected_version,
         )
 
     def record_abandoned(
-        self, entry_id: UUID, *, reason: str, at: dt.datetime
+        self,
+        entry_id: UUID,
+        *,
+        reason: str,
+        at: dt.datetime,
+        expected_version: int | None = None,
     ) -> dict[str, Any]:
         return self._append(
             {
@@ -766,8 +939,15 @@ class LogicalEntryStore:
                 "at": at.isoformat(),
                 "logical_entry_id": str(entry_id),
                 "reason": reason,
-            }
+            },
+            entry_id=entry_id,
+            expected_version=expected_version,
         )
+
+    def version(self, entry_id: UUID) -> int:
+        """Return the durable per-entry version used by transition CAS."""
+
+        return self._version_unlocked(entry_id)
 
     # -- reading ----------------------------------------------------------
 
@@ -864,10 +1044,17 @@ class LogicalEntryStore:
         at = dt.datetime.fromisoformat(str(event.get("at")))
         if at.tzinfo is None:
             raise ValueError(f"{kind} carries a naive timestamp")
+        event_version = int(event.get("version", current.version + 1))
+        if event_version != current.version + 1:
+            raise ValueError(
+                f"{kind} carries version {event_version}, expected {current.version + 1}"
+            )
 
         if kind == LogicalEvent.REVIEW_FILED.value:
             revision = int(event["revision"])
-            expires = dt.datetime.fromisoformat(str(event["expires_at"]))
+            expires = utc_instant(
+                dt.datetime.fromisoformat(str(event["expires_at"])), "review expiry"
+            )
             return _replace(
                 current,
                 state=LogicalEntryState.AWAITING_REVIEW,
@@ -876,7 +1063,9 @@ class LogicalEntryStore:
                 current_handoff_id=str(event["handoff_id"]),
                 current_approval_id="",
                 review_expires_at=expires,
+                current_approval_expires_at=None,
                 updated_at=at,
+                version=event_version,
             )
 
         if kind == LogicalEvent.REVISION_SUPERSEDED.value:
@@ -887,7 +1076,9 @@ class LogicalEntryStore:
                 at=at,
                 detail=str(event.get("reason") or ""),
             )
-            return _replace(current, lineage=current.lineage + (record,), updated_at=at)
+            return _replace(
+                current, lineage=current.lineage + (record,), updated_at=at, version=event_version
+            )
 
         if kind == LogicalEvent.REVIEW_APPROVED.value:
             record = LineageRecord(
@@ -901,8 +1092,17 @@ class LogicalEntryStore:
                 current,
                 state=LogicalEntryState.APPROVED_PENDING_EXECUTION,
                 current_approval_id=str(event.get("response_id") or ""),
+                current_approval_expires_at=(
+                    utc_instant(
+                        dt.datetime.fromisoformat(str(event["expires_at"])),
+                        "approval expiry",
+                    )
+                    if event.get("expires_at")
+                    else current.review_expires_at
+                ),
                 lineage=current.lineage + (record,),
                 updated_at=at,
+                version=event_version,
             )
 
         if kind == LogicalEvent.REVIEW_REFUSED.value:
@@ -920,6 +1120,7 @@ class LogicalEntryStore:
                 refusal_count=current.refusal_count + 1,
                 lineage=current.lineage + (record,),
                 updated_at=at,
+                version=event_version,
             )
 
         if kind == LogicalEvent.REVIEW_EXPIRED.value:
@@ -934,6 +1135,23 @@ class LogicalEntryStore:
                 state=LogicalEntryState.EXPIRED,
                 lineage=current.lineage + (record,),
                 updated_at=at,
+                version=event_version,
+            )
+
+        if kind == LogicalEvent.APPROVAL_EXPIRED.value:
+            record = LineageRecord(
+                revision=int(event["revision"]),
+                handoff_id=current.current_handoff_id,
+                outcome=RevisionOutcome.EXPIRED,
+                at=at,
+                detail=f"approval {event.get('approval_id') or ''} expired",
+            )
+            return _replace(
+                current,
+                state=LogicalEntryState.EXPIRED,
+                lineage=current.lineage + (record,),
+                updated_at=at,
+                version=event_version,
             )
 
         if kind == LogicalEvent.RESERVATION_RELEASED.value:
@@ -950,6 +1168,7 @@ class LogicalEntryStore:
                 reservation_amount=None,
                 lineage=current.lineage + (record,),
                 updated_at=at,
+                version=event_version,
             )
 
         if kind == LogicalEvent.PHYSICAL_SUBMITTED.value:
@@ -964,6 +1183,7 @@ class LogicalEntryStore:
                 state=LogicalEntryState.EXECUTING,
                 lineage=current.lineage + (record,),
                 updated_at=at,
+                version=event_version,
             )
 
         if kind == LogicalEvent.PHYSICAL_RESOLVED.value:
@@ -982,6 +1202,7 @@ class LogicalEntryStore:
                 state=LogicalEntryState.FILLED if filled else LogicalEntryState.ABANDONED,
                 lineage=current.lineage + (record,),
                 updated_at=at,
+                version=event_version,
             )
 
         if kind == LogicalEvent.ENTRY_ABANDONED.value:
@@ -997,10 +1218,12 @@ class LogicalEntryStore:
                 state=LogicalEntryState.ABANDONED,
                 lineage=current.lineage + (record,),
                 updated_at=at,
+                version=event_version,
             )
 
-        # A newer writer's vocabulary is not corruption. Left alone.
-        return current
+        # A newer writer's vocabulary is not corruption. Preserve its version
+        # so a restart cannot append a transition against a stale predecessor.
+        return _replace(current, updated_at=at, version=event_version)
 
     def integrity_errors(self) -> tuple[str, ...]:
         problems: list[str] = []
@@ -1077,17 +1300,22 @@ class LogicalEntryManager:
         gate: VerifierGate,
         clock: Callable[[], dt.datetime] | None = None,
         refusal_policy: RefusalCooldownPolicy = DEFAULT_REFUSAL_POLICY,
+        receipts: ReceiptJournal | None = None,
     ) -> None:
         self.store = store
         self.gate = gate
         self.clock = clock or (lambda: dt.datetime.now(dt.timezone.utc))
         self.refusal_policy = refusal_policy
+        self.receipts = receipts or ReceiptJournal(store.path.parent / "receipts.jsonl")
 
     # -- helpers ----------------------------------------------------------
 
     def _now(self, now: dt.datetime | None) -> dt.datetime:
         instant = now if now is not None else self.clock()
-        return _aware(instant, "now")
+        try:
+            return utc_instant(instant, "now")
+        except ValueError as exc:
+            raise RefusedError(str(exc), hint="logical transitions require a UTC-normalizable clock") from exc
 
     def _reload(self, entry_id: UUID) -> LogicalEntry:
         entry = self.store.get(entry_id)
@@ -1151,6 +1379,7 @@ class LogicalEntryManager:
                 reservation_id=entry.reservation_id,
                 reason=reason,
                 at=at,
+                expected_version=entry.version,
             )
 
     def _withdraw_request(self, request_id: str, *, note: str) -> None:
@@ -1188,6 +1417,19 @@ class LogicalEntryManager:
             handoff_id=handoff_id,
             expires_at=packet.expires_at,
             at=now,
+            expected_version=entry.version,
+        )
+        self.receipts.append(
+            ReceiptKind.REVIEW_REQUEST_FILED,
+            saga_id=f"entry:{entry.logical_entry_id}:rev:{revision}",
+            at=now,
+            idempotency_key=f"logical-review-filed:{entry.logical_entry_id}:{revision}:{packet.spec.digest}",
+            payload={
+                "logical_entry_id": str(entry.logical_entry_id),
+                "revision": revision,
+                "request_id": handoff_id,
+                "spec_digest": packet.spec.digest,
+            },
         )
         return handoff_id
 
@@ -1253,7 +1495,32 @@ class LogicalEntryManager:
         raced = self.store.active_for(nomination.underlying)
         if raced is not None:
             return raced
-        self.store.record_claimed(entry, at=at)
+        try:
+            self.store.record_claimed(
+                entry,
+                at=at,
+                expected_version=0,
+                enforce_underlying=True,
+            )
+        except LogicalEntryConflict:
+            # Another process won the atomic underlying/CAS claim.  Reuse its
+            # durable identity rather than minting a second reservation.
+            raced = self.store.active_for(nomination.underlying)
+            if raced is not None:
+                return raced
+            raise
+        self.receipts.append(
+            ReceiptKind.LOGICAL_ENTRY_CLAIMED,
+            saga_id=f"entry:{entry.logical_entry_id}",
+            at=at,
+            idempotency_key=f"logical-entry-claimed:{entry.logical_entry_id}",
+            payload={
+                "logical_entry_id": str(entry.logical_entry_id),
+                "underlying": entry.normalized_underlying,
+                "version": entry.version + 1,
+            },
+        )
+        entry = self._reload(entry.logical_entry_id)
         if claim_writer is not None:
             try:
                 claimed = claim_writer.mark_claimed(
@@ -1268,7 +1535,10 @@ class LogicalEntryManager:
                 )
                 self._release_reservation(entry, reason=reason, at=at)
                 self.store.record_abandoned(
-                    entry.logical_entry_id, reason=reason, at=at
+                    entry.logical_entry_id,
+                    reason=reason,
+                    at=at,
+                    expected_version=self.store.version(entry.logical_entry_id),
                 )
                 _refuse(
                     reason,
@@ -1282,7 +1552,10 @@ class LogicalEntryManager:
                 )
                 self._release_reservation(entry, reason=reason, at=at)
                 self.store.record_abandoned(
-                    entry.logical_entry_id, reason=reason, at=at
+                    entry.logical_entry_id,
+                    reason=reason,
+                    at=at,
+                    expected_version=self.store.version(entry.logical_entry_id),
                 )
                 _refuse(
                     reason,
@@ -1339,6 +1612,20 @@ class LogicalEntryManager:
             return self._service_cooldown(entry, packet_now, at)
 
         if entry.state is LogicalEntryState.APPROVED_PENDING_EXECUTION:
+            # Approval is not a blanket permission to keep using the logical
+            # entry.  The caller must rebuild the packet from current facts on
+            # every pass.  A changed digest retires this approved revision and
+            # files a fresh review instead of returning a misleading
+            # ALREADY_APPROVED result.
+            if packet_now.spec.digest != entry.current_spec_digest:
+                return self._supersede(
+                    entry, packet_now, at, reason="approved packet facts changed"
+                )
+            approval_expires_at = (
+                entry.current_approval_expires_at or entry.review_expires_at
+            )
+            if approval_expires_at is not None and at >= approval_expires_at:
+                return self._expire_approved(entry, at)
             return ServiceResult(
                 ServiceOutcome.ALREADY_APPROVED, entry, request_id=entry.current_handoff_id
             )
@@ -1388,6 +1675,8 @@ class LogicalEntryManager:
             revision=entry.proposal_revision,
             response_id=approval.response_id,
             at=at,
+            expires_at=approval.expires_at,
+            expected_version=entry.version,
         )
         return ServiceResult(
             ServiceOutcome.APPROVED,
@@ -1407,11 +1696,27 @@ class LogicalEntryManager:
             revision=entry.proposal_revision,
             handoff_id=entry.current_handoff_id,
             at=at,
+            expected_version=self.store.version(entry.logical_entry_id),
         )
         self._withdraw_request(
             entry.current_handoff_id,
             note=f"EXPIRED: logical entry {entry.logical_entry_id} revision "
             f"{entry.proposal_revision}: review expired unanswered",
+        )
+        return ServiceResult(
+            ServiceOutcome.EXPIRED, self._reload(entry.logical_entry_id)
+        )
+
+    def _expire_approved(self, entry: LogicalEntry, at: dt.datetime) -> ServiceResult:
+        """Expire an approval that was accepted but never sent."""
+
+        self._release_reservation(entry, reason="approval expired before execution", at=at)
+        self.store.record_approval_expired(
+            entry.logical_entry_id,
+            revision=entry.proposal_revision,
+            approval_id=entry.current_approval_id,
+            at=at,
+            expected_version=self.store.version(entry.logical_entry_id),
         )
         return ServiceResult(
             ServiceOutcome.EXPIRED, self._reload(entry.logical_entry_id)
@@ -1439,6 +1744,7 @@ class LogicalEntryManager:
             handoff_id=entry.current_handoff_id,
             reason=reason,
             at=at,
+            expected_version=entry.version,
         )
         self._withdraw_request(
             entry.current_handoff_id,
@@ -1447,7 +1753,10 @@ class LogicalEntryManager:
             f"{entry.proposal_revision + 1} replaces it",
         )
         self._file_revision(
-            entry, packet_now, revision=entry.proposal_revision + 1, now=at
+            self._reload(entry.logical_entry_id),
+            packet_now,
+            revision=entry.proposal_revision + 1,
+            now=at,
         )
         updated = self._reload(entry.logical_entry_id)
         return ServiceResult(
@@ -1463,6 +1772,7 @@ class LogicalEntryManager:
             handoff_id=entry.current_handoff_id,
             at=at,
             detail=detail,
+            expected_version=entry.version,
         )
         updated = self._reload(entry.logical_entry_id)
         if updated.refusal_count >= self.refusal_policy.terminal_after:
@@ -1483,6 +1793,7 @@ class LogicalEntryManager:
             reason=f"refused {entry.refusal_count} times "
             f"(terminal_after={self.refusal_policy.terminal_after})",
             at=at,
+            expected_version=self.store.version(entry.logical_entry_id),
         )
         self._withdraw_request(
             entry.current_handoff_id,
@@ -1549,6 +1860,7 @@ class LogicalEntryManager:
             revision=entry.proposal_revision,
             handoff_id=entry.current_handoff_id,
             at=at,
+            expected_version=entry.version,
         )
         return self._reload(entry.logical_entry_id)
 
@@ -1590,7 +1902,11 @@ class LogicalEntryManager:
             at=at,
         )
         self.store.record_physical_resolved(
-            entry.logical_entry_id, filled=filled, detail=detail, at=at
+            entry.logical_entry_id,
+            filled=filled,
+            detail=detail,
+            at=at,
+            expected_version=self.store.version(entry.logical_entry_id),
         )
         return self._reload(entry.logical_entry_id)
 
@@ -1605,7 +1921,12 @@ class LogicalEntryManager:
                 f"({entry.state.value})"
             )
         self._release_reservation(entry, reason=f"abandoned: {reason}", at=at)
-        self.store.record_abandoned(entry.logical_entry_id, reason=reason, at=at)
+        self.store.record_abandoned(
+            entry.logical_entry_id,
+            reason=reason,
+            at=at,
+            expected_version=self.store.version(entry.logical_entry_id),
+        )
         self._withdraw_request(
             entry.current_handoff_id,
             note=f"ABANDONED: logical entry {entry.logical_entry_id} revision "
@@ -1641,6 +1962,12 @@ class LogicalEntryManager:
             if entry.state is LogicalEntryState.AWAITING_REVIEW:
                 if entry.review_expires_at is not None and at >= entry.review_expires_at:
                     results.append(self._expire(entry, at))
+            elif entry.state is LogicalEntryState.APPROVED_PENDING_EXECUTION:
+                approval_expires_at = (
+                    entry.current_approval_expires_at or entry.review_expires_at
+                )
+                if approval_expires_at is not None and at >= approval_expires_at:
+                    results.append(self._expire_approved(entry, at))
             elif entry.state is LogicalEntryState.CLAIMED:
                 if at - entry.created_at >= self.refusal_policy.claimed_max_age:
                     results.append(
@@ -1675,7 +2002,12 @@ class LogicalEntryManager:
         self, entry: LogicalEntry, at: dt.datetime, *, reason: str
     ) -> ServiceResult:
         self._release_reservation(entry, reason=f"abandoned: {reason}", at=at)
-        self.store.record_abandoned(entry.logical_entry_id, reason=reason, at=at)
+        self.store.record_abandoned(
+            entry.logical_entry_id,
+            reason=reason,
+            at=at,
+            expected_version=self.store.version(entry.logical_entry_id),
+        )
         self._withdraw_request(
             entry.current_handoff_id,
             note=f"ABANDONED: logical entry {entry.logical_entry_id} revision "

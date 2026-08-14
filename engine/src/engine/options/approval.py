@@ -78,6 +78,7 @@ from uuid import UUID
 from .. import _collabkit
 from ..errors import RefusedError
 from .domain import OptionStrategyIntent
+from .execution_outbox import ReceiptJournal, ReceiptKind, exclusive_file_lock, utc_instant
 from .governor import GovernorVerdict
 from .risk import CandidateRiskAssessment
 
@@ -400,6 +401,7 @@ class ApprovalContext:
     port: int
     commit_sha: str
     configuration_fingerprint: str
+    reviewer_liveness_epoch: str = ""
 
     def __post_init__(self) -> None:
         if not self.account or not self.account.strip():
@@ -417,6 +419,8 @@ class ApprovalContext:
             )
         if not self.configuration_fingerprint:
             raise RefusedError("an approval context needs a configuration fingerprint")
+        if not isinstance(self.reviewer_liveness_epoch, str):
+            raise RefusedError("reviewer_liveness_epoch must be a string")
 
     @classmethod
     def for_run(
@@ -426,6 +430,7 @@ class ApprovalContext:
         policy: Any,
         account: str = "",
         start: Path | None = None,
+        reviewer_liveness_epoch: str = "",
     ) -> "ApprovalContext":
         """Derive the context from the live config and policy.
 
@@ -438,6 +443,10 @@ class ApprovalContext:
             port=int(getattr(config, "port", 0)),
             commit_sha=commit_sha_at(start),
             configuration_fingerprint=configuration_fingerprint(config, policy),
+            reviewer_liveness_epoch=(
+                reviewer_liveness_epoch
+                or str(getattr(config, "reviewer_liveness_epoch", "") or "").strip()
+            ),
         )
 
     def describe(self) -> str:
@@ -476,6 +485,7 @@ class AuthorizedOrderSpec:
     governor_digest: str
     commit_sha: str
     configuration_fingerprint: str
+    reviewer_liveness_epoch: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.intent_id, UUID):
@@ -497,6 +507,7 @@ class AuthorizedOrderSpec:
             "governor_digest": self.governor_digest,
             "commit_sha": self.commit_sha,
             "configuration_fingerprint": self.configuration_fingerprint,
+            "reviewer_liveness_epoch": self.reviewer_liveness_epoch,
         }
 
     @property
@@ -533,6 +544,7 @@ def spec_for_open(
         governor_digest=governor_digest(governor),
         commit_sha=context.commit_sha,
         configuration_fingerprint=context.configuration_fingerprint,
+        reviewer_liveness_epoch=context.reviewer_liveness_epoch,
     )
 
 
@@ -587,6 +599,33 @@ class VerificationPacket:
         "correlation_impact",
     )
 
+    def __post_init__(self) -> None:
+        """Enforce the packet clock and lifetime at construction time.
+
+        A packet is a binding artifact, not a loose bag of timestamps.  Both
+        endpoints are normalised to UTC so a caller in a DST-aware local zone
+        cannot create a negative or ambiguous TTL, and a zero/negative TTL can
+        never reach the reviewer or final execution door.
+        """
+
+        try:
+            proposed = utc_instant(self.proposed_at, "packet proposed_at")
+            expires = utc_instant(self.expires_at, "packet expires_at")
+        except ValueError as exc:
+            raise RefusedError(str(exc), hint="packet TTL timestamps must be timezone-aware") from exc
+        if expires <= proposed:
+            raise RefusedError(
+                "packet expires_at must be after proposed_at",
+                hint="a non-positive packet TTL cannot authorize an opening",
+            )
+        lifetime = expires - proposed
+        if lifetime > MAXIMUM_APPROVAL_LIFETIME:
+            raise RefusedError(
+                f"a packet lifetime of {lifetime} exceeds the {MAXIMUM_APPROVAL_LIFETIME} maximum"
+            )
+        object.__setattr__(self, "proposed_at", proposed)
+        object.__setattr__(self, "expires_at", expires)
+
     def title(self) -> str:
         return (
             f"VERIFY OPEN: {self.intent_record.get('underlying', '?')} "
@@ -615,6 +654,7 @@ class VerificationPacket:
             f"| Configuration fingerprint | `{self.spec.configuration_fingerprint}` |",
             f"| Paper account | `{self.spec.account}` |",
             f"| Paper port | `{self.spec.port}` |",
+            f"| Reviewer liveness epoch | `{self.spec.reviewer_liveness_epoch or 'UNBOUND'}` |",
             f"| Order type / TIF | `{self.spec.order_type}` / `{self.spec.time_in_force}` |",
             f"| Proposed at (UTC) | `{self.proposed_at.isoformat()}` |",
             f"| Approval must expire by (UTC) | `{self.expires_at.isoformat()}` |",
@@ -721,10 +761,19 @@ def packet_for(
     evidence: Mapping[str, Any] | None = None,
 ) -> VerificationPacket:
     """Build the packet for one opening order, spec included."""
+    if not isinstance(lifetime, dt.timedelta) or lifetime <= dt.timedelta(0):
+        raise RefusedError(
+            f"an approval lifetime must be positive, got {lifetime!r}",
+            hint="zero and negative TTLs are never valid authorization artifacts",
+        )
     if lifetime > MAXIMUM_APPROVAL_LIFETIME:
         raise RefusedError(
             f"an approval lifetime of {lifetime} exceeds the {MAXIMUM_APPROVAL_LIFETIME} maximum"
         )
+    try:
+        binding_now = utc_instant(now, "packet now")
+    except ValueError as exc:
+        raise RefusedError(str(exc), hint="packet binding clocks must be timezone-aware") from exc
     spec = spec_for_open(
         intent_id=intent.strategy_id,
         structure_digest=structure_digest,
@@ -740,8 +789,8 @@ def packet_for(
         intent_record=_intent_record(intent),
         risk_record=risk.to_record(),
         governor_record=governor.to_record(),
-        expires_at=now + lifetime,
-        proposed_at=now,
+        expires_at=binding_now + lifetime,
+        proposed_at=binding_now,
         evidence=dict(evidence or {}),
     )
 
@@ -772,6 +821,7 @@ class VerifierApproval:
     sender_seat: str
     thread: str
     source: Path
+    reviewer_liveness_epoch: str = ""
     key: Any = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -915,6 +965,7 @@ def _approval_from_handoff(handoff: Any) -> VerifierApproval | None:
             sender_seat=str(getattr(handoff, "sender", "")),
             thread=str(getattr(handoff, "thread", "") or ""),
             source=Path(getattr(handoff, "path", "") or where),
+            reviewer_liveness_epoch="",
             key=_APPROVAL_KEY,
         )
 
@@ -937,6 +988,9 @@ def _approval_from_handoff(handoff: Any) -> VerifierApproval | None:
             hint="a long-lived approval is a standing licence, which is the thing "
             "this gate exists to abolish",
         )
+    reviewer_liveness_epoch = str(
+        meta.get(VERIFICATION_PREFIX + "reviewer_liveness_epoch", "") or ""
+    ).strip()
 
     return VerifierApproval(
         decision=decision,
@@ -950,6 +1004,7 @@ def _approval_from_handoff(handoff: Any) -> VerifierApproval | None:
         sender_seat=str(getattr(handoff, "sender", "")),
         thread=str(getattr(handoff, "thread", "") or ""),
         source=Path(getattr(handoff, "path", "") or where),
+        reviewer_liveness_epoch=reviewer_liveness_epoch,
         key=_APPROVAL_KEY,
     )
 
@@ -961,6 +1016,7 @@ def render_response(
     intent_id: UUID,
     spec_digest: str = "",
     verifier: str = REVIEWER_SEAT,
+    reviewer_liveness_epoch: str = "",
     approved_at: dt.datetime | None = None,
     expires_at: dt.datetime | None = None,
     reasons: str = "",
@@ -982,10 +1038,23 @@ def render_response(
     if decision is ApprovalDecision.APPROVED:
         if approved_at is None or expires_at is None:
             raise RefusedError("an APPROVED answer must carry approved_at and expires_at")
+        try:
+            approved_at_utc = utc_instant(approved_at, "approved_at")
+            expires_at_utc = utc_instant(expires_at, "expires_at")
+        except ValueError as exc:
+            raise RefusedError(
+                str(exc), hint="approval TTL timestamps must be timezone-aware"
+            ) from exc
+        if expires_at_utc <= approved_at_utc:
+            raise RefusedError(
+                "expires_at must be after approved_at",
+                hint="a non-positive approval TTL cannot authorize an opening",
+            )
         fields += [
             f"spec_digest: {spec_digest}",
-            f"approved_at: {approved_at.astimezone(dt.timezone.utc).isoformat()}",
-            f"expires_at: {expires_at.astimezone(dt.timezone.utc).isoformat()}",
+            f"reviewer_liveness_epoch: {reviewer_liveness_epoch}",
+            f"approved_at: {approved_at_utc.isoformat()}",
+            f"expires_at: {expires_at_utc.isoformat()}",
         ]
     block = "\n".join(fields)
     return "\n".join(
@@ -1028,6 +1097,16 @@ class VerifierGate(Protocol):
         self, approval: VerifierApproval, *, now: dt.datetime
     ) -> None:  # pragma: no cover - protocol
         """Burn the approval. A second call for the same answer must raise."""
+        ...
+
+    def recheck(
+        self,
+        packet: VerificationPacket,
+        approval: VerifierApproval,
+        *,
+        now: dt.datetime,
+    ) -> VerifierApproval:  # pragma: no cover - protocol
+        """Revalidate packet, approval, lifecycle, and TTL at the send door."""
         ...
 
 
@@ -1078,6 +1157,8 @@ class CollabVerifierGate:
     root: Path
     ledger: Path
     reviewer_seat: str = REVIEWER_SEAT
+    reviewer_liveness_epoch: str = ""
+    receipts: ReceiptJournal | None = None
 
     # -- collab-kit plumbing ---------------------------------------------
 
@@ -1087,6 +1168,44 @@ class CollabVerifierGate:
 
     def _canonical(self, raw: str | None) -> str:
         return str(_collab("seats", "canonical")(raw) or "")
+
+    def _receipt_journal(self) -> ReceiptJournal:
+        return self.receipts or ReceiptJournal(self.ledger.parent / "receipts.jsonl")
+
+    def _receipt(
+        self,
+        kind: ReceiptKind,
+        *,
+        spec_digest: str,
+        at: dt.datetime,
+        payload: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self._receipt_journal().append(
+            kind,
+            saga_id=f"review:{spec_digest}",
+            at=at,
+            idempotency_key=f"{kind.value.lower()}:{spec_digest}",
+            payload={"spec_digest": spec_digest, **dict(payload or {})},
+        )
+
+    @staticmethod
+    def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle, temporary = tempfile.mkstemp(
+            dir=str(path.parent), prefix=f".{path.name}-", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                json.dump(dict(payload), stream, indent=2, sort_keys=True)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
 
     # -- the builder's memory --------------------------------------------
 
@@ -1110,6 +1229,64 @@ class CollabVerifierGate:
         except OSError:
             return ""
 
+    def _request_exists(self, store: Any, request_id: str) -> bool:
+        if not request_id:
+            return False
+        try:
+            store.find(request_id)
+        except Exception:  # noqa: BLE001 - a stale marker is recoverable
+            return False
+        return True
+
+    def _find_request_for_digest(self, store: Any, digest: str) -> str:
+        """Recover a handoff created before its request marker was published."""
+
+        needle = str(digest).lower()
+        for handoff in store.list(
+            ("pending", "claimed", "done", "archive"), to=_REVIEWER_ROUTE
+        ):
+            body = str(getattr(handoff, "body", "") or "").lower()
+            title = str(getattr(handoff, "title", "") or "").lower()
+            if (
+                str(getattr(handoff, "sender", "")) == _BUILDER_SEAT
+                and (needle in body or needle in title)
+            ):
+                return str(getattr(handoff, "id", ""))
+        return ""
+
+    def _publish_request_marker(self, marker: Path, request_id: str) -> None:
+        handle, temporary = tempfile.mkstemp(
+            dir=str(marker.parent), prefix=f".{marker.name}-", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                stream.write(request_id)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, marker)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+
+    def _validate_packet(self, packet: VerificationPacket, *, now: dt.datetime) -> dt.datetime:
+        at = utc_instant(now, "approval validation clock")
+        if at >= packet.expires_at:
+            raise RefusedError(
+                f"the verification packet expired at {packet.expires_at.isoformat()}",
+                hint="rebuild the packet from fresh facts before asking or sending",
+            )
+        if self.reviewer_liveness_epoch and (
+            packet.spec.reviewer_liveness_epoch != self.reviewer_liveness_epoch
+        ):
+            raise RefusedError(
+                "the packet is bound to a stale reviewer liveness epoch",
+                hint="bind a fresh reviewer heartbeat/readiness epoch before entry",
+            )
+        return at
+
     # -- step 2 and 3: persist, then ask ---------------------------------
 
     def propose(self, packet: VerificationPacket, *, now: dt.datetime) -> str:
@@ -1120,28 +1297,62 @@ class CollabVerifierGate:
         rather than a request nobody remembers making. The handoff id is written
         last, and its presence is what "already asked" means.
         """
+        at = self._validate_packet(packet, now=now)
         marker = self._request_marker(packet.spec)
+        with exclusive_file_lock(marker.with_name(marker.name + ".lock")):
+            return self._propose_locked(packet, at=at, marker=marker)
+
+    def _propose_locked(
+        self,
+        packet: VerificationPacket,
+        *,
+        at: dt.datetime,
+        marker: Path,
+    ) -> str:
+        """Perform the digest-keyed recovery protocol under one writer lock."""
+
+        store = self._store()
         existing = self.request_id_for(packet.spec)
-        if existing:
+        if existing and self._request_exists(store, existing):
+            self._receipt(
+                ReceiptKind.REVIEW_REQUEST_FILED,
+                spec_digest=packet.spec.digest,
+                at=at,
+                payload={"request_id": existing, "recovered": False},
+            )
             return existing
 
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        (marker.parent / f"{packet.spec.digest}.json").write_text(
-            json.dumps(
-                {
-                    "state": VerificationState.PROPOSED.value,
-                    "proposed_at": now.isoformat(),
-                    "spec": packet.spec.to_record(),
-                    "spec_digest": packet.spec.digest,
-                    "expires_at": packet.expires_at.isoformat(),
-                },
-                indent=2,
-                sort_keys=True,
-            ),
-            encoding="utf-8",
+        # A crash may have created the handoff but died before the marker was
+        # installed. Search by the full digest before creating anything new.
+        recovered = self._find_request_for_digest(store, packet.spec.digest)
+        if recovered:
+            self._publish_request_marker(marker, recovered)
+            self._receipt(
+                ReceiptKind.REVIEW_REQUEST_FILED,
+                spec_digest=packet.spec.digest,
+                at=at,
+                payload={"request_id": recovered, "recovered": True},
+            )
+            return recovered
+
+        self._atomic_json(
+            marker.with_suffix(".json"),
+            {
+                "state": VerificationState.PROPOSED.value,
+                "proposed_at": at.isoformat(),
+                "spec": packet.spec.to_record(),
+                "spec_digest": packet.spec.digest,
+                "expires_at": packet.expires_at.isoformat(),
+            },
+        )
+        self._receipt(
+            ReceiptKind.REVIEW_REQUEST_INTENT,
+            spec_digest=packet.spec.digest,
+            at=at,
+            payload={"expires_at": packet.expires_at.isoformat()},
         )
 
-        handoff = self._store().create(
+        handoff = store.create(
             to=_REVIEWER_ROUTE,
             sender=_BUILDER_SEAT,
             title=packet.title(),
@@ -1152,19 +1363,13 @@ class CollabVerifierGate:
         # Atomic: temp + os.replace, like every store. A torn direct write
         # would leave a marker whose truncated id "remembers" a request that
         # cannot be found, which reads as a lost request and refuses forever.
-        handle, temp_name = tempfile.mkstemp(
-            dir=str(marker.parent), prefix=f".{packet.spec.digest}-", suffix=".tmp"
+        self._publish_request_marker(marker, str(handoff.id))
+        self._receipt(
+            ReceiptKind.REVIEW_REQUEST_FILED,
+            spec_digest=packet.spec.digest,
+            at=at,
+            payload={"request_id": str(handoff.id), "recovered": False},
         )
-        try:
-            with os.fdopen(handle, "w", encoding="utf-8") as stream:
-                stream.write(handoff.id)
-            os.replace(temp_name, marker)
-        except BaseException:
-            try:
-                os.unlink(temp_name)
-            except OSError:
-                pass
-            raise
         return str(handoff.id)
 
     # -- step 7 and the validation --------------------------------------
@@ -1175,9 +1380,10 @@ class CollabVerifierGate:
         Never waits. Every failure raises; the one that means "not yet" is
         :class:`AwaitingVerification`, so a caller can keep going.
         """
+        at = self._validate_packet(packet, now=now)
         spec = packet.spec
         store = self._store()
-        request_id = self.propose(packet, now=now)
+        request_id = self.propose(packet, now=at)
 
         find = store.find
         try:
@@ -1227,7 +1433,7 @@ class CollabVerifierGate:
             )
 
         for approval in approved:
-            problems = self._mismatches(approval, packet, request=request, now=now)
+            problems = self._mismatches(approval, packet, request=request, now=at)
             if not problems:
                 return approval
             reasons.append(f"{approval.response_id}: {'; '.join(problems)}")
@@ -1245,6 +1451,33 @@ class CollabVerifierGate:
             f"no APPROVED answer covers this order (intent {spec.intent_id})",
             hint=" | ".join(reasons),
         )
+
+    def recheck(
+        self,
+        packet: VerificationPacket,
+        approval: VerifierApproval,
+        *,
+        now: dt.datetime,
+    ) -> VerifierApproval:
+        """Final-door validation without filing or consuming anything."""
+
+        at = self._validate_packet(packet, now=now)
+        if approval.decision is not ApprovalDecision.APPROVED:
+            raise RefusedError("only an APPROVED reviewer answer can reach execution")
+        try:
+            request = self._store().find(approval.request_id)
+        except Exception as exc:  # noqa: BLE001 - missing lifecycle proof
+            raise RefusedError(
+                f"review request {approval.request_id} is not recoverable",
+                hint="an approval without its request lifecycle is not executable",
+            ) from exc
+        problems = self._mismatches(approval, packet, request=request, now=at)
+        if problems:
+            raise RefusedError(
+                f"approval {approval.response_id} failed final-door revalidation",
+                hint="; ".join(problems),
+            )
+        return approval
 
     # -- the closer: retiring the builder's own question -------------------
 
@@ -1351,6 +1584,24 @@ class CollabVerifierGate:
                 f"approved spec {approval.spec_digest[:12]}, order is {spec.digest[:12]}"
             )
 
+        if approval.approved_at < packet.proposed_at - CLOCK_SKEW_TOLERANCE:
+            problems.append(
+                f"approval predates packet proposal at {packet.proposed_at.isoformat()}"
+            )
+        if approval.expires_at > packet.expires_at:
+            problems.append(
+                f"approval expires at {approval.expires_at.isoformat()}, after packet "
+                f"expiry {packet.expires_at.isoformat()}"
+            )
+        if spec.reviewer_liveness_epoch and (
+            approval.reviewer_liveness_epoch != spec.reviewer_liveness_epoch
+        ):
+            problems.append("approval does not carry the packet's reviewer liveness epoch")
+        if self.reviewer_liveness_epoch and (
+            spec.reviewer_liveness_epoch != self.reviewer_liveness_epoch
+        ):
+            problems.append("packet reviewer liveness epoch is no longer current")
+
         # -- it is still an approval ------------------------------------
         if now >= approval.expires_at:
             problems.append(f"expired at {approval.expires_at.isoformat()}")
@@ -1375,6 +1626,14 @@ class CollabVerifierGate:
         would mean a dry run disarms the real one that follows it, which is a
         worse failure than the one single-use exists to prevent.
         """
+        if approval.decision is not ApprovalDecision.APPROVED:
+            raise RefusedError("only an APPROVED reviewer answer can be consumed")
+        at = utc_instant(now, "approval consumption clock")
+        if at >= approval.expires_at:
+            raise RefusedError(
+                f"approval {approval.response_id} expired at {approval.expires_at.isoformat()}",
+                hint="revalidate a fresh approval at the physical-send door",
+            )
         marker = self._consumed_marker(approval)
         marker.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(
@@ -1385,7 +1644,7 @@ class CollabVerifierGate:
                 "intent_id": str(approval.intent_id),
                 "spec_digest": approval.spec_digest,
                 "verifier": approval.verifier,
-                "consumed_at": now.isoformat(),
+                "consumed_at": at.isoformat(),
             },
             sort_keys=True,
         )
@@ -1393,6 +1652,16 @@ class CollabVerifierGate:
             handle = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except OSError as exc:
             if exc.errno == errno.EEXIST:
+                self._receipt(
+                    ReceiptKind.REVIEW_APPROVAL_CONSUMED,
+                    spec_digest=approval.spec_digest,
+                    at=at,
+                    payload={
+                        "response_id": approval.response_id,
+                        "request_id": approval.request_id,
+                        "recovered": True,
+                    },
+                )
                 raise RefusedError(
                     f"approval {approval.response_id} has already been consumed",
                     hint="an approval authorizes exactly one opening order; a second "
@@ -1401,3 +1670,15 @@ class CollabVerifierGate:
             raise  # pragma: no cover - a genuinely broken ledger directory
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
             stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        self._receipt(
+            ReceiptKind.REVIEW_APPROVAL_CONSUMED,
+            spec_digest=approval.spec_digest,
+            at=at,
+            payload={
+                "response_id": approval.response_id,
+                "request_id": approval.request_id,
+                "recovered": False,
+            },
+        )
