@@ -1286,7 +1286,16 @@ class SchedulerLoop:
             detail="authority and session lease validated before broker work",
         )
         try:
-            result = self.engine.run(list(self.command), timeout=self.command_timeout)
+            # The auto-trader command is itself the persistent, broker-owning
+            # worker. A scheduler-level timeout would kill a healthy worker
+            # after the first command window and leave the paper-day authority
+            # believing the session was supervised when it was not. Its own
+            # cycle/tick policy owns bounded work; legacy one-shot commands
+            # retain the scheduler command timeout.
+            command_timeout = (
+                None if self.command and self.command[0] == "options-cycle" else self.command_timeout
+            )
+            result = self.engine.run(list(self.command), timeout=command_timeout)
         except Exception as exc:  # noqa: BLE001 - the terminal receipt is the recovery boundary
             elapsed = round(self.monotonic() - started, 3)
             self._emit_event(

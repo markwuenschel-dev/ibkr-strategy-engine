@@ -417,6 +417,8 @@ class OptionsCycleWorker:
         clock: Callable[[], dt.datetime] | None = None,
         sleeper: Callable[[float], None] = time.sleep,
         poll_seconds: float = 1.0,
+        stop_requested: Callable[[], bool] | None = None,
+        job_allowed: Callable[[JobKind, dt.datetime], bool] | None = None,
     ) -> None:
         self.config = config
         self.session_id = session_id
@@ -428,6 +430,8 @@ class OptionsCycleWorker:
         self.clock = clock or (lambda: dt.datetime.now(dt.timezone.utc))
         self.sleeper = sleeper
         self.poll_seconds = poll_seconds
+        self.stop_requested = stop_requested or (lambda: False)
+        self.job_allowed = job_allowed or (lambda _job, _at: True)
         self._stop = threading.Event()
         self._single_flight = threading.Lock()
         self._recovery_blocked = bool(receipts.unmatched_ticks(session_id=session_id))
@@ -450,14 +454,48 @@ class OptionsCycleWorker:
     def stop(self) -> None:
         self._stop.set()
 
-    def run_forever(self, *, arm: bool = False) -> None:
+    def run_forever(
+        self,
+        *,
+        arm: bool = False,
+        broker: Any | None = None,
+        max_cycles: int | None = None,
+    ) -> None:
+        """Run until stop/quiesce, keeping one broker connection for the day."""
+
+        if broker is not None:
+            self._run_loop(arm=arm, broker=broker, max_cycles=max_cycles)
+            return
+        with self._broker_context() as connected:
+            self._run_loop(arm=arm, broker=connected, max_cycles=max_cycles)
+
+    def _run_loop(self, *, arm: bool, broker: Any, max_cycles: int | None) -> None:
+        completed = 0
         while not self._stop.is_set():
-            due = self.schedule.due(self.clock())
+            if self.stop_requested():
+                self.stop()
+                break
+            moment = _utc(self.clock())
+            due = tuple(
+                slot
+                for slot in self.schedule.due(moment)
+                if self.job_allowed(slot.job, moment)
+            )
             if due:
-                self.run_tick(due=due, arm=arm)
+                self.run_tick(due=due, arm=arm, broker=broker)
+                completed += 1
+                if max_cycles is not None and completed >= max_cycles:
+                    self.stop()
+                    break
             self.sleeper(self.poll_seconds)
 
-    def run_tick(self, *, due: Iterable[DueSlot], arm: bool = False) -> CycleResult:
+    def run_tick(
+        self,
+        *,
+        due: Iterable[DueSlot],
+        arm: bool = False,
+        broker: Any | None = None,
+    ) -> CycleResult:
         slots = tuple(due)
         if not slots:
             raise CycleError("a cycle tick requires at least one due slot")
@@ -488,7 +526,12 @@ class OptionsCycleWorker:
             missed_slots=missed,
         )
         try:
-            with self._broker_context() as broker:
+            broker_context = (
+                contextlib.nullcontext(broker)
+                if broker is not None
+                else self._broker_context()
+            )
+            with broker_context as broker:
                 broker_started = True
                 phase_context = PhaseContext(
                     cycle=context,

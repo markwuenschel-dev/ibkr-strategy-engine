@@ -126,21 +126,33 @@ class EngineCommandRunner:
     def __init__(self, state_dir: Path) -> None:
         self.state_dir = state_dir
 
-    def run(self, args: list[str], *, timeout: float = 300.0) -> EngineCommandResult:
+    def run(self, args: list[str], *, timeout: float | None = 300.0) -> EngineCommandResult:
+        """Run one command, or leave a declared persistent worker alive.
+
+        ``options-cycle`` is the supervised paper-day worker rather than a
+        one-shot tick.  Passing ``timeout=None`` to ``subprocess.run`` is the
+        explicit runtime contract for that command; every legacy command keeps
+        the finite timeout default.
+        """
         env = {**os.environ, "IBKR_STATE_DIR": str(self.state_dir)}
+        command = [
+            sys.executable,
+            "-c",
+            "import sys; from engine.cli import main; sys.exit(main(sys.argv[1:]))",
+            *args,
+        ]
+        run_kwargs: dict[str, object] = {
+            "capture_output": True,
+            "text": True,
+            "env": env,
+            "cwd": str(_engine_dir()),
+            "check": False,
+        }
+        if timeout is not None:
+            run_kwargs["timeout"] = timeout
         completed = subprocess.run(  # noqa: S603
-            [
-                sys.executable,
-                "-c",
-                "import sys; from engine.cli import main; sys.exit(main(sys.argv[1:]))",
-                *args,
-            ],
-            capture_output=True,
-            text=True,
-            env=env,
-            cwd=str(_engine_dir()),
-            timeout=timeout,
-            check=False,
+            command,
+            **run_kwargs,
         )
         return EngineCommandResult(
             code=completed.returncode,

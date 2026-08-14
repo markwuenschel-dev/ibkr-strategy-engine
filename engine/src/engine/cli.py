@@ -170,6 +170,42 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    cycle = subs.add_parser(
+        "options-cycle",
+        help=(
+            "persistent paper-day worker: manage, scan, probe, service review, "
+            "and apply the hash-pinned entry policy"
+        ),
+    )
+    cycle.add_argument(
+        "--schedule-config",
+        required=True,
+        help="absolute ibkr.autotrader/1 policy artifact",
+    )
+    cycle.add_argument(
+        "--schedule-config-sha256",
+        required=True,
+        help="SHA-256 of the exact policy bytes",
+    )
+    cycle.add_argument(
+        "--scheduler-session",
+        help="scheduler identity session_id:lease_nonce (normally read from state)",
+    )
+    cycle.add_argument(
+        "--arm",
+        action="store_true",
+        help="required only when the pinned policy worker command includes --arm",
+    )
+    cycle.add_argument(
+        "--max-cycles",
+        type=int,
+        help="test/operator bound; production omits it and remains persistent",
+    )
+    # A scheduler command may carry the absolute StateDir after the verb. Keep
+    # the global option authoritative and suppress this subparser's default so
+    # argparse cannot overwrite a value supplied before options-cycle.
+    cycle.add_argument("--state-dir", dest="state_dir", default=argparse.SUPPRESS)
+
     run = subs.add_parser(
         "options-run",
         help=(
@@ -782,6 +818,15 @@ def cmd_options_run(args: argparse.Namespace, broker_factory: Any = Broker) -> i
     if not args.arm:
         note("dry run complete; nothing was transmitted. Pass --arm to trade.")
     return EXIT_OK
+
+
+def cmd_options_cycle(args: argparse.Namespace, broker_factory: Any = Broker) -> int:
+    """Run the persistent, one-connection unattended application worker."""
+
+    from .cycle_adapter import run_options_cycle
+
+    config = config_from(args)
+    return run_options_cycle(args, config=config, broker_factory=broker_factory)
 
 
 def _paper_day_preflight(
@@ -1735,6 +1780,7 @@ COMMANDS = {
     "probe-options-data": cmd_probe_options_data,
     "options-scan": cmd_options_scan,
     "options-universe-scan": cmd_options_universe_scan,
+    "options-cycle": cmd_options_cycle,
     "options-run": cmd_options_run,
     "options-positions": cmd_options_positions,
     "logical-entries": cmd_logical_entries,
