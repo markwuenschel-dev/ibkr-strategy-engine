@@ -19,6 +19,11 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from engine.errors import ConfigError
+from engine.autotrader_policy import (
+    AUTOTRADER_POLICY_SCHEMA,
+    AutotraderPolicy,
+    load_autotrader_policy,
+)
 from engine.market_calendar import CalendarError, MarketCalendar, SessionHours
 from engine.runtime import EngineCommandRunner
 from engine.scheduler import (
@@ -160,6 +165,18 @@ def build_scheduler_loop(
 ) -> SchedulerLoop:
     """Construct the real scheduler loop from a pinned policy file."""
 
+    if _policy_schema(schedule_config, schedule_config_sha256) == AUTOTRADER_POLICY_SCHEMA:
+        return build_autotrader_scheduler_loop(
+            identity=identity,
+            state_dir=state_dir,
+            schedule_config=schedule_config,
+            schedule_config_sha256=schedule_config_sha256,
+            engine=engine,
+            clock=clock,
+            sleep=sleep,
+            monotonic=monotonic,
+        )
+
     policy = load_scheduler_policy(schedule_config, schedule_config_sha256)
     paths = SchedulerPaths(root=Path(state_dir) / "paperday")
     loop_args: dict[str, Any] = {
@@ -171,6 +188,55 @@ def build_scheduler_loop(
         "command": policy.command,
         "engine": engine if engine is not None else EngineCommandRunner(Path(state_dir)),
         "command_timeout": policy.command_timeout_seconds,
+    }
+    if clock is not None:
+        loop_args["clock"] = clock
+    if sleep is not None:
+        loop_args["sleep"] = sleep
+    if monotonic is not None:
+        loop_args["monotonic"] = monotonic
+    return SchedulerLoop(**loop_args)
+
+
+def build_autotrader_scheduler_loop(
+    *,
+    identity: SchedulerIdentity,
+    state_dir: Path,
+    schedule_config: Path,
+    schedule_config_sha256: str,
+    engine: Any | None = None,
+    clock: Callable[[], Any] | None = None,
+    sleep: Callable[[float], None] | None = None,
+    monotonic: Callable[[], float] | None = None,
+) -> SchedulerLoop:
+    """Construct the persistent worker driver from ``ibkr.autotrader/1``.
+
+    The scheduler remains domain-free: it invokes the pinned ``options-cycle``
+    command at the management fixed rate and carries the policy/catalog hashes
+    into lifecycle receipts. Discovery, probing, reviewer servicing, and entry
+    decisions stay inside the future application-tier worker.
+    """
+
+    policy = load_autotrader_policy(schedule_config, schedule_config_sha256)
+    configured_state = Path(state_dir)
+    if configured_state.resolve() != policy.state_dir.resolve():
+        raise ConfigError(
+            "autotrader policy state_dir does not match the scheduler state_dir",
+            hint="use one explicit state directory so paper-day authority cannot split",
+        )
+    paths = SchedulerPaths(root=configured_state / "paperday")
+    loop_args: dict[str, Any] = {
+        "identity": identity,
+        "paths": paths,
+        "lock": paths.root / "session.lock",
+        "cadence_seconds": policy.cadences.management_seconds,
+        "is_open": policy.calendar.is_open,
+        "command": policy.worker_command,
+        "engine": engine if engine is not None else EngineCommandRunner(configured_state),
+        "command_timeout": policy.command_timeout_seconds,
+        "policy_hash": policy.policy_hash,
+        "catalog_hash": policy.catalog.sha256,
+        "lifecycle_receipts": True,
     }
     if clock is not None:
         loop_args["clock"] = clock
@@ -196,6 +262,24 @@ def build_scheduler_spec(
     and prevents a missing script from becoming a readiness timeout.
     """
 
+    if _policy_schema(schedule_config, schedule_config_sha256) == AUTOTRADER_POLICY_SCHEMA:
+        policy = load_autotrader_policy(schedule_config, schedule_config_sha256)
+        if Path(state_dir).resolve() != policy.state_dir.resolve():
+            raise ConfigError(
+                "autotrader policy state_dir does not match the scheduler state_dir",
+                hint="use one explicit state directory so paper-day authority cannot split",
+            )
+        return SchedulerSpec(
+            cadence_seconds=policy.cadences.management_seconds,
+            command=policy.worker_command,
+            entry_script=Path(entry_script),
+            entry_args=(
+                f"--schedule-config={Path(schedule_config)}",
+                f"--schedule-config-sha256={schedule_config_sha256}",
+                f"--state-dir={Path(state_dir)}",
+            ),
+        )
+
     policy = load_scheduler_policy(schedule_config, schedule_config_sha256)
     return SchedulerSpec(
         cadence_seconds=policy.cadence_seconds,
@@ -207,6 +291,20 @@ def build_scheduler_spec(
             f"--state-dir={Path(state_dir)}",
         ),
     )
+
+
+def _policy_schema(path: Path, expected_sha256: str) -> str:
+    """Read only the pinned schema discriminator without weakening validation."""
+
+    raw = _read_required_bytes(Path(path))
+    _verify_sha256(raw, expected_sha256, path=Path(path))
+    try:
+        loaded = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"scheduler policy {path} is malformed JSON") from exc
+    if not isinstance(loaded, dict) or not isinstance(loaded.get("schema"), str):
+        raise ConfigError("scheduler policy must declare a string schema")
+    return loaded["schema"]
 
 
 def _read_required_bytes(path: Path) -> bytes:

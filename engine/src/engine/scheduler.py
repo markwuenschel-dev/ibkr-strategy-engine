@@ -48,6 +48,18 @@ from pathlib import Path
 from typing import Any, Callable
 
 __all__ = [
+    "AuthorityDecision",
+    "DiscoveryBacklog",
+    "FixedRateScheduler",
+    "ScheduledSlot",
+    "ScheduledSlotStore",
+    "SlotRecoveryRequired",
+    "SlotStatus",
+    "TickContext",
+    "TickEvent",
+    "append_tick_event",
+    "find_unmatched_ticks",
+    "read_tick_events",
     "TickOutcome",
     "SchedulerIdentity",
     "SchedulerPaths",
@@ -83,6 +95,9 @@ class TickOutcome(Enum):
     STOPPED_LEASE_LOST = "STOPPED_LEASE_LOST"
     STOPPED_QUIESCED = "STOPPED_QUIESCED"
     STOPPED_TICK_BUDGET = "STOPPED_TICK_BUDGET"
+    STOPPED_TICK_ABORTED = "STOPPED_TICK_ABORTED"
+    STOPPED_AUTHORITY_INVALID = "STOPPED_AUTHORITY_INVALID"
+    STOPPED_RECOVERY_REQUIRED = "STOPPED_RECOVERY_REQUIRED"
     UNRESOLVED_LEASE_LOST_MID_TICK = "UNRESOLVED_LEASE_LOST_MID_TICK"
 
     @property
@@ -106,6 +121,9 @@ _TERMINAL_OUTCOMES = frozenset(
         TickOutcome.STOPPED_LEASE_LOST,
         TickOutcome.STOPPED_QUIESCED,
         TickOutcome.STOPPED_TICK_BUDGET,
+        TickOutcome.STOPPED_TICK_ABORTED,
+        TickOutcome.STOPPED_AUTHORITY_INVALID,
+        TickOutcome.STOPPED_RECOVERY_REQUIRED,
         TickOutcome.UNRESOLVED_LEASE_LOST_MID_TICK,
     }
 )
@@ -176,6 +194,21 @@ class SchedulerPaths:
     def receipts_for(self, day: dt.date) -> Path:
         return self.receipts / f"{day:%Y-%m-%d}-ticks.jsonl"
 
+    @property
+    def tick_events(self) -> Path:
+        """Lifecycle events for the recovery-complete scheduler path."""
+        return self.root / "tick-events.jsonl"
+
+    @property
+    def slots(self) -> Path:
+        """Append-only fixed-rate slot transitions."""
+        return self.root / "scheduled-slots.jsonl"
+
+    @property
+    def discovery_backlog(self) -> Path:
+        """Independent discovery backlog; it is not a timer-slot replay queue."""
+        return self.root / "discovery-backlog.jsonl"
+
 
 @dataclass(frozen=True)
 class TickReceipt:
@@ -193,6 +226,8 @@ class TickReceipt:
     command: tuple[str, ...] = ()
     exit_code: int | None = None
     duration_seconds: float | None = None
+    context: "TickContext | None" = None
+    failure_code: str | None = None
 
     def to_record(self) -> dict[str, Any]:
         return {
@@ -204,7 +239,544 @@ class TickReceipt:
             "command": list(self.command),
             "exit_code": self.exit_code,
             "duration_seconds": self.duration_seconds,
+            **(self.context.to_record() if self.context is not None else {}),
+            "failure_code": self.failure_code,
         }
+
+
+@dataclass(frozen=True)
+class TickContext:
+    """Identity carried by every recovery-relevant tick and downstream saga."""
+
+    session_id: str
+    lease_nonce: str
+    tick_id: str
+    attempt_id: str
+    policy_hash: str | None = None
+    catalog_hash: str | None = None
+    scheduled_for: dt.datetime | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("session_id", "lease_nonce", "tick_id", "attempt_id"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"tick context {name} must be a non-empty string")
+        for name in ("policy_hash", "catalog_hash"):
+            value = getattr(self, name)
+            if value is not None and (
+                not isinstance(value, str) or not value.strip()
+            ):
+                raise ValueError(f"tick context {name} must be non-empty when supplied")
+        if self.scheduled_for is not None:
+            _aware_utc(self.scheduled_for, "tick context scheduled_for")
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "lease_nonce": self.lease_nonce,
+            "tick_id": self.tick_id,
+            "attempt_id": self.attempt_id,
+            "policy_hash": self.policy_hash,
+            "catalog_hash": self.catalog_hash,
+            "scheduled_for": (
+                self.scheduled_for.astimezone(dt.timezone.utc).isoformat()
+                if self.scheduled_for is not None
+                else None
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class AuthorityDecision:
+    """Result of the caller-owned paper-day authority hook.
+
+    The scheduler does not know how to inspect a controller heartbeat, reviewer
+    epoch, or risk fingerprint. It only knows that a caller may provide a
+    fail-closed check immediately before broker work and that a negative answer
+    must be durable and terminal.
+    """
+
+    allowed: bool
+    failure_code: str = "FAIL-STALE-PAPERDAY-AUTHORITY"
+    detail: str = "paper-day authority check refused this tick"
+
+
+class TickEvent(str, Enum):
+    """Durable lifecycle events for a recovery-complete tick."""
+
+    TICK_STARTED = "TICK_STARTED"
+    TICK_FINISHED = "TICK_FINISHED"
+    TICK_ABORTED = "TICK_ABORTED"
+    TICK_UNRESOLVED = "TICK_UNRESOLVED"
+    TICK_RECONCILED = "TICK_RECONCILED"
+    RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
+    RECOVERY_CLEARED = "RECOVERY_CLEARED"
+
+
+class SlotStatus(str, Enum):
+    """Durable state of one fixed-rate scheduled slot."""
+
+    SCHEDULED = "SCHEDULED"
+    STARTED = "STARTED"
+    COMPLETED = "COMPLETED"
+    MISSED = "MISSED"
+    UNRESOLVED = "UNRESOLVED"
+    RECONCILED = "RECONCILED"
+
+
+class SlotRecoveryRequired(RuntimeError):
+    """A prior slot needs explicit reconciliation before another can run."""
+
+    failure_code = "FAIL-UNMATCHED-TICK"
+
+
+@dataclass(frozen=True)
+class ScheduledSlot:
+    """One fixed-rate slot and its latest durable transition."""
+
+    job: str
+    slot_id: str
+    scheduled_for: dt.datetime
+    status: SlotStatus
+    session_id: str
+    lease_nonce: str
+    policy_hash: str | None = None
+    catalog_hash: str | None = None
+    attempt_id: str | None = None
+    tick_id: str | None = None
+    at: dt.datetime | None = None
+    detail: str = ""
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "v": 1,
+            "job": self.job,
+            "slot_id": self.slot_id,
+            "scheduled_for": _aware_utc(self.scheduled_for, "scheduled_for").isoformat(),
+            "status": self.status.value,
+            "session_id": self.session_id,
+            "lease_nonce": self.lease_nonce,
+            "policy_hash": self.policy_hash,
+            "catalog_hash": self.catalog_hash,
+            "attempt_id": self.attempt_id,
+            "tick_id": self.tick_id,
+            "at": _aware_utc(self.at, "at").isoformat() if self.at is not None else None,
+            "detail": self.detail,
+        }
+
+    @classmethod
+    def from_record(cls, record: dict[str, Any]) -> "ScheduledSlot":
+        try:
+            return cls(
+                job=_nonempty_record_string(record, "job"),
+                slot_id=_nonempty_record_string(record, "slot_id"),
+                scheduled_for=_parse_aware(record["scheduled_for"], "scheduled_for"),
+                status=SlotStatus(record["status"]),
+                session_id=_nonempty_record_string(record, "session_id"),
+                lease_nonce=_nonempty_record_string(record, "lease_nonce"),
+                policy_hash=_optional_record_string(record, "policy_hash"),
+                catalog_hash=_optional_record_string(record, "catalog_hash"),
+                attempt_id=_optional_record_string(record, "attempt_id"),
+                tick_id=_optional_record_string(record, "tick_id"),
+                at=(
+                    _parse_aware(record["at"], "at")
+                    if record.get("at") is not None
+                    else None
+                ),
+                detail=record.get("detail", "")
+                if isinstance(record.get("detail", ""), str)
+                else "",
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"invalid scheduled slot record: {record!r}") from exc
+
+
+def _aware_utc(value: dt.datetime | None, label: str) -> dt.datetime:
+    if not isinstance(value, dt.datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{label} must be timezone-aware")
+    return value.astimezone(dt.timezone.utc)
+
+
+def _parse_aware(value: Any, label: str) -> dt.datetime:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be an ISO datetime")
+    try:
+        return _aware_utc(dt.datetime.fromisoformat(value), label)
+    except ValueError as exc:
+        raise ValueError(f"{label} is not a valid aware ISO datetime") from exc
+
+
+def _nonempty_record_string(record: dict[str, Any], key: str) -> str:
+    value = record[key]
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"record field {key} must be non-empty")
+    return value
+
+
+def _optional_record_string(record: dict[str, Any], key: str) -> str | None:
+    value = record.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"record field {key} must be non-empty when supplied")
+    return value
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    records: list[dict[str, Any]] = []
+    for line_number, line in enumerate(raw.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"malformed JSON at {path}:{line_number}") from exc
+        if not isinstance(record, dict):
+            raise ValueError(f"JSON record at {path}:{line_number} must be an object")
+        records.append(record)
+    return records
+
+
+def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
+    existing = ""
+    if path.exists():
+        # Validate the complete prior log before publishing its successor. A
+        # corrupt middle record is not repaired by appending another line.
+        _read_jsonl(path)
+        existing = path.read_text(encoding="utf-8")
+    line = json.dumps(record, sort_keys=True) + "\n"
+    separator = "" if not existing or existing.endswith(("\n", "\r")) else "\n"
+    _atomic_write_text(path, existing + separator + line)
+
+
+def _tick_event_path(paths: SchedulerPaths, at: dt.datetime) -> Path:
+    # One file per session day avoids a long-lived unbounded event log while
+    # still keeping startup inspection deterministic.
+    return paths.receipts / f"{_aware_utc(at, 'event at').date():%Y-%m-%d}-tick-events.jsonl"
+
+
+def append_tick_event(
+    paths: SchedulerPaths,
+    event: TickEvent,
+    context: TickContext,
+    *,
+    at: dt.datetime,
+    detail: str = "",
+    failure_code: str | None = None,
+) -> None:
+    """Atomically publish one lifecycle event before dependent work proceeds."""
+
+    record = {
+        "v": 1,
+        "event": event.value,
+        "at": _aware_utc(at, "event at").isoformat(),
+        "detail": detail,
+        "failure_code": failure_code,
+        **context.to_record(),
+    }
+    _append_jsonl(_tick_event_path(paths, at), record)
+
+
+def read_tick_events(paths: SchedulerPaths, *, day: dt.date | None = None) -> list[dict[str, Any]]:
+    """Read lifecycle events, failing closed on malformed evidence."""
+
+    if day is not None:
+        return _read_jsonl(paths.receipts / f"{day:%Y-%m-%d}-tick-events.jsonl")
+    if not paths.receipts.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    for path in sorted(paths.receipts.glob("*-tick-events.jsonl")):
+        records.extend(_read_jsonl(path))
+    return records
+
+
+def _context_from_event(record: dict[str, Any]) -> TickContext:
+    return TickContext(
+        session_id=_nonempty_record_string(record, "session_id"),
+        lease_nonce=_nonempty_record_string(record, "lease_nonce"),
+        tick_id=_nonempty_record_string(record, "tick_id"),
+        attempt_id=_nonempty_record_string(record, "attempt_id"),
+        policy_hash=_optional_record_string(record, "policy_hash"),
+        catalog_hash=_optional_record_string(record, "catalog_hash"),
+        scheduled_for=(
+            _parse_aware(record["scheduled_for"], "scheduled_for")
+            if record.get("scheduled_for") is not None
+            else None
+        ),
+    )
+
+
+def find_unmatched_ticks(
+    paths: SchedulerPaths,
+    *,
+    session_id: str | None = None,
+    lease_nonce: str | None = None,
+) -> list[TickContext]:
+    """Return TICK_STARTED contexts without a terminal lifecycle event.
+
+    The absence of a terminal receipt is deliberately treated as unknown, not
+    as success. ``TICK_RECONCILED`` is the only event that clears an unresolved
+    start after a restart.
+    """
+
+    terminal = {
+        TickEvent.TICK_FINISHED.value,
+        TickEvent.TICK_ABORTED.value,
+        TickEvent.TICK_UNRESOLVED.value,
+        TickEvent.TICK_RECONCILED.value,
+    }
+    pending: dict[str, TickContext] = {}
+    for record in read_tick_events(paths):
+        if session_id is not None and record.get("session_id") != session_id:
+            continue
+        if lease_nonce is not None and record.get("lease_nonce") != lease_nonce:
+            continue
+        event = record.get("event")
+        tick_id = record.get("tick_id")
+        if not isinstance(tick_id, str) or not tick_id:
+            raise ValueError("tick lifecycle record has no usable tick_id")
+        if event == TickEvent.TICK_STARTED.value:
+            pending[tick_id] = _context_from_event(record)
+        elif event in terminal:
+            pending.pop(tick_id, None)
+    return list(pending.values())
+
+
+class ScheduledSlotStore:
+    """Append-only, atomically published fixed-rate slot state."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+
+    def records(self) -> list[ScheduledSlot]:
+        records = _read_jsonl(self.path)
+        result: list[ScheduledSlot] = []
+        for record in records:
+            if record.get("v") != 1:
+                raise ValueError(f"unsupported scheduled-slot record version: {record!r}")
+            result.append(ScheduledSlot.from_record(record))
+        return result
+
+    def latest(self, *, job: str, session_id: str) -> ScheduledSlot | None:
+        found = [
+            slot
+            for slot in self.records()
+            if slot.job == job and slot.session_id == session_id
+        ]
+        return found[-1] if found else None
+
+    def publish(self, slot: ScheduledSlot) -> ScheduledSlot:
+        _append_jsonl(self.path, slot.to_record())
+        return slot
+
+    def transition(
+        self,
+        slot: ScheduledSlot,
+        status: SlotStatus,
+        *,
+        at: dt.datetime,
+        attempt_id: str | None = None,
+        tick_id: str | None = None,
+        detail: str = "",
+    ) -> ScheduledSlot:
+        latest = self.latest(job=slot.job, session_id=slot.session_id)
+        if (
+            latest is None
+            or latest.slot_id != slot.slot_id
+            or latest.status != slot.status
+            or latest.lease_nonce != slot.lease_nonce
+            or latest.policy_hash != slot.policy_hash
+            or latest.catalog_hash != slot.catalog_hash
+        ):
+            raise SlotRecoveryRequired(
+                f"slot {slot.slot_id} ownership changed before {status.value}; refusing a stale transition"
+            )
+        allowed = {
+            SlotStatus.SCHEDULED: {SlotStatus.STARTED, SlotStatus.MISSED},
+            SlotStatus.STARTED: {SlotStatus.COMPLETED, SlotStatus.UNRESOLVED},
+            SlotStatus.UNRESOLVED: {SlotStatus.RECONCILED},
+        }
+        if status not in allowed.get(latest.status, set()):
+            raise ValueError(
+                f"invalid scheduled-slot transition {latest.status.value} -> {status.value}"
+            )
+        updated = ScheduledSlot(
+            job=latest.job,
+            slot_id=latest.slot_id,
+            scheduled_for=latest.scheduled_for,
+            status=status,
+            session_id=latest.session_id,
+            lease_nonce=latest.lease_nonce,
+            policy_hash=latest.policy_hash,
+            catalog_hash=latest.catalog_hash,
+            attempt_id=attempt_id if attempt_id is not None else latest.attempt_id,
+            tick_id=tick_id if tick_id is not None else latest.tick_id,
+            at=_aware_utc(at, "slot transition at"),
+            detail=detail,
+        )
+        return self.publish(updated)
+
+
+class FixedRateScheduler:
+    """Select one current fixed-rate slot without replaying missed work.
+
+    The caller supplies the session anchor and cadence.  Slots before the
+    current one become durable ``MISSED`` records; the current slot is returned
+    once as ``SCHEDULED``.  A prior ``STARTED`` or ``UNRESOLVED`` slot blocks
+    selection until a caller explicitly reconciles it. Discovery backlog is a
+    separate object and is never synthesized by replaying timer slots.
+    """
+
+    def __init__(
+        self,
+        *,
+        store: ScheduledSlotStore,
+        job: str,
+        cadence_seconds: float,
+        anchor: dt.datetime,
+        session_id: str,
+        lease_nonce: str,
+        policy_hash: str | None = None,
+        catalog_hash: str | None = None,
+    ) -> None:
+        if not job.strip():
+            raise ValueError("fixed-rate job must be non-empty")
+        if cadence_seconds <= 0:
+            raise ValueError("fixed-rate cadence_seconds must be positive")
+        self.store = store
+        self.job = job
+        self.cadence_seconds = float(cadence_seconds)
+        self.anchor = _aware_utc(anchor, "fixed-rate anchor")
+        self.session_id = session_id
+        self.lease_nonce = lease_nonce
+        self.policy_hash = policy_hash
+        self.catalog_hash = catalog_hash
+
+    def poll(self, *, now: dt.datetime) -> ScheduledSlot | None:
+        moment = _aware_utc(now, "fixed-rate now")
+        if moment < self.anchor:
+            return None
+        latest = self.store.latest(job=self.job, session_id=self.session_id)
+        if latest is not None and latest.status in {
+            SlotStatus.STARTED,
+            SlotStatus.UNRESOLVED,
+        }:
+            raise SlotRecoveryRequired(
+                f"{self.job} slot {latest.slot_id} is {latest.status.value}; reconcile before polling"
+            )
+        if latest is not None and (
+            latest.lease_nonce != self.lease_nonce
+            or latest.policy_hash != self.policy_hash
+            or latest.catalog_hash != self.catalog_hash
+        ):
+            raise SlotRecoveryRequired(
+                f"{self.job} slot {latest.slot_id} belongs to a different "
+                "fencing/policy identity; refusing to advance it"
+            )
+        current_index = int((moment - self.anchor).total_seconds() // self.cadence_seconds)
+        latest_index = _slot_index(latest.slot_id) if latest is not None else -1
+        if latest is not None and latest_index == current_index:
+            if latest.status is SlotStatus.SCHEDULED:
+                return latest
+            return None
+        next_index = latest_index + 1
+        for index in range(next_index, current_index):
+            scheduled = self._slot(index, SlotStatus.SCHEDULED, moment)
+            self.store.publish(scheduled)
+            self.store.transition(
+                scheduled,
+                SlotStatus.MISSED,
+                at=moment,
+                detail="fixed-rate slot elapsed; SKIP_MISSED_TICKS forbids burst replay",
+            )
+        scheduled = self._slot(current_index, SlotStatus.SCHEDULED, moment)
+        return self.store.publish(scheduled)
+
+    def start(self, slot: ScheduledSlot, *, attempt_id: str, tick_id: str, at: dt.datetime) -> ScheduledSlot:
+        return self.store.transition(
+            slot,
+            SlotStatus.STARTED,
+            at=at,
+            attempt_id=attempt_id,
+            tick_id=tick_id,
+        )
+
+    def complete(self, slot: ScheduledSlot, *, at: dt.datetime, detail: str = "") -> ScheduledSlot:
+        return self.store.transition(slot, SlotStatus.COMPLETED, at=at, detail=detail)
+
+    def unresolved(self, slot: ScheduledSlot, *, at: dt.datetime, detail: str) -> ScheduledSlot:
+        return self.store.transition(slot, SlotStatus.UNRESOLVED, at=at, detail=detail)
+
+    def reconciled(self, slot: ScheduledSlot, *, at: dt.datetime, detail: str) -> ScheduledSlot:
+        return self.store.transition(slot, SlotStatus.RECONCILED, at=at, detail=detail)
+
+    def _slot(self, index: int, status: SlotStatus, now: dt.datetime) -> ScheduledSlot:
+        scheduled_for = self.anchor + dt.timedelta(seconds=index * self.cadence_seconds)
+        slot_id = f"{self.job}-{self.session_id}-{index:08d}"
+        return ScheduledSlot(
+            job=self.job,
+            slot_id=slot_id,
+            scheduled_for=scheduled_for,
+            status=status,
+            session_id=self.session_id,
+            lease_nonce=self.lease_nonce,
+            policy_hash=self.policy_hash,
+            catalog_hash=self.catalog_hash,
+            at=now,
+        )
+
+
+def _slot_index(slot_id: str) -> int:
+    try:
+        return int(slot_id.rsplit("-", 1)[1])
+    except (IndexError, ValueError) as exc:
+        raise ValueError(f"invalid fixed-rate slot id {slot_id!r}") from exc
+
+
+class DiscoveryBacklog:
+    """Durable backlog independent from fixed-rate timer slots."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+
+    def enqueue(self, *, key: str, scheduled_for: dt.datetime, reason: str) -> None:
+        if not key.strip():
+            raise ValueError("discovery backlog key must be non-empty")
+        _append_jsonl(
+            self.path,
+            {
+                "v": 1,
+                "event": "BACKLOG_ENQUEUED",
+                "key": key,
+                "scheduled_for": _aware_utc(scheduled_for, "backlog scheduled_for").isoformat(),
+                "reason": reason,
+            },
+        )
+
+    def complete(self, *, key: str, at: dt.datetime, detail: str = "") -> None:
+        _append_jsonl(
+            self.path,
+            {
+                "v": 1,
+                "event": "BACKLOG_COMPLETED",
+                "key": key,
+                "at": _aware_utc(at, "backlog at").isoformat(),
+                "detail": detail,
+            },
+        )
+
+    def pending(self) -> list[dict[str, Any]]:
+        latest: dict[str, dict[str, Any]] = {}
+        for record in _read_jsonl(self.path):
+            key = record.get("key")
+            if not isinstance(key, str) or not key:
+                raise ValueError("discovery backlog record has no usable key")
+            latest[key] = record
+        return [record for record in latest.values() if record.get("event") == "BACKLOG_ENQUEUED"]
 
 
 def _append_receipt(paths: SchedulerPaths, receipt: TickReceipt) -> None:
@@ -508,6 +1080,11 @@ class SchedulerLoop:
     monotonic: Callable[[], float] = None  # type: ignore[assignment]
     command_timeout: float = 300.0
     receipts: list[TickReceipt] = field(default_factory=list)
+    policy_hash: str | None = None
+    catalog_hash: str | None = None
+    lifecycle_receipts: bool = False
+    authority_check: Callable[[], AuthorityDecision | bool] | None = None
+    on_unmatched_ticks: Callable[[list[TickContext]], bool] | None = None
 
     def __post_init__(self) -> None:
         if self.cadence_seconds <= 0:
@@ -539,10 +1116,88 @@ class SchedulerLoop:
     def _tick_id(self, now: dt.datetime, index: int) -> str:
         return f"{self.identity.session_id}-{now:%Y%m%dT%H%M%S}-{index:04d}"
 
+    def _context(
+        self,
+        *,
+        now: dt.datetime,
+        index: int,
+        scheduled_for: dt.datetime | None = None,
+    ) -> TickContext:
+        tick_id = self._tick_id(now, index)
+        return TickContext(
+            session_id=self.identity.session_id,
+            lease_nonce=self.identity.nonce,
+            tick_id=tick_id,
+            attempt_id=f"{tick_id}-attempt-1",
+            policy_hash=self.policy_hash,
+            catalog_hash=self.catalog_hash,
+            scheduled_for=scheduled_for or now,
+        )
+
+    def _emit_event(
+        self,
+        event: TickEvent,
+        context: TickContext,
+        *,
+        at: dt.datetime,
+        detail: str = "",
+        failure_code: str | None = None,
+    ) -> None:
+        if self.lifecycle_receipts:
+            append_tick_event(
+                self.paths,
+                event,
+                context,
+                at=at,
+                detail=detail,
+                failure_code=failure_code,
+            )
+
+    def _startup_recovery(self) -> tuple[bool, str]:
+        """Inspect unmatched starts; reconciliation remains caller-owned."""
+        if not self.lifecycle_receipts:
+            return True, "lifecycle recovery disabled for legacy scheduler policy"
+        unmatched = find_unmatched_ticks(
+            self.paths,
+            session_id=self.identity.session_id,
+        )
+        if not unmatched:
+            return True, "no unmatched tick starts"
+        for context in unmatched:
+            self._emit_event(
+                TickEvent.RECOVERY_REQUIRED,
+                context,
+                at=self.clock(),
+                detail=(
+                    "startup found TICK_STARTED without a terminal receipt; "
+                    "automatic replay is forbidden"
+                ),
+                failure_code="FAIL-UNMATCHED-TICK",
+            )
+        if self.on_unmatched_ticks is None or not self.on_unmatched_ticks(unmatched):
+            return False, (
+                "FAIL-UNMATCHED-TICK: recovery callback did not clear every "
+                "unmatched tick; no broker work will be replayed"
+            )
+        for context in unmatched:
+            self._emit_event(
+                TickEvent.TICK_RECONCILED,
+                context,
+                at=self.clock(),
+                detail="caller-owned broker reconciliation cleared the unmatched tick",
+            )
+            self._emit_event(
+                TickEvent.RECOVERY_CLEARED,
+                context,
+                at=self.clock(),
+                detail="startup recovery cleared by the caller-owned reconciler",
+            )
+        return True, "unmatched ticks reconciled by caller"
+
     def _lease_held(self) -> bool:
         return session_id_holding(self.lock) == self.identity.session_id
 
-    def tick(self, index: int) -> TickReceipt:
+    def tick(self, index: int, *, scheduled_for: dt.datetime | None = None) -> TickReceipt:
         """Run exactly one tick and return its receipt.
 
         The lease is checked twice on purpose. Before the pass, because a
@@ -554,6 +1209,7 @@ class SchedulerLoop:
         """
         now = self.clock()
         tick_id = self._tick_id(now, index)
+        context = self._context(now=now, index=index, scheduled_for=scheduled_for)
 
         if not self._lease_held():
             return self._record(
@@ -565,6 +1221,8 @@ class SchedulerLoop:
                         f"session {self.identity.session_id} no longer holds "
                         f"{self.lock}; stopping without running a pass"
                     ),
+                    context=context,
+                    failure_code="FAIL-STALE-PAPERDAY-AUTHORITY",
                 )
             )
 
@@ -575,6 +1233,7 @@ class SchedulerLoop:
                     at=now,
                     outcome=TickOutcome.STOPPED_QUIESCED,
                     detail="quiesce requested before this tick started; no pass run",
+                    context=context,
                 )
             )
 
@@ -585,14 +1244,83 @@ class SchedulerLoop:
                     at=now,
                     outcome=TickOutcome.SKIPPED_SESSION_CLOSED,
                     detail=f"no trading session at {now.isoformat()}",
+                    context=context,
                 )
             )
 
+        if self.authority_check is not None:
+            try:
+                decision = self.authority_check()
+                if isinstance(decision, bool):
+                    decision = AuthorityDecision(allowed=decision)
+                elif not isinstance(decision, AuthorityDecision):
+                    decision = AuthorityDecision(
+                        allowed=False,
+                        detail=(
+                            "authority hook returned an invalid result; "
+                            "refusing broker work"
+                        ),
+                    )
+            except Exception as exc:  # noqa: BLE001 - authority is fail-closed
+                decision = AuthorityDecision(
+                    allowed=False,
+                    detail=f"authority hook failed: {type(exc).__name__}: {exc}",
+                )
+            if not decision.allowed:
+                return self._record(
+                    TickReceipt(
+                        tick_id=tick_id,
+                        at=now,
+                        outcome=TickOutcome.STOPPED_AUTHORITY_INVALID,
+                        detail=decision.detail,
+                        context=context,
+                        failure_code=decision.failure_code,
+                    )
+                )
+
         started = self.monotonic()
-        result = self.engine.run(list(self.command), timeout=self.command_timeout)
+        self._emit_event(
+            TickEvent.TICK_STARTED,
+            context,
+            at=now,
+            detail="authority and session lease validated before broker work",
+        )
+        try:
+            result = self.engine.run(list(self.command), timeout=self.command_timeout)
+        except Exception as exc:  # noqa: BLE001 - the terminal receipt is the recovery boundary
+            elapsed = round(self.monotonic() - started, 3)
+            self._emit_event(
+                TickEvent.TICK_ABORTED,
+                context,
+                at=self.clock(),
+                detail=f"worker raised {type(exc).__name__}: {exc}",
+                failure_code="FAIL-RECOVERY-BLOCKED",
+            )
+            return self._record(
+                TickReceipt(
+                    tick_id=tick_id,
+                    at=now,
+                    outcome=TickOutcome.STOPPED_TICK_ABORTED,
+                    detail=f"worker aborted: {type(exc).__name__}: {exc}",
+                    command=tuple(self.command),
+                    duration_seconds=elapsed,
+                    context=context,
+                    failure_code="FAIL-RECOVERY-BLOCKED",
+                )
+            )
         elapsed = round(self.monotonic() - started, 3)
 
         if not self._lease_held():
+            self._emit_event(
+                TickEvent.TICK_UNRESOLVED,
+                context,
+                at=self.clock(),
+                detail=(
+                    "the session lease was lost while the pass was running; "
+                    "broker reconciliation is required before another tick"
+                ),
+                failure_code="FAIL-STALE-PAPERDAY-AUTHORITY",
+            )
             return self._record(
                 TickReceipt(
                     tick_id=tick_id,
@@ -606,8 +1334,17 @@ class SchedulerLoop:
                     command=tuple(self.command),
                     exit_code=getattr(result, "code", None),
                     duration_seconds=elapsed,
+                    context=context,
+                    failure_code="FAIL-STALE-PAPERDAY-AUTHORITY",
                 )
             )
+
+        self._emit_event(
+            TickEvent.TICK_FINISHED,
+            context,
+            at=self.clock(),
+            detail=f"worker exited {getattr(result, 'code', None)}",
+        )
 
         return self._record(
             TickReceipt(
@@ -618,6 +1355,7 @@ class SchedulerLoop:
                 command=tuple(self.command),
                 exit_code=getattr(result, "code", None),
                 duration_seconds=elapsed,
+                context=context,
             )
         )
 
@@ -634,6 +1372,23 @@ class SchedulerLoop:
         until it had done some work would deadlock its own startup.
         """
         announce_ready(self.paths, self.identity, now=self.clock())
+        recovery_ok, recovery_detail = self._startup_recovery()
+        if not recovery_ok:
+            now = self.clock()
+            context = self._context(now=now, index=0)
+            receipt = self._record(
+                TickReceipt(
+                    tick_id=context.tick_id,
+                    at=now,
+                    outcome=TickOutcome.STOPPED_RECOVERY_REQUIRED,
+                    detail=recovery_detail,
+                    context=context,
+                    failure_code="FAIL-UNMATCHED-TICK",
+                )
+            )
+            _write_terminal_receipt(self.paths, self.identity, receipt)
+            _release_start_claim(self.paths, self.identity)
+            return self.receipts
         index = 0
         while True:
             if max_ticks is not None and index >= max_ticks:
