@@ -27,7 +27,31 @@ from typing import Callable
 
 from ..errors import EngineError
 
-__all__ = ["RequestKind", "Priority", "DiscoveryPaced", "PacedRequestBudget"]
+__all__ = [
+    "RequestKind",
+    "Priority",
+    "DiscoveryPaced",
+    "PacedRequestBudget",
+    "PacingLedger",
+    "DurablePacingLedger",
+]
+
+
+def __getattr__(name: str):
+    """Expose the durable backend without creating an import cycle.
+
+    ``pacing_ledger`` uses the enums in this module, so eager re-export would
+    make ``from engine.options.pacing_ledger import ...`` cyclic.  Lazy module
+    attributes keep both import paths stable.
+    """
+    if name in {"PacingLedger", "DurablePacingLedger"}:
+        from .pacing_ledger import DurablePacingLedger, PacingLedger
+
+        return {
+            "PacingLedger": PacingLedger,
+            "DurablePacingLedger": DurablePacingLedger,
+        }[name]
+    raise AttributeError(name)
 
 
 class RequestKind(str, Enum):

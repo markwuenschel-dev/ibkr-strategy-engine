@@ -57,6 +57,7 @@ class CachedSeries:
     fetched_at: dt.datetime | None
     source: str
     envelope: ObservationEnvelope | None = None
+    catalog_version: str | None = None
 
     @property
     def last_observation(self) -> dt.date | None:
@@ -86,6 +87,7 @@ class IVStore:
         observations: list[IVObservation] = []
         fetched_at: dt.datetime | None = None
         source = SOURCE_IBKR_OPTION_IV
+        catalog_version: str | None = None
         try:
             lines = path.read_text(encoding="utf-8").splitlines()
         except OSError:
@@ -106,6 +108,8 @@ class IVStore:
             meta = record.get("meta")
             if isinstance(meta, dict):
                 source = str(meta.get("source", source))
+                if meta.get("catalog_version") is not None:
+                    catalog_version = str(meta["catalog_version"])
                 raw_fetched = str(meta.get("fetched_at", ""))
                 try:
                     fetched_at = dt.datetime.fromisoformat(raw_fetched)
@@ -114,7 +118,9 @@ class IVStore:
                 raw_envelope = meta.get("envelope")
                 if isinstance(raw_envelope, dict):
                     with contextlib.suppress(KeyError, ValueError, TypeError):
-                        envelope = ObservationEnvelope.from_record(raw_envelope)
+                        candidate = ObservationEnvelope.from_record(raw_envelope)
+                        if candidate.symbol == symbol.strip().upper():
+                            envelope = candidate
                 continue
             try:
                 on = dt.date.fromisoformat(str(record.get("on", "")))
@@ -130,6 +136,7 @@ class IVStore:
             fetched_at=fetched_at,
             source=source,
             envelope=envelope,
+            catalog_version=catalog_version,
         )
 
     def fresh(
@@ -174,6 +181,7 @@ class IVStore:
         source: str = SOURCE_IBKR_OPTION_IV,
         ttl: dt.timedelta = DEFAULT_TTL,
         configuration_version: str = IVSTORE_VERSION,
+        catalog_version: str | None = None,
     ) -> Path:
         """Atomic whole-file rewrite. A crash mid-write leaves the old file.
 
@@ -204,6 +212,7 @@ class IVStore:
                         "source": source,
                         "fetched_at": fetched_at.isoformat(),
                         "envelope": envelope.to_record(),
+                        "catalog_version": catalog_version,
                     }
                 },
                 sort_keys=True,

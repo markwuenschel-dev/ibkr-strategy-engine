@@ -35,6 +35,7 @@ cannot be stated cannot be reused.
 from __future__ import annotations
 
 import datetime as dt
+import contextlib
 import json
 import os
 from dataclasses import dataclass
@@ -57,6 +58,18 @@ __all__ = [
 ENV_PREFIX = "IBKR_OPTIONS_FRESHNESS_"
 
 FRESHNESS_VERSION = "freshness/1"
+
+
+def _utc(value: dt.datetime) -> dt.datetime:
+    """Normalize aware instants at the value boundary.
+
+    Comparing two aware datetimes with different timezone objects is legal but
+    easy to misuse around DST transitions.  Persisting UTC here makes the
+    cache's ordering and expiry comparisons unambiguous for every caller.
+    """
+    if value.tzinfo is None:
+        raise ValueError("freshness instants must be timezone-aware")
+    return value.astimezone(dt.timezone.utc)
 
 
 class FreshnessClass(str, Enum):
@@ -85,15 +98,19 @@ class ObservationEnvelope:
     subscription_generation: UUID | None = None
 
     def __post_init__(self) -> None:
-        if not self.symbol.strip():
+        symbol = self.symbol.strip().upper()
+        if not symbol:
             raise ValueError("an envelope must name its symbol")
-        if self.expires_at <= self.observed_at:
+        observed_at = _utc(self.observed_at)
+        expires_at = _utc(self.expires_at)
+        if expires_at <= observed_at:
             raise ValueError(
-                f"{self.symbol}: expires_at {self.expires_at.isoformat()} is not "
-                f"after observed_at {self.observed_at.isoformat()}"
+                f"{symbol}: expires_at {expires_at.isoformat()} is not "
+                f"after observed_at {observed_at.isoformat()}"
             )
-        if self.observed_at.tzinfo is None or self.expires_at.tzinfo is None:
-            raise ValueError(f"{self.symbol}: envelope instants must be timezone-aware")
+        object.__setattr__(self, "symbol", symbol)
+        object.__setattr__(self, "observed_at", observed_at)
+        object.__setattr__(self, "expires_at", expires_at)
 
     def fresh(self, *, now: dt.datetime, session_date: dt.date) -> bool:
         """Whether this record may be *reused* right now.
@@ -103,11 +120,17 @@ class ObservationEnvelope:
         outlive their session, whatever their expiry claims -- a generous
         TTL cannot resurrect yesterday's quote.
         """
+        current = _utc(now)
         if self.freshness_class is FreshnessClass.SESSION_METADATA:
             return self.session_date == session_date
         if self.freshness_class is FreshnessClass.PERISHABLE:
-            return self.session_date == session_date and now < self.expires_at
-        return now < self.expires_at
+            return self.session_date == session_date and current < self.expires_at
+        return current < self.expires_at
+
+    @property
+    def cacheable(self) -> bool:
+        """Whether this envelope may cross a pass boundary."""
+        return self.freshness_class is not FreshnessClass.PERISHABLE
 
     def to_record(self) -> dict[str, Any]:
         return {
@@ -177,6 +200,33 @@ class FreshnessPolicy:
     #: Recent volume: meaningful on the hour scale during a session.
     volume_ttl: dt.timedelta = dt.timedelta(hours=1)
     version: str = FRESHNESS_VERSION
+
+    def ttl_for(
+        self, freshness_class: FreshnessClass | str
+    ) -> dt.timedelta | None:
+        """Return the configured TTL, or ``None`` for perishable data.
+
+        A perishable quote has no cache TTL by design.  Its usable lifetime is
+        the live quote policy at the final decision door, not this cache.
+        """
+        if isinstance(freshness_class, str) and not isinstance(
+            freshness_class, FreshnessClass
+        ):
+            normalized = freshness_class.strip().upper()
+            if normalized in {"IV", "IV_HISTORY", "REALIZED_VOLATILITY"}:
+                freshness_class = FreshnessClass.SLOW_OBSERVATION
+            elif normalized in {"OI", "OPEN_INTEREST"}:
+                return self.open_interest_ttl
+            elif normalized in {"VOLUME", "RECENT_VOLUME"}:
+                return self.volume_ttl
+            else:
+                with contextlib.suppress(ValueError):
+                    freshness_class = FreshnessClass(normalized)
+        if freshness_class is FreshnessClass.SESSION_METADATA:
+            return None
+        if freshness_class is FreshnessClass.SLOW_OBSERVATION:
+            return self.iv_history_ttl
+        return None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "FreshnessPolicy":
