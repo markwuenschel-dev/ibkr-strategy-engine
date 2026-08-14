@@ -298,6 +298,7 @@ def run_proof(
         sink=capture,
         verifier=verifier,
         approval_context=context,
+        session_lease=lambda: None,
     )
     return report, preflight, capture, broker
 
@@ -362,6 +363,20 @@ def _patch_adapters(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         adapters, "IBKRPortfolioStateAdapter", lambda _broker: FakePortfolioPort()
     )
+
+    # The proof command is an intentionally narrow manual harness, but it
+    # exercises an armed FULL pass. Give that harness the same live lease
+    # callback that the paper-day controller supplies in production; the
+    # runner's None-vs-present contract is tested separately below.
+    from engine.options import runner as runner_module
+
+    real_run_once = runner_module.run_once
+
+    def _run_with_proof_lease(*args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("session_lease", lambda: None)
+        return real_run_once(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module, "run_once", _run_with_proof_lease)
 
 
 def _review_in_line(monkeypatch: pytest.MonkeyPatch, home: Path) -> None:
@@ -1151,6 +1166,7 @@ class TestTheProofRefusesWhenABoundWouldBeBroken:
             now=NOW,
             today=TODAY,
             account="DU1234567",
+            session_lease=lambda: None,
             enforce_iv_rank=False,
             entry_preflight=exploding,
         )
@@ -1354,6 +1370,7 @@ class TestTheStrategyPathIsUnchanged:
             now=NOW,
             today=TODAY,
             account="DU1234567",
+            session_lease=lambda: None,
         )
         assert broker.ib.placed == []
         assert any("IV Rank" in blocker for blocker in report.blockers), report.blockers

@@ -60,6 +60,7 @@ from engine.options.policy import RiskPolicy
 from engine.options.positions import PositionStore
 from engine.options.runner import EntryMode, RunReport, run_once
 from engine.options.selection import Bias
+from engine.options.order_outbox import FAIL_LEASE_MISSING
 from engine.options.transmit import SESSION_LEASE_LOST, authorize_close, place_combo
 from engine.safety import SafetyGate
 
@@ -225,13 +226,7 @@ def place_combo_calls(function: ast.FunctionDef) -> list[ast.Call]:
 
 
 class TestNoLeaseIsNoFence:
-    """Every existing caller passes no lease, and must behave exactly as before.
-
-    The failure prevented is the one a fail-closed default would cause: a fence
-    whose absence refuses would silently stop every caller in the tree -- the
-    CLI, the execution proof, the reprice ladder -- from ever transmitting
-    again, which is a far larger outage than the one being fixed.
-    """
+    """The low-level port remains optional; production FULL is not."""
 
     def test_both_lease_parameters_default_to_no_fence(self) -> None:
         runner_default = inspect.signature(run_once).parameters["session_lease"].default
@@ -245,14 +240,14 @@ class TestNoLeaseIsNoFence:
             "existing caller would get a fence it never asked for"
         )
 
-    def test_an_armed_pass_with_no_lease_still_transmits_its_entry(
+    def test_an_armed_production_pass_with_no_lease_is_refused(
         self, tmp_path: Path
     ) -> None:
         session = LeasePass(tmp_path)
         report = session.run()
-        assert report.entered, f"the unfenced pass did not enter: {report.blockers}"
-        assert len(session.ib.placed) == 1, session.ib.placed
-        assert SESSION_LEASE_LOST not in report.refusal_codes, report.refusal_codes
+        assert not report.entered, report.describe()
+        assert session.ib.placed == [], session.ib.placed
+        assert FAIL_LEASE_MISSING in report.refusal_codes, report.refusal_codes
 
     def test_place_combo_with_no_lease_still_transmits(self, tmp_path: Path) -> None:
         intent = spread()

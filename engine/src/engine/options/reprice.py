@@ -112,7 +112,7 @@ from uuid import UUID
 
 from ..errors import ConfigError, RefusedError
 from ..safety import SafetyGate
-from .domain import OptionStrategyIntent
+from .domain import OptionStrategyIntent, StrategyAction
 from .orderstate import OrderLifecycleState
 from .proof import PriceEnvelope, envelope_for
 from .approval import ApprovalContext, VerifierGate
@@ -126,6 +126,7 @@ from .transmit import (
     cancel_combo,
     place_combo,
 )
+from .order_outbox import ExecutionOutbox, TransmissionBudget
 
 __all__ = [
     "MAXIMUM_ATTEMPTS",
@@ -394,6 +395,11 @@ def work_order(
     verifier: VerifierGate | None = None,
     approval_context: ApprovalContext | None = None,
     session_lease: SessionLease | None = None,
+    execution_outbox: ExecutionOutbox | None = None,
+    transmission_budget: TransmissionBudget | None = None,
+    session_id: str | None = None,
+    lease_nonce: str | None = None,
+    tick_id: str | None = None,
 ) -> RepriceOutcome:
     """Work a transmitted order that is still alive, then stop -- flat or filled.
 
@@ -540,6 +546,20 @@ def work_order(
                 detail=f"{current.filled} filled while cancelling; not replacing",
             )
 
+        # Legacy/manual callers without the durable budget still get the
+        # original journal-backed cap at every rung.  Production callers pass
+        # ``TransmissionBudget``; its reservation happens inside
+        # ``authorize_reprice`` before the new approval is consumed.
+        if transmission_budget is None and current_intent.strategy_action is StrategyAction.OPEN:
+            try:
+                gate.gate_daily_count()
+            except RefusedError as exc:
+                return done(
+                    RepriceStop.REFUSED,
+                    cancelled=cancelled,
+                    detail=f"FAIL-REPRICE-BUDGET: {exc.message}",
+                )
+
         try:
             repriced: RepricedOrder = authorize_reprice(
                 current_auth,
@@ -557,6 +577,12 @@ def work_order(
                 # *closing* reprice needs neither and gets neither.
                 verifier=verifier,
                 context=approval_context,
+                execution_outbox=execution_outbox,
+                transmission_budget=transmission_budget,
+                session_id=session_id,
+                lease_nonce=lease_nonce,
+                tick_id=tick_id,
+                account=account,
             )
         except RefusedError as exc:
             return done(

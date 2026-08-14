@@ -542,6 +542,7 @@ def run_pass(
         verifier = reviewer.approving_gate(gate.config.state_dir.parent / "verifier")
     if approval_context is None:
         approval_context = reviewer.approval_context()
+    session_lease = extra.pop("session_lease", lambda: None)
     return run_once(
         broker,
         gate=gate,
@@ -559,6 +560,7 @@ def run_pass(
         account="DU1234567",
         verifier=verifier,
         approval_context=approval_context,
+        session_lease=session_lease,
         **extra,
     )
 

@@ -98,6 +98,12 @@ from .positions import (
 )
 from .proof import envelope_for
 from .reprice import DEFAULT_LADDER, RepriceLadder, RepriceOutcome, work_order
+from .order_outbox import (
+    FAIL_BROKER_AMBIGUOUS,
+    FAIL_LEASE_MISSING,
+    ExecutionOutbox,
+    TransmissionBudget,
+)
 from .risk import CandidateRiskAssessment, assess_candidate
 from .sink import LifecycleRecorder
 from .selection import (
@@ -590,6 +596,17 @@ def _manage_one(
         return
 
     report.transmissions.append(result)
+    if not result.transmitted:
+        store.record_close_failed(
+            position.strategy_id,
+            at=now,
+            reason=result.message or "broker submission did not return a trade handle",
+        )
+        report.errors.append(
+            f"close failed for {position.strategy_id}: "
+            f"{result.message or 'broker submission did not return a trade handle'}"
+        )
+        return
     journal.record("order_placed", **result.to_record())
 
     # Persistence already happened, inside the polling loop, via the sink. What
@@ -1378,6 +1395,11 @@ def _authorize_and_transmit_entry(
     before_transmit: Callable[[], None] | None = None,
     after_transmit: Callable[[bool | None, str], None] | None = None,
     session_lease: SessionLease | None = None,
+    execution_outbox: ExecutionOutbox | None = None,
+    transmission_budget: TransmissionBudget | None = None,
+    session_id: str | None = None,
+    lease_nonce: str | None = None,
+    tick_id: str | None = None,
 ) -> str:
     """THE one corridor from a built candidate to a transmitted opening order.
 
@@ -1420,6 +1442,21 @@ def _authorize_and_transmit_entry(
     # After every engine gate, before the token exists. A refusal here means
     # no TransmitAuthorization is ever minted for this candidate, rather than
     # one being minted and then not used.
+    if armed and session_lease is None:
+        report.blockers.append(
+            "entry refused: an armed FULL pass has no production session lease"
+        )
+        report.refusal_codes.append(FAIL_LEASE_MISSING)
+        return "refused"
+
+    if execution_outbox is not None:
+        try:
+            execution_outbox.assert_clear()
+        except RefusedError as exc:
+            report.blockers.append(f"entry refused: {exc.message}")
+            report.refusal_codes.append(FAIL_BROKER_AMBIGUOUS)
+            return "refused"
+
     if entry_preflight is not None:
         try:
             refusal = entry_preflight(
@@ -1576,6 +1613,12 @@ def _authorize_and_transmit_entry(
             now=now,
             verifier=verifier,
             packet=packet,
+            execution_outbox=execution_outbox,
+            transmission_budget=transmission_budget,
+            session_id=session_id,
+            lease_nonce=lease_nonce,
+            tick_id=tick_id,
+            account=account,
         )
     except AwaitingVerification as exc:
         # Not a refusal of the candidate -- a statement that the answer has
@@ -1626,6 +1669,18 @@ def _authorize_and_transmit_entry(
         return "transmit_failed"
 
     report.transmissions.append(result)
+    if not result.transmitted:
+        store.record_open_failed(
+            candidate.strategy_id,
+            at=now,
+            reason=result.message or "broker submission did not return a trade handle",
+        )
+        report.errors.append(
+            result.message or "broker submission did not return a trade handle"
+        )
+        if after_transmit is not None:
+            after_transmit(False, result.message or "transmission failed")
+        return "transmit_failed"
     journal.record("order_placed", **result.to_record())
 
     # -- 5. work the order, if the broker took it and did not fill it ----
@@ -1676,6 +1731,11 @@ def _authorize_and_transmit_entry(
             account=account,
             sink=recorder,
             session_lease=session_lease,
+            execution_outbox=execution_outbox,
+            transmission_budget=transmission_budget,
+            session_id=session_id,
+            lease_nonce=lease_nonce,
+            tick_id=tick_id,
         )
         report.reprice = outcome
         # A summary of the ladder, under its own event name. The individual
@@ -2239,6 +2299,11 @@ def run_once(
     #: At most this many logical entries may sit pending verification before
     #: the pass stops claiming new nominations (contract section 3(b)).
     max_pending_entries: int = 3,
+    execution_outbox: ExecutionOutbox | None = None,
+    transmission_budget: TransmissionBudget | None = None,
+    session_id: str | None = None,
+    lease_nonce: str | None = None,
+    tick_id: str | None = None,
 ) -> RunReport:
     """Reconcile and manage positions, optionally running the entry pipeline.
 
@@ -2377,6 +2442,36 @@ def run_once(
             )
             return report
 
+        # An armed FULL pass is a production opening caller.  It must carry
+        # the live session fence all the way to the transmission door; keeping
+        # this check in the runner prevents a future worker from accidentally
+        # treating the optional low-level port as a production authority.
+        if armed and session_lease is None:
+            report.blockers.append(
+                "entry refused: an armed FULL pass has no production session lease"
+            )
+            report.refusal_codes.append(FAIL_LEASE_MISSING)
+            report.entry_refusal_code = FAIL_LEASE_MISSING
+            return report
+
+        if armed:
+            execution_outbox = execution_outbox or ExecutionOutbox(
+                gate.config.state_dir / "execution-outbox"
+            )
+            transmission_budget = transmission_budget or TransmissionBudget(
+                gate.config.state_dir / "transmission-budget.json",
+                limit=gate.config.max_orders_per_session,
+                journal=journal,
+                now=now,
+            )
+            try:
+                execution_outbox.assert_clear()
+            except RefusedError as exc:
+                report.blockers.append(f"entry refused: {exc.message}")
+                report.refusal_codes.append(FAIL_BROKER_AMBIGUOUS)
+                report.entry_refusal_code = FAIL_BROKER_AMBIGUOUS
+                return report
+
         # -- 3. entry ------------------------------------------------------
         # An order whose outcome is unknown may be resting in the book. Opening
         # another on top of it is how one intended position becomes two, so this
@@ -2433,6 +2528,11 @@ def run_once(
             minimum_iv_rank=minimum_iv_rank,
             entry_preflight=entry_preflight,
             session_lease=session_lease,
+            execution_outbox=execution_outbox,
+            transmission_budget=transmission_budget,
+            session_id=session_id,
+            lease_nonce=lease_nonce,
+            tick_id=tick_id,
             reprice=reprice,
             report=report,
         )

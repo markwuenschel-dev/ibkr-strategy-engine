@@ -41,6 +41,7 @@ def run_manage_only(
     entry_mode: EntryMode = EntryMode.MANAGE_ONLY,
     **overrides: Any,
 ) -> Any:
+    session_lease = overrides.pop("session_lease", lambda: None)
     return run_once(
         broker,
         gate=gate,
@@ -56,6 +57,7 @@ def run_manage_only(
         today=overrides.pop("today", TODAY),
         account="DU1234567",
         entry_mode=entry_mode,
+        session_lease=session_lease,
         **overrides,
     )
 

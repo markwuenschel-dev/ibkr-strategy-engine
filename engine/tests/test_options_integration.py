@@ -202,6 +202,7 @@ class Rig:
             verifier=self.verifier,
             approval_context=self.context,
             entry_mode=EntryMode.FULL,
+            session_lease=extra.pop("session_lease", lambda: None),
             manager=manager if manager is not None else self.manager,
             scanbook_root=self.state_dir,
             **extra,

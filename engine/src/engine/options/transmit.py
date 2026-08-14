@@ -135,6 +135,11 @@ from .domain import (
 from .execution import COMBO_ORDER_TYPE, COMBO_TIME_IN_FORCE, build_combo
 from .governor import GovernorVerdict
 from .orderstate import BrokerOrderSnapshot, OrderLifecycleState, snapshot_from_trade
+from .order_outbox import (
+    ExecutionOutbox,
+    TransmissionBudget,
+    TransmissionReservation,
+)
 from .proof import PriceEnvelope
 from .risk import CandidateRiskAssessment
 
@@ -143,9 +148,11 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle avoidance only
 
 __all__ = [
     "CancelAuthorization",
+    "ExecutionOutbox",
     "RepricedOrder",
     "SESSION_LEASE_LOST",
     "SessionLease",
+    "TransmissionBudget",
     "TransmitAuthorization",
     "TransmitResult",
     "authorize_cancel",
@@ -302,6 +309,13 @@ class TransmitAuthorization:
     #: module docstring argues for expressed as a field rather than a comment.
     spec: AuthorizedOrderSpec | None = None
     approval: VerifierApproval | None = None
+    #: Recovery state for the physical send.  Kept on the token so the only
+    #: transmitting door can commit the reservation and receipt immediately
+    #: around ``placeOrder`` without a second, caller-controlled chokepoint.
+    execution_outbox: ExecutionOutbox | None = field(default=None, repr=False, compare=False)
+    execution_attempt_id: str | None = field(default=None, repr=False, compare=False)
+    transmission_budget: TransmissionBudget | None = field(default=None, repr=False, compare=False)
+    budget_reservation_id: str | None = field(default=None, repr=False, compare=False)
     key: Any = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -485,6 +499,13 @@ def authorize_open(
     now: dt.datetime,
     verifier: VerifierGate,
     packet: VerificationPacket,
+    execution_outbox: ExecutionOutbox | None = None,
+    transmission_budget: TransmissionBudget | None = None,
+    execution_attempt_id: str | None = None,
+    session_id: str | None = None,
+    lease_nonce: str | None = None,
+    tick_id: str | None = None,
+    account: str = "",
 ) -> TransmitAuthorization:
     """Run every gate, demand an independent APPROVED answer, and mint the token.
 
@@ -520,6 +541,11 @@ def authorize_open(
     gate.assert_not_halted()
     _check_allowlist(gate, intent)
     gate.gate_daily_count()
+    if execution_outbox is not None:
+        # Do not file or consume a new approval while an earlier physical send
+        # is unresolved.  The runner checks this too, but keeping the invariant
+        # at the authorization boundary closes direct production callers.
+        execution_outbox.assert_clear()
 
     if not risk.approved:
         raise RefusedError(
@@ -558,7 +584,59 @@ def authorize_open(
     approval = verifier.require(packet, now=now)
 
     gate.gate_armed(armed=armed)
-    verifier.consume(approval, now=now)
+
+    # The physical-send intent must be durable before the single-use approval
+    # is consumed.  A crash after consume but before ``placeOrder`` therefore
+    # leaves an explicit attempt for recovery rather than a consumed approval
+    # with no answer to "did the broker see it?".
+    attempt_id: str | None = None
+    reservation: TransmissionReservation | None = None
+    if execution_outbox is not None:
+        attempt_id = execution_outbox.prepare(
+            intent,
+            structure_digest=digest,
+            spec_digest=expected.digest,
+            account=account or packet.context.account,
+            approval_id=approval.response_id,
+            attempt_id=execution_attempt_id,
+            session_id=session_id,
+            lease_nonce=lease_nonce,
+            tick_id=tick_id,
+            now=now,
+        )
+    try:
+        if transmission_budget is not None:
+            reservation = transmission_budget.reserve(
+                intent.strategy_id, attempt_id=attempt_id, now=now
+            )
+    except Exception:
+        if execution_outbox is not None and attempt_id is not None:
+            try:
+                execution_outbox.abort(
+                    attempt_id,
+                    reason="transmission budget refused before approval consumption",
+                )
+            except Exception:
+                pass
+        raise
+    try:
+        # This is intentionally after both durable intent and budget reserve.
+        verifier.consume(approval, now=now)
+        if execution_outbox is not None and attempt_id is not None:
+            execution_outbox.approval_consumed(attempt_id)
+    except Exception as exc:
+        if execution_outbox is not None and attempt_id is not None:
+            try:
+                execution_outbox.quarantine(
+                    attempt_id,
+                    reason=f"approval consumption or reservation failed: {type(exc).__name__}: {exc}",
+                )
+            except Exception:
+                # The original failure is still the most useful signal; the
+                # outbox's own durability error is fail-closed on the next
+                # startup when the PREPARED record is found.
+                pass
+        raise
 
     return TransmitAuthorization(
         strategy_id=intent.strategy_id,
@@ -570,6 +648,10 @@ def authorize_open(
         governor=governor,
         spec=expected,
         approval=approval,
+        execution_outbox=execution_outbox,
+        execution_attempt_id=attempt_id,
+        transmission_budget=transmission_budget,
+        budget_reservation_id=(reservation.reservation_id if reservation else None),
         key=_AUTHORIZATION_KEY,
     )
 
@@ -718,6 +800,13 @@ def authorize_reprice(
     now: dt.datetime,
     verifier: VerifierGate | None = None,
     context: ApprovalContext | None = None,
+    execution_outbox: ExecutionOutbox | None = None,
+    transmission_budget: TransmissionBudget | None = None,
+    execution_attempt_id: str | None = None,
+    session_id: str | None = None,
+    lease_nonce: str | None = None,
+    tick_id: str | None = None,
+    account: str = "",
 ) -> RepricedOrder:
     """Re-authorize the same structure at a new price, or refuse.
 
@@ -837,10 +926,14 @@ def authorize_reprice(
         )
 
     gate.assert_not_halted()
+    if execution_outbox is not None:
+        execution_outbox.assert_clear()
 
     spec: AuthorizedOrderSpec | None = None
     approval: VerifierApproval | None = None
     repriced_digest = structure_digest(repriced)
+    attempt_id: str | None = None
+    reservation: TransmissionReservation | None = None
     if repriced.strategy_action is StrategyAction.OPEN:
         if verifier is None or context is None:
             raise RefusedError(
@@ -875,7 +968,56 @@ def authorize_reprice(
 
     gate.gate_armed(armed=armed)
     if approval is not None:
-        verifier.consume(approval, now=now)
+        execution_outbox = execution_outbox or previous.execution_outbox
+        transmission_budget = transmission_budget or previous.transmission_budget
+        if execution_outbox is not None:
+            attempt_id = execution_outbox.prepare(
+                repriced,
+                structure_digest=repriced_digest,
+                spec_digest=spec.digest if spec is not None else "",
+                account=(account or (context.account if context is not None else "")),
+                approval_id=approval.response_id,
+                attempt_id=execution_attempt_id,
+                session_id=session_id,
+                lease_nonce=lease_nonce,
+                tick_id=tick_id,
+                now=now,
+            )
+        try:
+            if transmission_budget is not None:
+                reservation = transmission_budget.reserve(
+                    repriced.strategy_id, attempt_id=attempt_id, now=now
+                )
+        except Exception:
+            if execution_outbox is not None and attempt_id is not None:
+                try:
+                    execution_outbox.abort(
+                        attempt_id,
+                        reason="transmission budget refused before reprice approval consumption",
+                    )
+                except Exception:
+                    pass
+            raise
+        try:
+            verifier.consume(approval, now=now)
+            if execution_outbox is not None and attempt_id is not None:
+                execution_outbox.approval_consumed(attempt_id)
+        except Exception as exc:
+            if execution_outbox is not None and attempt_id is not None:
+                try:
+                    execution_outbox.quarantine(
+                        attempt_id,
+                        reason=f"reprice approval consumption or reservation failed: {type(exc).__name__}: {exc}",
+                    )
+                except Exception:
+                    pass
+            raise
+    else:
+        # Closing reprices do not consume the opening budget, but inherit the
+        # outbox/budget references only as a convenience for the transmission
+        # door; no reservation is minted for an exit.
+        execution_outbox = execution_outbox or previous.execution_outbox
+        transmission_budget = transmission_budget or previous.transmission_budget
 
     authorization = TransmitAuthorization(
         strategy_id=repriced.strategy_id,
@@ -887,6 +1029,10 @@ def authorize_reprice(
         governor=previous.governor,
         spec=spec,
         approval=approval,
+        execution_outbox=execution_outbox,
+        execution_attempt_id=attempt_id,
+        transmission_budget=transmission_budget,
+        budget_reservation_id=(reservation.reservation_id if reservation else None),
         key=_AUTHORIZATION_KEY,
     )
     return RepricedOrder(
@@ -1009,13 +1155,70 @@ def place_combo(
                 "held; nothing was sent, and the authorization is spent",
             )
 
+    outbox = authorization.execution_outbox
+    attempt_id = authorization.execution_attempt_id
+    budget = authorization.transmission_budget
+    reservation_id = authorization.budget_reservation_id
+    if intent.strategy_action is StrategyAction.OPEN and outbox is not None:
+        if not attempt_id:
+            raise RefusedError(
+                "an opening authorization has an execution outbox but no attempt id",
+                hint="prepare the physical-send intent before consuming approval",
+            )
+        # This is the last local write before the broker call.  If it cannot be
+        # published, nothing is handed to IBKR.
+        outbox.send_intent(
+            attempt_id, order_ref=str(getattr(order, "orderRef", ""))
+        )
+
     # Set explicitly rather than relying on ib_async's default. This is the one
     # file permitted to arm an order, and an armed order should say so in the
     # code that arms it rather than inheriting it from a library default that
     # could change.
     order.transmit = True
 
-    trade = ib.placeOrder(bag, order)
+    try:
+        trade = ib.placeOrder(bag, order)
+    except Exception as exc:  # noqa: BLE001 - broker may have accepted before raising
+        if outbox is not None and attempt_id is not None:
+            try:
+                outbox.quarantine(
+                    attempt_id,
+                    reason=(
+                        "placeOrder raised after the send door opened: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                )
+            except Exception:
+                pass
+        return TransmitResult(
+            strategy_id=intent.strategy_id,
+            action=intent.strategy_action,
+            transmitted=False,
+            snapshot=None,
+            message=(
+                "broker submission outcome is ambiguous after placeOrder raised: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        )
+
+    # A reservation is committed only after the broker call returns.  If this
+    # durable transition fails, the broker may still have the order; retain the
+    # reservation and quarantine rather than releasing a potentially used slot.
+    budget_failure: str | None = None
+    if budget is not None and reservation_id is not None:
+        try:
+            budget.commit(reservation_id)
+        except Exception as exc:  # noqa: BLE001 - fail closed after broker touch
+            budget_failure = (
+                "transmission budget commit failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            if outbox is not None and attempt_id is not None:
+                try:
+                    outbox.quarantine(attempt_id, reason=budget_failure)
+                except Exception:
+                    pass
 
     # From here the order may be live at the broker. Every path below must
     # produce a TransmitResult rather than raise: an exception escaping after
@@ -1043,6 +1246,36 @@ def place_combo(
             timed_out=timed,
             disconnected=lost,
         )
+        if outbox is not None and attempt_id is not None:
+            payload = observation.to_record()
+            payload.update(
+                {
+                    "strategy_order_ref": str(getattr(order, "orderRef", "")),
+                    "account": getattr(order, "account", None) or account,
+                    "legs": [
+                        {
+                            "con_id": getattr(leg, "conId", None),
+                            "action": getattr(leg, "action", None),
+                            "ratio": getattr(leg, "ratio", None),
+                            "exchange": getattr(leg, "exchange", None),
+                        }
+                        for leg in getattr(bag, "comboLegs", ())
+                    ],
+                }
+            )
+            try:
+                outbox.submission_observed(attempt_id, observation=payload)
+            except Exception as exc:  # noqa: BLE001 - broker state now needs quarantine
+                try:
+                    outbox.quarantine(
+                        attempt_id,
+                        reason=(
+                            "submission receipt failed: "
+                            f"{type(exc).__name__}: {exc}"
+                        ),
+                    )
+                except Exception:
+                    pass
         if sink is not None:
             sink.observe(record_as, observation, closing=closing)
         return observation
@@ -1087,7 +1320,7 @@ def place_combo(
     # both are facts about *us* rather than about the order.
     snapshot = emit(timed=timed_out, lost=disconnected)
 
-    return TransmitResult(
+    result = TransmitResult(
         strategy_id=intent.strategy_id,
         action=intent.strategy_action,
         transmitted=True,
@@ -1099,6 +1332,51 @@ def place_combo(
         ),
         trade=trade,
     )
+    if outbox is not None and attempt_id is not None:
+        if snapshot.state is OrderLifecycleState.FILLED:
+            classification = "FILLED"
+        elif snapshot.state is OrderLifecycleState.PARTIALLY_FILLED:
+            classification = "PARTIAL"
+        elif snapshot.state in {
+            OrderLifecycleState.SUBMITTED,
+            OrderLifecycleState.ACKNOWLEDGED,
+        }:
+            classification = "WORKING"
+        elif snapshot.state in {
+            OrderLifecycleState.CANCELLED,
+            OrderLifecycleState.REJECTED,
+            OrderLifecycleState.INACTIVE,
+        }:
+            classification = "CANCELLED"
+        else:
+            classification = "UNKNOWN"
+        try:
+            outbox.outcome(
+                attempt_id,
+                classification=classification,
+                observation=snapshot.to_record(),
+            )
+        except Exception as exc:  # noqa: BLE001 - never make an ambiguous send look clean
+            try:
+                outbox.quarantine(
+                    attempt_id,
+                    reason=(
+                        "outcome receipt failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                )
+            except Exception:
+                pass
+    if budget_failure:
+        result = TransmitResult(
+            strategy_id=result.strategy_id,
+            action=result.action,
+            transmitted=result.transmitted,
+            snapshot=result.snapshot,
+            message=budget_failure,
+            trade=result.trade,
+        )
+    return result
 
 
 def cancel_combo(
