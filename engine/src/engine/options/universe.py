@@ -60,6 +60,7 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from ..errors import ConfigError, EngineError
 from .chain import select_expiration, narrow_strikes
@@ -70,10 +71,11 @@ from .freshness import (
     SessionMetadataStore,
     SymbolSessionMetadata,
 )
-from .ivrank import IVRankMetric, build_iv_rank
-from .ivstore import IVStore
+from .ivrank import IVObservation, IVRankMetric, build_iv_rank
+from .ivstore import CachedSeries, IVStore
 from .liquidity import check_liquidity
 from .pacing import DiscoveryPaced, PacedRequestBudget, Priority, RequestKind
+from .pacing_ledger import PacingLedger
 from .policy import RiskPolicy
 from .ports import ContractDataPort, LiveMarketDataPort, VolatilityHistoryPort
 from .regime import (
@@ -83,6 +85,19 @@ from .regime import (
     classify,
 )
 from .selection import Bias, candidates_from_snapshot, select_vertical, target_delta_for
+from .catalog import CatalogEntry, CatalogSnapshot, UniverseCatalog
+from .observation_cache import (
+    FairRefreshQueue,
+    ObservationCache,
+    RawObservation,
+)
+from .scan_receipts import ScanReceiptStore
+from .scanbook_store import (
+    ObservationAges,
+    PhaseCoverage,
+    ScanBookSnapshot,
+    ScanBookSnapshotStore,
+)
 from .universe_data import UNIVERSE_VERSION, UniverseEntry
 
 __all__ = [
@@ -101,6 +116,11 @@ __all__ = [
     "ScanBookFileWriter",
     "UniverseScanConfig",
     "run_universe_pass",
+    "IntegratedScanResult",
+    "UniverseScanRecoveryRequired",
+    "run_catalog_universe_pass",
+    "run_integrated_universe_pass",
+    "ObservationCacheIVStore",
     "transition",
     "claim_for_logical_entry",
     "supersede",
@@ -118,6 +138,7 @@ __all__ = [
     "REASON_NO_STRUCTURE",
     "REASON_EVENT_RISK",
     "REASON_PHASE2_NOT_REACHED",
+    "REASON_CATALOG_ENTRY_INELIGIBLE",
 ]
 
 SCANBOOK_VERSION = "scanbook/1"
@@ -143,6 +164,7 @@ REASON_NO_EXPIRY_IN_WINDOW = "UNIVERSE_NO_EXPIRY_IN_WINDOW"
 REASON_NO_STRUCTURE = "UNIVERSE_NO_STRUCTURE"
 REASON_EVENT_RISK = "UNIVERSE_EVENT_RISK"
 REASON_PHASE2_NOT_REACHED = "UNIVERSE_PHASE2_NOT_REACHED"
+REASON_CATALOG_ENTRY_INELIGIBLE = "UNIVERSE_CATALOG_ENTRY_INELIGIBLE"
 
 ZERO = Decimal("0")
 
@@ -882,6 +904,11 @@ class UniverseScanConfig:
     maximum_dte: int = 55
     #: Strikes to enumerate around the ladder anchor before qualification.
     strike_window: int = 24
+    #: Conservative upper bound for one deep-probe reservation.  The
+    #: integrated worker reserves this amount before it touches expirations,
+    #: strikes, qualification, or live quotes.  A smaller actual request count
+    #: releases the unused estimate at completion.
+    phase2_request_cost: int = 4
     version: str = UNIVERSE_SCAN_VERSION
 
     def __post_init__(self) -> None:
@@ -901,6 +928,16 @@ class UniverseScanConfig:
                     hint="the bound exists to keep one pass inside the broker's "
                     "pacing windows",
                 )
+        if (
+            not isinstance(self.phase2_request_cost, int)
+            or isinstance(self.phase2_request_cost, bool)
+            or self.phase2_request_cost <= 0
+            or self.phase2_request_cost > 100
+        ):
+            _refuse(
+                "phase2_request_cost must be a positive int no greater than 100",
+                hint="deep probing must reserve a finite broker-load estimate",
+            )
         for label in ("target_dte", "minimum_dte", "maximum_dte", "strike_window"):
             value = getattr(self, label)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
@@ -925,6 +962,7 @@ class UniverseScanConfig:
             "minimum_dte": _env_int(source, "MINIMUM_DTE", 35),
             "maximum_dte": _env_int(source, "MAXIMUM_DTE", 55),
             "strike_window": _env_int(source, "STRIKE_WINDOW", 24),
+            "phase2_request_cost": _env_int(source, "PHASE2_REQUEST_COST", 4),
         }
         values.update({k: v for k, v in overrides.items() if v is not None})
         return cls(**values)  # type: ignore[arg-type]
@@ -1011,6 +1049,713 @@ def _utcnow() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
 
 
+def _previous_weekday(value: dt.date) -> dt.date:
+    candidate = value - dt.timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate -= dt.timedelta(days=1)
+    return candidate
+
+
+class ObservationCacheIVStore:
+    """IVStore-shaped adapter over the durable raw-observation cache.
+
+    The legacy scanner consumes :class:`IVStore`; the unattended worker must
+    consume one batch/indexed cache shared by every phase.  This adapter keeps
+    that old scanner contract local to this module, stores only raw IV input,
+    and never caches a derived IV Rank conclusion.
+    """
+
+    def __init__(
+        self,
+        cache: ObservationCache,
+        *,
+        session_date: dt.date,
+        catalog_version: str,
+        configuration_version: str,
+        now: dt.datetime,
+        ttl: dt.timedelta = dt.timedelta(hours=20),
+    ) -> None:
+        if now.tzinfo is None:
+            raise ValueError("cache adapter now must be timezone-aware")
+        if ttl <= dt.timedelta(0):
+            raise ValueError("cache adapter ttl must be positive")
+        self.cache = cache
+        self.session_date = session_date
+        self.catalog_version = catalog_version
+        self.configuration_version = configuration_version
+        self.now = now.astimezone(dt.timezone.utc)
+        self.ttl = ttl
+        self._records: dict[str, tuple[RawObservation, ...]] = {}
+
+    def prefetch(self, symbols: Iterable[str]) -> None:
+        wanted = tuple(dict.fromkeys(str(symbol).strip().upper() for symbol in symbols))
+        if not wanted:
+            return
+        records = self.cache.read_many(
+            wanted,
+            now=self.now,
+            session_date=self.session_date,
+            catalog_version=self.catalog_version,
+            configuration_version=self.configuration_version,
+            include_expired=True,
+        )
+        self._records.update(
+            {
+                symbol: tuple(
+                    observation
+                    for observation in records.get(symbol, ())
+                    if observation.key in {"iv-history", "iv", "realized-volatility"}
+                )
+                for symbol in wanted
+            }
+        )
+
+    @staticmethod
+    def _decode(observations: Iterable[RawObservation]) -> tuple[IVObservation, ...]:
+        decoded: list[IVObservation] = []
+        for observation in observations:
+            payload = observation.payload
+            raw_series: Any = payload.get("observations", payload.get("series"))
+            if raw_series is None and "on" in payload and "iv" in payload:
+                raw_series = [payload]
+            if not isinstance(raw_series, (list, tuple)):
+                continue
+            for raw in raw_series:
+                if not isinstance(raw, Mapping):
+                    continue
+                try:
+                    on = dt.date.fromisoformat(str(raw["on"]))
+                    implied = Decimal(str(raw["iv"]))
+                except (KeyError, TypeError, ValueError, InvalidOperation):
+                    continue
+                if implied.is_finite() and implied > ZERO:
+                    decoded.append(IVObservation(on=on, implied_volatility=implied))
+        return tuple(sorted(decoded, key=lambda item: item.on))
+
+    def _records_for(self, symbol: str) -> tuple[RawObservation, ...]:
+        wanted = symbol.strip().upper()
+        if wanted not in self._records:
+            self.prefetch((wanted,))
+        return self._records.get(wanted, ())
+
+    def read(self, symbol: str) -> CachedSeries:
+        wanted = symbol.strip().upper()
+        records = self._records_for(wanted)
+        observations = self._decode(records)
+        newest = max(records, key=lambda item: item.observed_at, default=None)
+        return CachedSeries(
+            symbol=wanted,
+            observations=observations,
+            fetched_at=newest.observed_at if newest is not None else None,
+            source=newest.envelope.source if newest is not None else "cache",
+            envelope=newest.envelope if newest is not None else None,
+            catalog_version=(
+                newest.catalog_version if newest is not None else self.catalog_version
+            ),
+        )
+
+    def fresh(
+        self,
+        symbol: str,
+        *,
+        today: dt.date,
+        now: dt.datetime,
+        previous_session: dt.date | None = None,
+    ) -> bool:
+        cached = self.read(symbol)
+        if cached.envelope is None or not cached.observations:
+            return False
+        if not cached.envelope.fresh(now=now, session_date=today):
+            return False
+        if cached.envelope.session_date != today:
+            return False
+        previous = previous_session or _previous_weekday(today)
+        return cached.last_observation is not None and cached.last_observation >= previous
+
+    def write(
+        self,
+        symbol: str,
+        observations: list[IVObservation] | tuple[IVObservation, ...],
+        *,
+        fetched_at: dt.datetime,
+        source: str = "IBKR:reqHistoricalData:iv",
+        ttl: dt.timedelta = dt.timedelta(hours=20),
+        configuration_version: str | None = None,
+        catalog_version: str | None = None,
+    ) -> None:
+        fetched_at = fetched_at.astimezone(dt.timezone.utc)
+        envelope = ObservationEnvelope(
+            symbol=symbol.strip().upper(),
+            session_date=fetched_at.date(),
+            observed_at=fetched_at,
+            expires_at=fetched_at + ttl,
+            source=source,
+            freshness_class=FreshnessClass.SLOW_OBSERVATION,
+            configuration_version=configuration_version or self.configuration_version,
+            subscription_generation=uuid4(),
+        )
+        update = RawObservation(
+            symbol=symbol,
+            key="iv-history",
+            payload={
+                "observations": [
+                    {"on": item.on.isoformat(), "iv": str(item.implied_volatility)}
+                    for item in observations
+                ]
+            },
+            envelope=envelope,
+            catalog_version=catalog_version or self.catalog_version,
+        )
+        self.cache.write_batch((update,))
+        self._records[update.symbol] = (update,)
+
+    @property
+    def observation_times(self) -> tuple[dt.datetime, ...]:
+        return tuple(
+            observation.observed_at
+            for records in self._records.values()
+            for observation in records
+        )
+
+
+class _DurablePacingBudget:
+    """Legacy budget facade backed by one persistent pacing ledger.
+
+    Refresh requests are committed one-for-one.  Deep probing first reserves
+    its full estimate at candidate priority, which preserves the ledger's
+    management floor, then consumes only that reservation while the legacy
+    phase-two routine makes its individual calls.  A request beyond the
+    estimate is refused instead of silently borrowing from management.
+    """
+
+    def __init__(self, ledger: PacingLedger, *, owner_id: str, now: dt.datetime) -> None:
+        self.ledger = ledger
+        self.owner_id = owner_id
+        self.now = now.astimezone(dt.timezone.utc)
+        self._sequence = 0
+        self._phase2: dict[str, Any] = {}
+        self._phase2_current: str | None = None
+        self.phase2_considered: list[str] = []
+        self.phase2_deferred: set[str] = set()
+
+    def _key(self, label: str) -> str:
+        self._sequence += 1
+        return f"{self.owner_id}:{label}:{self._sequence}"
+
+    def acquire(self, kind: RequestKind, *, priority: Priority) -> None:
+        if self._phase2_current is not None:
+            reservation = self._phase2[self._phase2_current]
+            used = int(reservation["used"])
+            if used >= int(reservation["cost"]):
+                raise DiscoveryPaced(
+                    f"deep probe estimate exhausted for {self._phase2_current}"
+                )
+            reservation["used"] = used + 1
+            return
+        reservation = self.ledger.reserve(
+            kind,
+            cost=1,
+            priority=priority,
+            owner_id=self.owner_id,
+            request_key=self._key(kind.value.lower()),
+            now=self.now,
+        )
+        if reservation is None:
+            raise DiscoveryPaced(
+                f"durable pacing ledger refused {kind.value} at {priority.name}"
+            )
+        self.ledger.commit(reservation.reservation_id, actual_cost=1, now=self.now)
+
+    def prepare_phase2(self, symbol: str, *, estimated_cost: int) -> bool:
+        symbol = symbol.strip().upper()
+        self.phase2_considered.append(symbol)
+        pacing = self.ledger.snapshot(RequestKind.GENERAL, now=self.now)
+        if pacing.paused_until is not None and self.now < pacing.paused_until:
+            self.phase2_deferred.add(symbol)
+            return False
+        reservation = self.ledger.reserve(
+            RequestKind.GENERAL,
+            cost=estimated_cost,
+            priority=Priority.CANDIDATE_CONSTRUCTION,
+            owner_id=self.owner_id,
+            request_key=self._key(f"phase2:{symbol}"),
+            now=self.now,
+        )
+        if reservation is None:
+            self.phase2_deferred.add(symbol)
+            return False
+        self._phase2[symbol] = {
+            "reservation": reservation,
+            "cost": estimated_cost,
+            "used": 0,
+        }
+        return True
+
+    def begin_phase2(self, symbol: str) -> None:
+        self._phase2_current = symbol.strip().upper()
+
+    def mark_phase2_deferred(self, symbol: str) -> None:
+        self.phase2_deferred.add(symbol.strip().upper())
+
+    def finish_phase2(self, symbol: str) -> None:
+        key = symbol.strip().upper()
+        reservation = self._phase2.pop(key, None)
+        self._phase2_current = None
+        if reservation is None:
+            return
+        item = reservation["reservation"]
+        used = int(reservation["used"])
+        if used == 0:
+            self.ledger.release(item.reservation_id)
+            return
+        self.ledger.commit(
+            item.reservation_id,
+            actual_cost=min(used, int(reservation["cost"])),
+            now=self.now,
+        )
+
+    def penalize(self, kind: RequestKind) -> None:
+        self.ledger.penalize(kind, now=self.now)
+
+    def snapshot(self) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for kind in (RequestKind.HISTORICAL, RequestKind.GENERAL):
+            item = self.ledger.snapshot(kind, now=self.now)
+            result[kind.value] = {
+                "limit": item.limit,
+                "window_seconds": item.window_seconds,
+                "consumed": item.consumed,
+                "outstanding": item.outstanding,
+                "available": item.available,
+                "discovery_available": item.discovery_available,
+                "management_reserve": item.management_reserve,
+                "penalty_factor": item.penalty_factor,
+                "paused_until": (
+                    item.paused_until.isoformat() if item.paused_until else None
+                ),
+            }
+        return result
+
+
+class UniverseScanRecoveryRequired(EngineError):
+    """A prior scan in this session has no terminal/reconciled receipt."""
+
+
+@dataclass(frozen=True)
+class IntegratedScanResult:
+    """The legacy book and its immutable, manifest-bound publication."""
+
+    book: ScanBook
+    snapshot: ScanBookSnapshot
+    scan_id: str
+    session_id: str
+    tick_id: str
+    attempt_id: str
+    catalog_hash: str
+    policy_hash: str
+    calendar_hash: str
+    config_hash: str
+    refresh_symbols: tuple[str, ...]
+
+    @property
+    def complete(self) -> bool:
+        return self.snapshot.coverage_complete
+
+    @property
+    def diagnostic_only(self) -> bool:
+        return not self.complete
+
+
+def _manifest_hash(value: str, *, name: str) -> str:
+    normalized = str(value).strip().lower()
+    if len(normalized) != 64 or any(char not in "0123456789abcdef" for char in normalized):
+        raise ConfigError(f"{name} must be a SHA-256 hex digest")
+    return normalized
+
+
+def _safe_scan_id(value: str) -> str:
+    """Make the identity safe for both receipt ids and Windows filenames."""
+    normalized = "".join(
+        character if character in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.@+-" else "_"
+        for character in str(value).strip()
+    )
+    if not normalized:
+        raise ValueError("scan_id must contain at least one safe identifier character")
+    if len(normalized) > 200:
+        raise ValueError("scan_id must be no longer than 200 characters")
+    return normalized
+
+
+def _catalog_snapshot(catalog: UniverseCatalog | CatalogSnapshot) -> CatalogSnapshot:
+    if isinstance(catalog, UniverseCatalog):
+        return catalog.snapshot()
+    if isinstance(catalog, CatalogSnapshot):
+        return catalog
+    raise TypeError("catalog must be a UniverseCatalog or CatalogSnapshot")
+
+
+def _catalog_universe(snapshot: CatalogSnapshot) -> tuple[UniverseEntry, ...]:
+    return tuple(
+        UniverseEntry(
+            symbol=entry.symbol,
+            sector=entry.sector,
+            correlation_group=entry.correlation_group,
+        )
+        for entry in snapshot.entries
+    )
+
+
+def _apply_catalog_entry_gate(
+    book: ScanBook, entries: Mapping[str, CatalogEntry]
+) -> ScanBook:
+    rows: list[ScanBookRow] = []
+    for row in book.rows:
+        entry = entries.get(row.symbol)
+        if entry is not None and row.state is ScanState.CANDIDATE and not entry.automated_entry_allowed:
+            row = replace(
+                row,
+                state=ScanState.INELIGIBLE_REGIME,
+                reason=REASON_CATALOG_ENTRY_INELIGIBLE,
+                detail="catalog classification or optionability does not permit automated entry",
+                nomination=None,
+            )
+        rows.append(row)
+    frozen = tuple(rows)
+    return replace(book, rows=frozen, coverage=CoverageSummary.from_rows(frozen))
+
+
+def _observation_ages(
+    adapter: ObservationCacheIVStore, *, now: dt.datetime
+) -> ObservationAges:
+    ages = [
+        max(0.0, (now.astimezone(dt.timezone.utc) - observed).total_seconds())
+        for observed in adapter.observation_times
+    ]
+    if not ages:
+        return ObservationAges(oldest_seconds=0.0, newest_seconds=0.0)
+    return ObservationAges(oldest_seconds=max(ages), newest_seconds=min(ages))
+
+
+def _snapshot_from_book(
+    book: ScanBook,
+    *,
+    scan_id: str,
+    session_id: str,
+    tick_id: str,
+    attempt_id: str,
+    catalog: CatalogSnapshot,
+    entries: Mapping[str, CatalogEntry],
+    policy_hash: str,
+    calendar_hash: str,
+    config_hash: str,
+    budget: _DurablePacingBudget,
+    adapter: ObservationCacheIVStore,
+) -> ScanBookSnapshot:
+    rows = []
+    for row in book.rows:
+        record = row.to_record()
+        entry = entries.get(row.symbol)
+        if entry is not None:
+            record["catalog"] = entry.to_record()
+            record["automated_entry_allowed"] = entry.automated_entry_allowed
+        record["scan_id"] = scan_id
+        rows.append(record)
+    expected = len(rows)
+    deferred = book.coverage.deferred
+    unavailable = book.coverage.unavailable
+    # ``ScanBookRow.evaluated_at`` records that phase one had facts, but a
+    # later deep-probe deferral/unavailability is still an incomplete breadth
+    # outcome.  Snapshot counts must partition the expected universe rather
+    # than double-count a row in both evaluated and deferred/unavailable.
+    evaluated = max(0, book.coverage.evaluated - deferred - unavailable)
+    phase2_expected = len(budget.phase2_considered)
+    phase2_deferred = len(budget.phase2_deferred)
+    by_symbol = {row.symbol: row for row in book.rows}
+    phase2_unavailable = sum(
+        1
+        for symbol in budget.phase2_considered
+        if by_symbol.get(symbol) is not None
+        and by_symbol[symbol].state is ScanState.METADATA_UNAVAILABLE
+    )
+    phase2_completed = max(0, phase2_expected - phase2_deferred - phase2_unavailable)
+    return ScanBookSnapshot(
+        scan_id=scan_id,
+        session_id=session_id,
+        session_date=book.session_date,
+        generated_at=book.generated_at,
+        catalog_hash=catalog.catalog_hash,
+        policy_hash=policy_hash,
+        calendar_hash=calendar_hash,
+        config_hash=config_hash,
+        expected_symbols=expected,
+        evaluated_symbols=evaluated,
+        deferred_symbols=deferred,
+        unavailable_symbols=unavailable,
+        rows=tuple(rows),
+        phase_coverage={
+            "breadth": PhaseCoverage(
+                expected=expected,
+                completed=evaluated,
+                deferred=deferred,
+                unavailable=unavailable,
+                required=True,
+            ),
+            "deep": PhaseCoverage(
+                expected=phase2_expected,
+                completed=phase2_completed,
+                deferred=phase2_deferred,
+                unavailable=phase2_unavailable,
+                required=False,
+            ),
+        },
+        observation_ages=_observation_ages(adapter, now=book.generated_at),
+        pacing_snapshot=budget.snapshot(),
+        cycle_state={
+            "status": "COMPLETE" if evaluated == expected and not deferred and not unavailable else "INCOMPLETE",
+            "diagnostic_only": not (evaluated == expected and not deferred and not unavailable),
+            "coverage": book.coverage.to_record(),
+        },
+        shard_state={
+            "shard_id": "all",
+            "expected": expected,
+            "completed": evaluated,
+            "deferred": deferred,
+            "unavailable": unavailable,
+        },
+        tick_id=tick_id,
+        attempt_id=attempt_id,
+    )
+
+
+def _update_refresh_queue(
+    queue: FairRefreshQueue,
+    *,
+    selected: frozenset[str],
+    book: ScanBook,
+    now: dt.datetime,
+    interval: dt.timedelta,
+    ledger: PacingLedger,
+) -> None:
+    general = ledger.snapshot(RequestKind.GENERAL, now=now)
+    deferred_until = general.paused_until or now + interval
+    for row in book.rows:
+        if row.symbol not in selected:
+            continue
+        if row.observation in {
+            ObservationProvenance.CACHE,
+            ObservationProvenance.REFRESHED,
+        }:
+            queue.mark_phase_one(
+                row.symbol,
+                observed_at=now,
+                next_due_at=now + interval,
+                previous_rank=float(row.rank_score) if row.rank_score is not None else None,
+            )
+            continue
+        reason = row.reason or REASON_REFRESH_FAILED
+        until = deferred_until if row.state is ScanState.DEFERRED_PACING else now + interval
+        queue.defer(row.symbol, until=until, reason=reason, now=now)
+
+
+def run_catalog_universe_pass(
+    *,
+    catalog: UniverseCatalog | CatalogSnapshot,
+    observation_cache: ObservationCache,
+    pacing_ledger: PacingLedger,
+    snapshot_store: ScanBookSnapshotStore,
+    receipt_store: ScanReceiptStore,
+    session_id: str,
+    session_date: dt.date,
+    policy_hash: str,
+    calendar_hash: str,
+    config_hash: str,
+    policy: RiskPolicy,
+    regime_policy: VolatilityRegimePolicy,
+    config: UniverseScanConfig,
+    metadata_store: SessionMetadataStore | None = None,
+    volatility_history: VolatilityHistoryPort | None = None,
+    contract_data: ContractDataPort | None = None,
+    market_data: LiveMarketDataPort | None = None,
+    event_risk: Callable[[str], str | None] | None = None,
+    refresh_queue: FairRefreshQueue | None = None,
+    now: dt.datetime | None = None,
+    scan_id: str | None = None,
+    tick_id: str | None = None,
+    attempt_id: str | None = None,
+    refresh_interval: dt.timedelta = dt.timedelta(minutes=30),
+) -> IntegratedScanResult:
+    """Run one durable catalog-backed breadth/deep scan.
+
+    The old :func:`run_universe_pass` remains the compatibility/manual API.
+    This path adds the unattended contracts around it: one batch cache read,
+    a durable fair refresh ring, a shared pacing ledger, immutable manifest
+    publication, and a receipt journal that makes an interrupted scan
+    observable instead of treating absence as success.
+    """
+    when = (now or _utcnow()).astimezone(dt.timezone.utc)
+    if refresh_interval <= dt.timedelta(0):
+        raise ValueError("refresh_interval must be positive")
+    if not session_id.strip():
+        raise ValueError("session_id is required")
+    policy_hash = _manifest_hash(policy_hash, name="policy_hash")
+    calendar_hash = _manifest_hash(calendar_hash, name="calendar_hash")
+    config_hash = _manifest_hash(config_hash, name="config_hash")
+    snapshot = _catalog_snapshot(catalog)
+    catalog_hash = _manifest_hash(snapshot.catalog_hash, name="catalog_hash")
+    tick_id = tick_id or f"manual:{when.strftime('%Y%m%dT%H%M%S')}"
+    attempt_id = attempt_id or uuid4().hex
+    scan_id = _safe_scan_id(scan_id or f"{session_id}:{tick_id}:{attempt_id}")
+    if receipt_store.unmatched(session_id=session_id):
+        raise UniverseScanRecoveryRequired(
+            f"session {session_id} has an unmatched scan receipt; reconcile before starting {scan_id}"
+        )
+    if receipt_store.read(scan_id):
+        raise UniverseScanRecoveryRequired(
+            f"scan {scan_id} already has receipts and cannot be replayed"
+        )
+    queue = refresh_queue or getattr(observation_cache, "refresh_queue", None)
+    if queue is None:
+        raise TypeError("refresh_queue must be supplied when the cache has no queue")
+    entries = {entry.symbol: entry for entry in snapshot.entries}
+    universe = _catalog_universe(snapshot)
+    # Publish the start before queue/cache work. If the process dies during
+    # setup, the unmatched receipt is the recovery witness; absence is never
+    # interpreted as a scan that did not happen.
+    receipt_store.start(
+        session_id=session_id,
+        scan_id=scan_id,
+        recorded_at=when,
+        tick_id=tick_id,
+        attempt_id=attempt_id,
+        expected_shards=1,
+        payload={
+            "catalog_hash": catalog_hash,
+            "policy_hash": policy_hash,
+            "calendar_hash": calendar_hash,
+            "config_hash": config_hash,
+            "expected_symbols": len(universe),
+        },
+    )
+    queue.seed(
+        universe,
+        catalog_version=snapshot.version,
+        configuration_version=config.version,
+        now=when,
+        interval=refresh_interval,
+        estimated_request_cost=2,
+    )
+    selected_states = queue.select_due(
+        now=when,
+        limit=min(config.refresh_limit, len(universe)),
+        catalog_version=snapshot.version,
+        configuration_version=config.version,
+        claim_owner=scan_id,
+    )
+    selected = frozenset(state.symbol for state in selected_states)
+    adapter = ObservationCacheIVStore(
+        observation_cache,
+        session_date=session_date,
+        catalog_version=snapshot.version,
+        configuration_version=config.version,
+        now=when,
+    )
+    adapter.prefetch(entry.symbol for entry in snapshot.entries)
+    budget = _DurablePacingBudget(pacing_ledger, owner_id=scan_id, now=when)
+    try:
+        book = run_universe_pass(
+            universe=universe,
+            session_date=session_date,
+            iv_store=adapter,  # type: ignore[arg-type]
+            metadata_store=metadata_store or SessionMetadataStore(snapshot_store.root / "metadata"),
+            budget=budget,  # type: ignore[arg-type]
+            policy=policy,
+            regime_policy=regime_policy,
+            config=config,
+            volatility_history=volatility_history,
+            contract_data=contract_data,
+            market_data=market_data,
+            event_risk=event_risk,
+            now=when,
+            refresh_symbols=selected,
+        )
+        book = _apply_catalog_entry_gate(book, entries)
+        _update_refresh_queue(
+            queue,
+            selected=selected,
+            book=book,
+            now=when,
+            interval=refresh_interval,
+            ledger=pacing_ledger,
+        )
+        immutable = _snapshot_from_book(
+            book,
+            scan_id=scan_id,
+            session_id=session_id,
+            tick_id=tick_id,
+            attempt_id=attempt_id,
+            catalog=snapshot,
+            entries=entries,
+            policy_hash=policy_hash,
+            calendar_hash=calendar_hash,
+            config_hash=config_hash,
+            budget=budget,
+            adapter=adapter,
+        )
+        receipt_store.shard_completed(
+            session_id=session_id,
+            scan_id=scan_id,
+            shard_id="all",
+            recorded_at=when,
+            tick_id=tick_id,
+            attempt_id=attempt_id,
+            evaluated=immutable.evaluated_symbols,
+            deferred=immutable.deferred_symbols,
+            unavailable=immutable.unavailable_symbols,
+            payload={"coverage": immutable.coverage.value},
+        )
+        snapshot_store.publish(immutable)
+        receipt_store.complete(
+            session_id=session_id,
+            scan_id=scan_id,
+            recorded_at=when,
+            tick_id=tick_id,
+            attempt_id=attempt_id,
+            payload={
+                "coverage": immutable.coverage.value,
+                "published": True,
+            },
+        )
+        return IntegratedScanResult(
+            book=book,
+            snapshot=immutable,
+            scan_id=scan_id,
+            session_id=session_id,
+            tick_id=tick_id,
+            attempt_id=attempt_id,
+            catalog_hash=catalog_hash,
+            policy_hash=policy_hash,
+            calendar_hash=calendar_hash,
+            config_hash=config_hash,
+            refresh_symbols=tuple(sorted(selected)),
+        )
+    except Exception as exc:
+        try:
+            receipt_store.abort(
+                session_id=session_id,
+                scan_id=scan_id,
+                recorded_at=when,
+                reason=f"{type(exc).__name__}: {exc}",
+                tick_id=tick_id,
+                attempt_id=attempt_id,
+            )
+        except Exception:
+            pass
+        raise
+
+
+run_integrated_universe_pass = run_catalog_universe_pass
+
+
 def run_universe_pass(
     *,
     universe: Sequence[UniverseEntry],
@@ -1026,6 +1771,7 @@ def run_universe_pass(
     market_data: LiveMarketDataPort | None = None,
     event_risk: Callable[[str], str | None] | None = None,
     now: dt.datetime | None = None,
+    refresh_symbols: frozenset[str] | None = None,
 ) -> ScanBook:
     """One read-only scheduling pass over the universe.
 
@@ -1119,6 +1865,19 @@ def run_universe_pass(
                 reason=REASON_REFRESH_NOT_REACHED,
                 detail=f"the refresh bound of {config.refresh_limit} was reached "
                 "before this symbol's turn; it is first in line next pass",
+                observation=stale_provenance,
+                rank_inputs=previous_inputs,
+            )
+            continue
+        if refresh_symbols is not None and symbol not in refresh_symbols:
+            rows[symbol] = replace(
+                rows[symbol],
+                state=ScanState.OBSERVATION_STALE,
+                reason=REASON_REFRESH_NOT_REACHED,
+                detail=(
+                    "the durable fair-refresh queue did not select this symbol "
+                    "for the current refresh ring"
+                ),
                 observation=stale_provenance,
                 rank_inputs=previous_inputs,
             )
@@ -1225,19 +1984,54 @@ def run_universe_pass(
     # -- phase 2: the strongest bounded subset ------------------------------
     ranked.sort(key=lambda item: (-item[0], item[1]))
     for score, symbol, decision in ranked[: config.phase2_limit]:
-        rows[symbol] = _phase_two(
-            rows[symbol],
-            decision=decision,
-            session_date=session_date,
-            now=when,
-            metadata_store=metadata_store,
-            budget=budget,
-            policy=policy,
-            config=config,
-            contract_data=contract_data,
-            market_data=market_data,
-            entry=by_symbol[symbol],
-        )
+        prepared = True
+        prepare = getattr(budget, "prepare_phase2", None)
+        if callable(prepare):
+            try:
+                prepared = bool(
+                    prepare(symbol, estimated_cost=config.phase2_request_cost)
+                )
+            except DiscoveryPaced as exc:
+                prepared = False
+                rows[symbol] = replace(
+                    rows[symbol],
+                    state=ScanState.DEFERRED_PACING,
+                    reason=REASON_PACING_DEFERRED,
+                    detail=str(exc),
+                )
+        if not prepared:
+            if rows[symbol].state is not ScanState.DEFERRED_PACING:
+                rows[symbol] = replace(
+                    rows[symbol],
+                    state=ScanState.DEFERRED_PACING,
+                    reason=REASON_PACING_DEFERRED,
+                    detail="durable pacing ledger refused the deep-probe estimate",
+                )
+            continue
+        begin = getattr(budget, "begin_phase2", None)
+        finish = getattr(budget, "finish_phase2", None)
+        if callable(begin):
+            begin(symbol)
+        try:
+            rows[symbol] = _phase_two(
+                rows[symbol],
+                decision=decision,
+                session_date=session_date,
+                now=when,
+                metadata_store=metadata_store,
+                budget=budget,
+                policy=policy,
+                config=config,
+                contract_data=contract_data,
+                market_data=market_data,
+                entry=by_symbol[symbol],
+            )
+            mark_deferred = getattr(budget, "mark_phase2_deferred", None)
+            if rows[symbol].state is ScanState.DEFERRED_PACING and callable(mark_deferred):
+                mark_deferred(symbol)
+        finally:
+            if callable(finish):
+                finish(symbol)
 
     ordered = tuple(rows[entry.symbol] for entry in universe)
     return ScanBook(
