@@ -14,12 +14,26 @@ Re-running is safe: a healthy session is re-verified, a stale one is recovered.
 
 .PARAMETER TimeoutSeconds
 How long to wait for the reviewer's liveness reply (default 180).
+
+.PARAMETER StateDir
+Absolute shared state root used by paper-day, scheduler, and engine workers.
+
+.PARAMETER Mandate
+MANAGE_ONLY preserves the legacy management-only session. FULL requires the
+hash-pinned policy, catalog, and config authority inputs below.
 #>
 [CmdletBinding()]
 param(
     [int]$TimeoutSeconds = 180,
     [string]$ScheduleConfig,
-    [string]$ScheduleConfigSha256
+    [string]$ScheduleConfigSha256,
+    [string]$StateDir,
+    [ValidateSet("MANAGE_ONLY", "FULL")]
+    [string]$Mandate = "MANAGE_ONLY",
+    [string]$PolicySha256,
+    [string]$CatalogSha256,
+    [string]$ConfigSha256,
+    [string]$ConfigurationFingerprint
 )
 
 $ErrorActionPreference = "Stop"
@@ -31,6 +45,21 @@ if ($env:OS -ne "Windows_NT") {
 
 $repo = Split-Path -Parent $PSScriptRoot
 $python = Join-Path $repo "engine\.venv\Scripts\python.exe"
+$defaultStateDir = Join-Path $repo "engine\.engine"
+if ([string]::IsNullOrWhiteSpace($StateDir)) {
+    $StateDir = $defaultStateDir
+}
+if (-not [IO.Path]::IsPathFullyQualified($StateDir)) {
+    Write-Error "-StateDir must be an absolute path: $StateDir"
+    exit 20
+}
+if ($Mandate -eq "FULL" -and (
+        [string]::IsNullOrWhiteSpace($PolicySha256) -or
+        [string]::IsNullOrWhiteSpace($CatalogSha256) -or
+        [string]::IsNullOrWhiteSpace($ConfigSha256))) {
+    Write-Error "FULL requires -PolicySha256, -CatalogSha256, and -ConfigSha256."
+    exit 20
+}
 
 foreach ($required in @(
         @{ Path = (Join-Path $repo "engine\src\engine\paperday.py"); What = "engine repository" },
@@ -42,7 +71,11 @@ foreach ($required in @(
     }
 }
 
-$controllerArgs = @("--timeout", $TimeoutSeconds)
+$controllerArgs = @(
+    "--timeout", $TimeoutSeconds,
+    "--state-dir", $StateDir,
+    "--mandate", $Mandate
+)
 if (($null -eq $ScheduleConfig) -xor ($null -eq $ScheduleConfigSha256)) {
     Write-Error "-ScheduleConfig and -ScheduleConfigSha256 must be supplied together."
     exit 20
@@ -52,6 +85,16 @@ if ($ScheduleConfig) {
         "--schedule-config", $ScheduleConfig,
         "--schedule-config-sha256", $ScheduleConfigSha256
     )
+}
+foreach ($optional in @(
+        @{ Flag = "--policy-sha256"; Value = $PolicySha256 },
+        @{ Flag = "--catalog-sha256"; Value = $CatalogSha256 },
+        @{ Flag = "--config-sha256"; Value = $ConfigSha256 },
+        @{ Flag = "--configuration-fingerprint"; Value = $ConfigurationFingerprint }
+    )) {
+    if (-not [string]::IsNullOrWhiteSpace($optional.Value)) {
+        $controllerArgs += @($optional.Flag, $optional.Value)
+    }
 }
 
 & $python -c "import sys; from engine.paperday import main_start; sys.exit(main_start(sys.argv[1:]))" @controllerArgs
