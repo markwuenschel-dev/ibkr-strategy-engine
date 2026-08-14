@@ -129,7 +129,7 @@ class FakeMarketData:
         )
 
     def strategy_quotes(
-        self, *, underlying_symbol: str, con_ids: Any
+        self, *, underlying_symbol: str, con_ids: Any, **_: object
     ) -> StrategyQuoteSnapshot:
         ids = tuple(int(c) for c in con_ids)
         self.calls.append((underlying_symbol, ids))
@@ -137,13 +137,18 @@ class FakeMarketData:
         # Greeks carry the *same* generation as their quote: the provenance gate
         # refuses greeks from a superseded subscription, and a mismatch here
         # would refuse every candidate for a reason no test in this file is
-        # about.
+        # about. Open interest and volume sit comfortably above the liquidity
+        # floors (OI 500, volume 100): unmeasured counts as insufficient, and a
+        # ``None`` here would refuse every walk for a reason no test in this
+        # file is about.
         legs = (
             OptionQuote(
                 con_id=SHORT_CON_ID,
                 provenance=self._provenance(short_gen),
                 bid=SHORT_BID + self.shift,
                 ask=SHORT_ASK + self.shift,
+                open_interest=1000,
+                volume=500,
                 greeks=OptionGreeks(
                     received_at=self.clock(),
                     subscription_generation=short_gen,
@@ -155,6 +160,8 @@ class FakeMarketData:
                 provenance=self._provenance(long_gen),
                 bid=LONG_BID,
                 ask=LONG_ASK + self.widen_long_ask,
+                open_interest=1000,
+                volume=500,
                 greeks=OptionGreeks(
                     received_at=self.clock(),
                     subscription_generation=long_gen,
@@ -162,6 +169,25 @@ class FakeMarketData:
                 ),
             ),
         )
+        # Neighbouring quoted strikes, so the snapshot clears the liquidity
+        # gate's sparse-chain floor (>= 10 quoted strikes). They belong to no
+        # intent, so only their presence -- never their prices -- is read.
+        fillers: list[OptionQuote] = []
+        filler_generations: list[tuple[str, UUID]] = []
+        for offset in range(1, 9):
+            filler_con_id = LONG_CON_ID - offset
+            filler_gen = uuid4()
+            fillers.append(
+                OptionQuote(
+                    con_id=filler_con_id,
+                    provenance=self._provenance(filler_gen),
+                    bid=D("1.00"),
+                    ask=D("1.05"),
+                    open_interest=1000,
+                    volume=500,
+                )
+            )
+            filler_generations.append((str(filler_con_id), filler_gen))
         return StrategyQuoteSnapshot(
             underlying=UnderlyingQuote(
                 symbol=underlying_symbol,
@@ -169,11 +195,12 @@ class FakeMarketData:
                 bid=D("449.90"),
                 ask=D("450.10"),
             ),
-            legs=legs,
+            legs=legs + tuple(fillers),
             generations=(
                 ("underlying", under_gen),
                 (str(SHORT_CON_ID), short_gen),
                 (str(LONG_CON_ID), long_gen),
+                *filler_generations,
             ),
         )
 
@@ -802,7 +829,9 @@ class TestTheEnvelope:
         original_quotes = market.strategy_quotes
         state = {"n": 0}
 
-        def moving(*, underlying_symbol: str, con_ids: Any) -> StrategyQuoteSnapshot:
+        def moving(
+            *, underlying_symbol: str, con_ids: Any, **_: object
+        ) -> StrategyQuoteSnapshot:
             state["n"] += 1
             if state["n"] > 1:
                 market.shift = D("-0.15")
@@ -835,7 +864,9 @@ class TestTheEnvelope:
         original_quotes = market.strategy_quotes
         state = {"n": 0}
 
-        def moving(*, underlying_symbol: str, con_ids: Any) -> StrategyQuoteSnapshot:
+        def moving(
+            *, underlying_symbol: str, con_ids: Any, **_: object
+        ) -> StrategyQuoteSnapshot:
             state["n"] += 1
             if state["n"] > 1:
                 market.shift = D("0.20")
@@ -881,7 +912,9 @@ class TestTheEnvelope:
 
     def test_a_market_data_outage_stops_the_walk(self, tmp_path: Path) -> None:
         class Dead:
-            def strategy_quotes(self, *, underlying_symbol: str, con_ids: Any):
+            def strategy_quotes(
+                self, *, underlying_symbol: str, con_ids: Any, **_: object
+            ):
                 raise ConnectionError("the subscription dropped")
 
         clock = Clock()

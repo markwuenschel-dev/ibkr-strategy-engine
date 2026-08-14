@@ -138,6 +138,26 @@ def greeks(generation: UUID, *, delta: str | None = "-0.16") -> OptionGreeks:
     )
 
 
+#: Filler chain contracts that make a snapshot's strike window dense enough for
+#: the liquidity gate's ``minimum_quoted_strikes`` floor (10). They are never in
+#: any intent, so they only count toward chain density -- but the whole-chain
+#: entitlement check (no ``intent``) still inspects them, so they carry the same
+#: liveness knobs as the traded legs.
+FILLER_CON_IDS = tuple(range(2001, 2011))
+
+#: A liquid two-sided market for one leg: tight against both spread caps
+#: (dollars and fraction-of-mid) and deep against the OI/volume floors. The
+#: short leg's mid must exceed the long leg's so the structure's mid credit is
+#: positive -- equal mids make the crossing-cost fraction meaningless and the
+#: liquidity gate refuses.
+LEG_MARKETS: dict[int, tuple[Decimal, Decimal]] = {
+    SHORT_CON_ID: (D("2.95"), D("3.05")),
+    LONG_CON_ID: (D("1.45"), D("1.55")),
+}
+LIQUID_OPEN_INTEREST = 5000
+LIQUID_VOLUME = 1000
+
+
 def live_snapshot(
     *,
     reported: MarketDataType | None = MarketDataType.LIVE,
@@ -147,29 +167,45 @@ def live_snapshot(
     delta: str | None = "-0.16",
     declared_generations: dict[str, UUID] | None = None,
 ) -> StrategyQuoteSnapshot:
-    """A snapshot that is fully live unless a knob is turned.
+    """A snapshot that is fully live and liquid unless a knob is turned.
 
-    ``declared_generations`` overrides what the snapshot claims is active, which
-    is how a generation mismatch is staged without the quotes themselves being
-    inconsistent.
+    ``declared_generations`` overrides what the snapshot claims is active for
+    the underlying and the two traded legs, which is how a generation mismatch
+    is staged without the quotes themselves being inconsistent. The filler
+    strikes always declare their own true generations -- they exist to satisfy
+    chain density, not to stage mismatches.
     """
     under_gen, short_gen, long_gen = uuid4(), uuid4(), uuid4()
-    legs = tuple(
-        OptionQuote(
+    filler_gens = {con_id: uuid4() for con_id in FILLER_CON_IDS}
+
+    def leg(con_id: int, gen: UUID, bid: Decimal, ask: Decimal) -> OptionQuote:
+        return OptionQuote(
             con_id=con_id,
             provenance=provenance(
                 gen, reported=reported, callback=callback, provider_at=provider_at
             ),
-            bid=D("1.40"),
-            ask=D("1.60"),
+            bid=bid,
+            ask=ask,
+            open_interest=LIQUID_OPEN_INTEREST,
+            volume=LIQUID_VOLUME,
             greeks=greeks(gen, delta=delta) if with_greeks else None,
         )
+
+    legs = tuple(
+        leg(con_id, gen, *LEG_MARKETS[con_id])
         for con_id, gen in ((SHORT_CON_ID, short_gen), (LONG_CON_ID, long_gen))
+    ) + tuple(
+        leg(con_id, filler_gens[con_id], D("0.95"), D("1.05"))
+        for con_id in FILLER_CON_IDS
     )
     declared = declared_generations or {
         "underlying": under_gen,
         str(SHORT_CON_ID): short_gen,
         str(LONG_CON_ID): long_gen,
+    }
+    declared = {
+        **{str(con_id): gen for con_id, gen in filler_gens.items()},
+        **declared,
     }
     return StrategyQuoteSnapshot(
         underlying=UnderlyingQuote(

@@ -997,3 +997,123 @@ class TestTheGuardsAreLoadBearing:
         for name in ("iv_rank", "stress_loss", "broker_what_if_margin"):
             assert name in rendered
         assert "**MISSING**" in rendered
+
+
+# ===========================================================================
+# Mis-addressed blocking answers (M4): a "no" about another order is not a
+# "no" about this one
+# ===========================================================================
+
+
+class TestMisaddressedBlockingAnswers:
+    """A non-APPROVED answer blocks only when it is about THIS order (intent
+    id) and from the reviewer route. A reply that names a foreign intent never
+    judged this order; it is recorded as a reason, never a refusal -- while a
+    correctly-addressed REFUSED still blocks with no digest demanded of it
+    (the anti-evasion property in the module docstring)."""
+
+    def test_a_refused_naming_a_foreign_intent_does_not_refuse_this_order(
+        self, tmp_path: Path
+    ) -> None:
+        """MUTATION GUARD (M4): revert the intent-id check on blocking answers
+        and this fails -- the mis-addressed REFUSED would refuse an order it
+        never judged, instead of leaving it awaiting its real answer."""
+        gate = approving_gate(tmp_path)
+        gate.reviewer.decision = ApprovalDecision.REFUSED
+        gate.reviewer.mangle = lambda fields: fields.__setitem__("intent_id", uuid4())
+        with pytest.raises(AwaitingVerification):
+            open_it(spread(), verifier=gate, context=context_at(), tmp_path=tmp_path)
+
+    def test_a_refused_naming_this_intent_still_blocks_with_no_digest(
+        self, tmp_path: Path
+    ) -> None:
+        """The control, and the preserved anti-evasion property: a reviewer's
+        REFUSED that names this intent blocks outright -- no spec digest is
+        demanded of a refusal, so a re-quote cannot evade the 'no'."""
+        gate = approving_gate(tmp_path)
+        gate.reviewer.decision = ApprovalDecision.REFUSED
+        with pytest.raises(RefusedError) as exc:
+            open_it(spread(), verifier=gate, context=context_at(), tmp_path=tmp_path)
+        assert "REFUSED" in exc.value.message
+        assert not isinstance(exc.value, AwaitingVerification)
+
+    def test_a_refused_from_a_non_reviewer_seat_does_not_block(
+        self, tmp_path: Path
+    ) -> None:
+        """A REFUSED carrying the right intent but sent from the builder's own
+        seat is not the reviewer saying no; it is recorded, not obeyed."""
+        root = collab_at(tmp_path)
+        gate = CollabVerifierGate(root=root, ledger=tmp_path / "ledger")
+        context = context_at()
+        intent = spread()
+        with pytest.raises(AwaitingVerification) as awaiting:
+            open_it(intent, verifier=gate, context=context, tmp_path=tmp_path)
+        request_id = awaiting.value.request_id
+
+        store_at(root).create(
+            to="builder",
+            sender="builder",  # the wrong seat: not the reviewer route
+            title="REFUSED: mis-sent",
+            body=render_response(
+                decision=ApprovalDecision.REFUSED,
+                request_id=request_id,
+                intent_id=intent.strategy_id,
+            ),
+            tags=["verification"],
+        )
+        with pytest.raises(AwaitingVerification):
+            open_it(intent, verifier=gate, context=context, tmp_path=tmp_path)
+
+    def test_a_correctly_addressed_unavailable_still_blocks(
+        self, tmp_path: Path
+    ) -> None:
+        """UNAVAILABLE is the other blocking decision, and the narrowed check
+        must not have loosened it."""
+        gate = approving_gate(tmp_path)
+        gate.reviewer.decision = ApprovalDecision.UNAVAILABLE
+        with pytest.raises(RefusedError) as exc:
+            open_it(spread(), verifier=gate, context=context_at(), tmp_path=tmp_path)
+        assert "UNAVAILABLE" in exc.value.message
+
+
+# ===========================================================================
+# The request marker is installed atomically (minor a)
+# ===========================================================================
+
+
+class TestRequestMarkerDurability:
+    def test_the_request_marker_cannot_half_exist(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """MUTATION GUARD (minor a): revert ``propose`` to a direct
+        ``write_text`` of the marker and this fails -- with the atomic install
+        broken, propose must fail loudly and leave NO marker behind, never a
+        torn one that 'remembers' an id nothing can find."""
+        from engine.options import approval as approval_module
+
+        root = collab_at(tmp_path)
+        gate = CollabVerifierGate(root=root, ledger=tmp_path / "ledger")
+        intent = spread()
+        proposal = packet(
+            intent,
+            risk=approving_risk(intent.strategy_id),
+            governor=approving_governor(intent),
+            context=context_at(),
+            now=NOW,
+        )
+
+        real_replace = approval_module.os.replace
+        marker = gate._request_marker(proposal.spec)
+
+        def broken_replace(source: Any, destination: Any) -> None:
+            if str(destination) == str(marker):
+                raise OSError("simulated crash installing the request marker")
+            real_replace(source, destination)
+
+        monkeypatch.setattr(approval_module.os, "replace", broken_replace)
+        with pytest.raises(OSError):
+            gate.propose(proposal, now=NOW)
+
+        assert not marker.exists()
+        assert gate.request_id_for(proposal.spec) == ""
+        assert list(marker.parent.glob("*.tmp")) == [], "a torn temp file leaked"

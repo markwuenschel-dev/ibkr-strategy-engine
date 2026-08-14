@@ -986,6 +986,11 @@ def mark_open_positions(
             error = None
         else:
             try:
+                # Two-sided demanded: these are the held structure's own legs,
+                # and a one-sided snapshot is the coin flip that made in-pass
+                # marking fail 7 of 10 passes on 2026-07-31. Passed by keyword
+                # only when needed, so ports predating the parameter still work
+                # on their default path.
                 snapshot = market_data.strategy_quotes(
                     underlying_symbol=position.underlying,
                     con_ids=con_ids,

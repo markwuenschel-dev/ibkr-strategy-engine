@@ -68,6 +68,7 @@ import errno
 import hashlib
 import json
 import os
+import tempfile
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -570,6 +571,12 @@ class VerificationPacket:
         "greek_timestamps",
         "iv_rank",
         "iv_rank_filter",
+        # The regime protocol (spec §1): every packet states the tier, the
+        # sizing multiplier and the exact reasons. Absent renders MISSING,
+        # which the reviewer treats as grounds for UNAVAILABLE.
+        "volatility_regime",
+        "allocation_multiplier",
+        "regime_reasons",
         "defined_max_loss",
         "stress_loss",
         "broker_what_if_margin",
@@ -1142,7 +1149,22 @@ class CollabVerifierGate:
             priority="high",
             tags=["verification", "opening"],
         )
-        marker.write_text(handoff.id, encoding="utf-8")
+        # Atomic: temp + os.replace, like every store. A torn direct write
+        # would leave a marker whose truncated id "remembers" a request that
+        # cannot be found, which reads as a lost request and refuses forever.
+        handle, temp_name = tempfile.mkstemp(
+            dir=str(marker.parent), prefix=f".{packet.spec.digest}-", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                stream.write(handoff.id)
+            os.replace(temp_name, marker)
+        except BaseException:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+            raise
         return str(handoff.id)
 
     # -- step 7 and the validation --------------------------------------
@@ -1168,15 +1190,33 @@ class CollabVerifierGate:
             ) from exc
 
         answers = self._answers_to(store, request_id)
-        if not answers:
-            raise AwaitingVerification(
-                f"awaiting independent verification of trade intent {spec.intent_id}",
-                hint=f"request {request_id} is filed and unanswered; this candidate "
-                "waits, everything else in the pass continues",
-                request_id=request_id,
-            )
 
-        blocking = [a for a in answers if a.decision is not ApprovalDecision.APPROVED]
+        reasons: list[str] = []
+        blocking: list[VerifierApproval] = []
+        approved: list[VerifierApproval] = []
+        for answer in answers:
+            if answer.decision is ApprovalDecision.APPROVED:
+                approved.append(answer)
+                continue
+            # A REFUSED or UNAVAILABLE blocks only when it is *about this
+            # order* -- its intent id names this trade -- and *from the
+            # reviewer route*. A mis-addressed reply naming a foreign intent
+            # never judged this order and must not refuse it; it is recorded
+            # as a reason, not a block. What is deliberately NOT demanded of a
+            # refusal is a matching digest (see _approval_from_handoff): a
+            # "no" that named this intent cannot be evaded by re-quoting the
+            # order it was about.
+            if (
+                answer.intent_id == spec.intent_id
+                and self._canonical(answer.sender_seat) == _REVIEWER_ROUTE
+            ):
+                blocking.append(answer)
+            else:
+                reasons.append(
+                    f"{answer.response_id}: {answer.decision.value} ignored -- it "
+                    f"answers intent {answer.intent_id} from seat "
+                    f"{answer.sender_seat!r}, this order is intent {spec.intent_id}"
+                )
         if blocking:
             worst = blocking[0]
             raise RefusedError(
@@ -1186,17 +1226,58 @@ class CollabVerifierGate:
                 "approval filed beside it",
             )
 
-        reasons: list[str] = []
-        for approval in answers:
+        for approval in approved:
             problems = self._mismatches(approval, packet, request=request, now=now)
             if not problems:
                 return approval
             reasons.append(f"{approval.response_id}: {'; '.join(problems)}")
 
+        if not approved:
+            raise AwaitingVerification(
+                f"awaiting independent verification of trade intent {spec.intent_id}",
+                hint=f"request {request_id} is filed and unanswered; this candidate "
+                "waits, everything else in the pass continues"
+                + (f" | {' | '.join(reasons)}" if reasons else ""),
+                request_id=request_id,
+            )
+
         raise RefusedError(
             f"no APPROVED answer covers this order (intent {spec.intent_id})",
             hint=" | ".join(reasons),
         )
+
+    # -- the closer: retiring the builder's own question -------------------
+
+    def withdraw(self, request_id: str, *, note: str) -> None:
+        """Close the builder's own review request, recording ``note`` on it.
+
+        Called when the *question* is retired -- a superseded revision, an
+        expired review, an abandoned entry -- so the reviewer's queue does not
+        accumulate orphaned requests nothing will ever act on. A pending
+        request is claimed first (by the builder: it is taking its own
+        question back), then completed with the note naming the cause.
+
+        Tolerant by contract: a missing, already-done or already-archived
+        request is left exactly as it is and nothing is recorded -- the goal,
+        no orphaned open request, is already met, and the reviewer's own
+        completion note must never be overwritten by the builder's. Only the
+        request is touched; answers are never moved or edited.
+        """
+        if not (request_id or "").strip():
+            return
+        try:
+            store = self._store()
+            request = store.find(request_id)
+        except Exception:  # noqa: BLE001 - missing request: nothing to close
+            return
+        if str(getattr(request, "status", "")) in ("done", "archive"):
+            return
+        try:
+            if str(getattr(request, "status", "")) == "pending":
+                store.claim(request_id, by=_BUILDER_SEAT)
+            store.complete(request_id, note=note, by=_BUILDER_SEAT)
+        except Exception:  # noqa: BLE001 - lost the race to another closer
+            return
 
     def _answers_to(self, store: Any, request_id: str) -> list[VerifierApproval]:
         found: list[VerifierApproval] = []

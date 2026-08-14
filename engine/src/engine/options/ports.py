@@ -156,13 +156,13 @@ class LiveMarketDataPort(Protocol):
         """One coherent snapshot of the underlying and every leg.
 
         ``require_two_sided`` asks the port to hold its settle window open
-        until every requested leg carries both a bid and an ask. Callers
-        pricing an exact selected structure, including a held position, pass
-        ``True``. Chain-wide scans leave it ``False``: deep wings without a
-        complete book must not pin the scan's bounded wait. The flag changes
-        patience, never truthfulness; at the deadline a one-sided snapshot is
-        still returned for the downstream freshness, liveness, provenance, and
-        pricing gates to classify independently.
+        until every leg carries both a bid and an ask. Callers quoting a
+        *selected structure* -- marking a held position, pricing an exit --
+        pass ``True``; callers sweeping a chain window must not, because deep
+        wings without bids would pin the wait at its ceiling. The flag changes
+        patience, never truthfulness: at the deadline a one-sided snapshot is
+        still returned for downstream freshness, provenance, and pricing gates
+        to classify independently.
         """
         ...
 

@@ -40,7 +40,8 @@ __all__ = [
 
 # Bumped whenever the calculation changes, so a cached metric computed under old
 # rules can be told apart from a fresh one rather than silently reused.
-METHODOLOGY_VERSION = "iv-rank/1"
+# /2: adds iv_percentile alongside iv_rank.
+METHODOLOGY_VERSION = "iv-rank/2"
 
 # Never to be compared numerically with a tastytrade IV Rank. Different input
 # series, different methodology; the label is what stops them being mixed.
@@ -66,6 +67,12 @@ class IVRankMetric:
     trailing_low: Decimal | None
     trailing_high: Decimal | None
     iv_rank: Decimal | None
+    #: Fraction of the retained window's observations at or below the current
+    #: reading, 0-100. Rank and percentile disagree exactly when the trailing
+    #: range is dominated by a spike -- one violent week leaves iv_rank low for
+    #: a year while the percentile still says "richer than most days" -- which
+    #: is why the regime classifier is given both.
+    iv_percentile: Decimal | None
     observation_count: int
     first_observation: dt.date | None
     last_observation: dt.date | None
@@ -99,6 +106,9 @@ class IVRankMetric:
         return {
             "symbol": self.symbol,
             "iv_rank": str(self.iv_rank) if self.iv_rank is not None else None,
+            "iv_percentile": (
+                str(self.iv_percentile) if self.iv_percentile is not None else None
+            ),
             "current_iv": str(self.current_iv) if self.current_iv is not None else None,
             "trailing_low": str(self.trailing_low) if self.trailing_low is not None else None,
             "trailing_high": str(self.trailing_high) if self.trailing_high is not None else None,
@@ -113,6 +123,21 @@ class IVRankMetric:
             "methodology_version": self.methodology_version,
             "degraded_reason": self.degraded_reason,
         }
+
+
+def iv_percentile(
+    observations: Sequence[IVObservation], current: Decimal
+) -> Decimal | None:
+    """Fraction of observations at or below ``current``, as 0-100.
+
+    ``None`` on an empty series or nonpositive current -- an unplaceable
+    percentile refuses rather than reads as zero, exactly like the rank.
+    """
+    values = [o.implied_volatility for o in observations]
+    if not values or current <= 0:
+        return None
+    at_or_below = sum(1 for value in values if value <= current)
+    return Decimal("100") * Decimal(at_or_below) / Decimal(len(values))
 
 
 def calculate_iv_rank(
@@ -203,6 +228,7 @@ def build_iv_rank(
             trailing_low=None,
             trailing_high=None,
             iv_rank=None,
+            iv_percentile=None,
             observation_count=len(kept),
             first_observation=kept[0].on if kept else None,
             last_observation=kept[-1].on if kept else None,
@@ -234,6 +260,7 @@ def build_iv_rank(
         trailing_low=low,
         trailing_high=high,
         iv_rank=rank,
+        iv_percentile=iv_percentile(kept, current),
         observation_count=len(kept),
         first_observation=kept[0].on,
         last_observation=kept[-1].on,

@@ -29,11 +29,13 @@ from engine.options.marketdata import (
 from engine.options.policy import RiskPolicy
 from engine.options.portfolio import PortfolioSnapshot, PositionExposure
 from engine.options.ports import StrategyQuoteSnapshot
+from engine.options.liquidity import CHECK_LIQUIDITY
 from engine.options.risk import (
     CHECK_BROKER_MARGIN,
     CHECK_DEFINED_LOSS,
     CHECK_MARKET_DATA_ENTITLEMENT,
     CHECK_STRESS_LOSS,
+    REQUIRED_CHECKS,
 )
 from engine.options.scan import SelectionMethod, run_scan
 
@@ -168,12 +170,26 @@ def _provenance(
     )
 
 
+#: Chain contracts the port quotes beyond the requested legs, so the snapshot
+#: clears the liquidity gate's ``minimum_quoted_strikes`` floor (10). Never in
+#: any candidate, so they only count toward chain density.
+FILLER_CON_IDS = tuple(range(5001, 5011))
+
+
 class FakeMarketDataPort:
-    """Returns a coherent snapshot at whatever liveness the test asks for.
+    """Returns a coherent, liquid snapshot at whatever liveness the test asks for.
 
     Stamped at call time rather than at a fixed constant, because the scan reads
     a real clock for its decision time and a frozen timestamp would fail the
     staleness check for reasons the test is not about.
+
+    Liquid on purpose, for the same reason it is live by default: the liquidity
+    gate is one of the required checks now, and a thin or one-priced market would
+    refuse every candidate for a reason these tests are not about. The first
+    requested con_id is the short leg (the scan sends the intent's legs in
+    order), so it is priced above the rest to give the structure a positive mid
+    credit; every leg is tight against the spread caps and deep against the
+    OI/volume floors, and filler strikes make the quoted window dense enough.
     """
 
     def __init__(self, *, reported: MarketDataType = MarketDataType.LIVE) -> None:
@@ -181,7 +197,11 @@ class FakeMarketDataPort:
         self.calls: list[tuple[str, tuple[int, ...]]] = []
 
     def strategy_quotes(
-        self, *, underlying_symbol: str, con_ids: Any
+        self,
+        *,
+        underlying_symbol: str,
+        con_ids: Any,
+        require_two_sided: bool = False,
     ) -> StrategyQuoteSnapshot:
         con_ids = tuple(int(c) for c in con_ids)
         self.calls.append((underlying_symbol, con_ids))
@@ -189,14 +209,17 @@ class FakeMarketDataPort:
         under_gen = uuid4()
         generations = [("underlying", under_gen)]
         legs = []
-        for con_id in con_ids:
+        for index, con_id in enumerate(con_ids + FILLER_CON_IDS):
             gen = uuid4()
+            mid = D("3.00") if index == 0 else D("1.50")
             legs.append(
                 OptionQuote(
                     con_id=con_id,
                     provenance=_provenance(gen, reported=self.reported, at=at),
-                    bid=D("1.40"),
-                    ask=D("1.60"),
+                    bid=mid - D("0.05"),
+                    ask=mid + D("0.05"),
+                    open_interest=5000,
+                    volume=1000,
                     greeks=OptionGreeks(
                         received_at=at,
                         subscription_generation=gen,
@@ -259,7 +282,7 @@ class TestVerdictsReachTheReport:
         assert report.governor.approved is False
         assert report.policy_version == RiskPolicy().version
 
-    def test_all_four_candidate_checks_are_present(self) -> None:
+    def test_all_five_candidate_checks_are_present(self) -> None:
         report = run_scan(FakeBroker(), symbol="SPY")
         assert report.risk is not None
         names = {result.check for result in report.risk.results}
@@ -268,7 +291,11 @@ class TestVerdictsReachTheReport:
             CHECK_DEFINED_LOSS,
             CHECK_BROKER_MARGIN,
             CHECK_STRESS_LOSS,
+            CHECK_LIQUIDITY,
         }
+        # And that enumeration is REQUIRED_CHECKS, exactly: a check added to the
+        # required set without reaching the report fails here.
+        assert names == set(REQUIRED_CHECKS)
 
     def test_refusal_codes_are_recorded_on_the_report(self) -> None:
         report = run_scan(FakeBroker(), symbol="SPY")

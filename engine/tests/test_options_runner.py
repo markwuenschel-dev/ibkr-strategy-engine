@@ -141,12 +141,19 @@ def option_quote(
     delta: Decimal | None = None,
     reported: MarketDataType = MarketDataType.LIVE,
     at: dt.datetime = NOW,
+    open_interest: int | None = 5000,
+    volume: int | None = 1000,
 ) -> OptionQuote:
     """One leg quote whose greeks carry the same generation as the quote.
 
     Same generation on purpose: ``require_uniform_live_provenance`` refuses
     greeks from a superseded subscription, so a mismatch here would refuse every
     candidate for a reason no test is about.
+
+    Open interest and volume default comfortably above the liquidity floors
+    (OI 500, volume 100): the liquidity gate treats unmeasured as insufficient,
+    and a ``None`` here would refuse every candidate for a reason no test in
+    this file is about. Tests about thin markets pass their own values.
     """
     generation = uuid4()
     return OptionQuote(
@@ -154,6 +161,8 @@ def option_quote(
         provenance=provenance(generation, reported=reported, at=at),
         bid=mid - HALF_SPREAD,
         ask=mid + HALF_SPREAD,
+        open_interest=open_interest,
+        volume=volume,
         greeks=OptionGreeks(
             received_at=at, subscription_generation=generation, delta=delta
         ),
@@ -356,8 +365,14 @@ class FakeMarketDataPort:
         self.calls: list[tuple[str, tuple[int, ...]]] = []
 
     def strategy_quotes(
-        self, *, underlying_symbol: str, con_ids: Any
+        self,
+        *,
+        underlying_symbol: str,
+        con_ids: Any,
+        require_two_sided: bool = False,
     ) -> StrategyQuoteSnapshot:
+        """``require_two_sided`` is accepted (the runner's management path sends
+        it) and ignored: this fake always quotes both sides anyway."""
         con_ids = tuple(int(c) for c in con_ids)
         self.calls.append((underlying_symbol, con_ids))
         legs = tuple(
@@ -511,6 +526,7 @@ def run_pass(
     policy: RiskPolicy | None = None,
     verifier: Any = None,
     approval_context: Any = None,
+    **extra: Any,
 ) -> RunReport:
     """One pass, with a real reviewed verifier gate unless one is supplied.
 
@@ -543,6 +559,7 @@ def run_pass(
         account="DU1234567",
         verifier=verifier,
         approval_context=approval_context,
+        **extra,
     )
 
 
@@ -1470,3 +1487,251 @@ class TestEntryEvidenceIsComplete:
         is asked to approve under a false label."""
         packet, _report = self._captured_evidence(tmp_path)
         assert packet.evidence["iv_rank_filter"] == "ENFORCED at minimum 50"
+
+
+# ===========================================================================
+# The volatility-regime gate: shadow records, live gates
+# ===========================================================================
+
+
+class TestRegimeGate:
+    """Shadow must be behavior-preserving; live must gate and scale sizing.
+
+    The DEPRESSED cases use a policy whose boundaries sit above any possible
+    IV Rank (rank is capped at 100), so the fake's rich history lands in the
+    bottom tier without inventing a second market fixture.
+    """
+
+    UNREACHABLE = dict(
+        low_minimum_iv_rank=Decimal("101"),
+        medium_minimum_iv_rank=Decimal("102"),
+        high_minimum_iv_rank=Decimal("103"),
+    )
+
+    def test_every_pass_records_a_regime_decision(self, tmp_path: Path) -> None:
+        from engine.options.regime import VolatilityRegime
+
+        report = run_pass(
+            FakeBroker(), gate_for(tmp_path), store_for(tmp_path), armed=False
+        )
+        assert report.regime is not None
+        assert report.regime.regime is VolatilityRegime.HIGH, report.regime.describe()
+        assert report.to_record()["regime"]["reasons"]
+
+    def test_shadow_mode_never_gates_on_the_regime(self, tmp_path: Path) -> None:
+        """DEPRESSED in shadow: the decision says refuse, the pass does not."""
+        from engine.options.regime import VolatilityRegime, VolatilityRegimePolicy
+
+        report = run_pass(
+            FakeBroker(),
+            gate_for(tmp_path),
+            store_for(tmp_path),
+            armed=False,
+            regime_policy=VolatilityRegimePolicy(**self.UNREACHABLE),
+            regime_live=False,
+        )
+        assert report.regime is not None
+        assert report.regime.regime is VolatilityRegime.DEPRESSED
+        assert "OPTIONS_REGIME_DEPRESSED_REFUSED" not in report.refusal_codes
+        assert report.candidate is not None, report.describe()
+
+    def test_live_mode_refuses_depressed_with_the_named_code(
+        self, tmp_path: Path
+    ) -> None:
+        from engine.options.regime import VolatilityRegimePolicy
+
+        report = run_pass(
+            FakeBroker(),
+            gate_for(tmp_path),
+            store_for(tmp_path),
+            armed=False,
+            regime_policy=VolatilityRegimePolicy(**self.UNREACHABLE),
+            regime_live=True,
+        )
+        assert "OPTIONS_REGIME_DEPRESSED_REFUSED" in report.refusal_codes
+        assert report.candidate is None, "a refused tier must not build a candidate"
+
+    def test_live_mode_replaces_the_flat_iv_wall(self, tmp_path: Path) -> None:
+        """HIGH tier in live mode: entry proceeds even with the old filter set
+        impossibly high -- the wall is no longer consulted."""
+        report = run_pass(
+            FakeBroker(),
+            gate_for(tmp_path),
+            store_for(tmp_path),
+            armed=False,
+            regime_live=True,
+            minimum_iv_rank=Decimal("99"),
+        )
+        assert report.regime is not None and report.regime.permits_entry
+        assert not any("entry filter" in b for b in report.blockers), report.blockers
+
+    def test_live_allocation_scales_the_sizing_budget(self, tmp_path: Path) -> None:
+        """A vanishing allocation must reach size_position: the same market
+        that builds a candidate at full allocation sizes to nothing at 1e-4,
+        which proves the multiplier is wired into the build, not just recorded."""
+        from engine.options.regime import VolatilityRegimePolicy
+
+        full = run_pass(
+            FakeBroker(),
+            gate_for(tmp_path / "full"),
+            store_for(tmp_path / "full"),
+            armed=False,
+            regime_live=True,
+        )
+        assert full.candidate is not None, full.describe()
+
+        starved = run_pass(
+            FakeBroker(),
+            gate_for(tmp_path / "starved"),
+            store_for(tmp_path / "starved"),
+            armed=False,
+            regime_policy=VolatilityRegimePolicy(
+                high_allocation=Decimal("0.0001"),
+                medium_allocation=Decimal("0.0001"),
+                low_allocation=Decimal("0.0001"),
+            ),
+            regime_live=True,
+        )
+        assert starved.candidate is None, starved.describe()
+
+
+# ===========================================================================
+# Binding revalidation: the packet binds the market as it is NOW
+# ===========================================================================
+
+
+class RecordingMarketDataPort(FakeMarketDataPort):
+    """The base fake, additionally recording the two-sided demand per call.
+
+    The base class records ``(symbol, con_ids)``; the runner's binding
+    revalidation is *defined* by the third argument -- a fresh quote of the
+    selected legs with a two-sided book demanded -- so these tests need all
+    three. ``require_two_sided`` defaults ``False`` here exactly as it does on
+    the port protocol, because ``_quotes_for`` omits the keyword entirely on
+    the discovery path and a recorder that required it would miss those calls.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.quote_calls: list[tuple[str, tuple[int, ...], bool]] = []
+
+    def strategy_quotes(
+        self,
+        *,
+        underlying_symbol: str,
+        con_ids: Any,
+        require_two_sided: bool = False,
+    ) -> StrategyQuoteSnapshot:
+        self.quote_calls.append(
+            (underlying_symbol, tuple(int(c) for c in con_ids), require_two_sided)
+        )
+        return super().strategy_quotes(
+            underlying_symbol=underlying_symbol,
+            con_ids=con_ids,
+            require_two_sided=require_two_sided,
+        )
+
+
+class TestBindingRevalidation:
+    """The packet Grok reviews is bound to the market as it is *now*.
+
+    Two properties, each pinned by one test. First: the quotes the packet
+    binds are never the discovery snapshot -- the selected legs are re-quoted,
+    two-sided, immediately before the packet is built, however fresh discovery
+    looks. Second: an approval binds the spec digest of the market it was
+    granted against, so a pass whose price has moved does not consume it --
+    it files a new review request and spends nothing.
+    """
+
+    def test_selected_leg_quotes_always_refresh_before_authorization(
+        self, tmp_path: Path
+    ) -> None:
+        """The last quotes call before the packet is the two selected legs with
+        a two-sided book demanded -- in addition to, not instead of, the full
+        chain-window call discovery made earlier."""
+        market = RecordingMarketDataPort()
+        report = run_pass(
+            FakeBroker(),
+            gate_for(tmp_path),
+            store_for(tmp_path),
+            armed=False,
+            market_data=market,
+            # A plain gate with no reviewer seat: the pass files a real request
+            # and stops at AWAITING, which proves the packet was reached without
+            # anything downstream of it mattering here.
+            verifier=reviewer.gate_at(tmp_path / "verifier"),
+        )
+
+        # The pass really got as far as the packet and the verifier.
+        assert report.verification_request, report.describe()
+        assert "OPTIONS_AWAITING_VERIFICATION" in report.refusal_codes
+
+        # Discovery quoted the full strike window first...
+        assert len(market.quote_calls) >= 2, market.quote_calls
+        assert any(
+            len(con_ids) > 2 for _sym, con_ids, _two in market.quote_calls[:-1]
+        ), market.quote_calls
+        # ...and the very last call before the packet re-quoted exactly the two
+        # selected legs, demanding both sides of the book.
+        symbol, con_ids, require_two_sided = market.quote_calls[-1]
+        assert symbol == "SPY"
+        assert sorted(con_ids) == [LONG_CON_ID, SHORT_CON_ID]
+        assert require_two_sided is True
+        assert report.candidate is not None
+        assert con_ids == tuple(leg.con_id for leg in report.candidate.legs)
+
+    def test_a_price_change_after_approval_invalidates_the_packet(
+        self, tmp_path: Path
+    ) -> None:
+        """A reviewed packet is an approval of one market, not of a structure.
+
+        Pass 1 files a request and stops AWAITING. The reviewer approves that
+        exact packet. Pass 2 arrives with every option mid 10% higher, so the
+        candidate's credit -- and with it the authorization-spec digest -- has
+        moved. The gate must not spend the old approval on the new market: the
+        pass files a *new* request, stops AWAITING again, transmits nothing,
+        and the consumed-markers ledger stays empty.
+        """
+        gate = gate_for(tmp_path)
+        store = store_for(tmp_path)
+        # One gate, one collab, one ledger, shared by both passes.
+        verifier = reviewer.gate_at(tmp_path / "verifier")
+
+        first = run_pass(FakeBroker(), gate, store, armed=False, verifier=verifier)
+        assert first.verification_request, first.describe()
+        assert "OPTIONS_AWAITING_VERIFICATION" in first.refusal_codes
+
+        # The reviewer answers APPROVED for the request pass 1 filed.
+        replies = reviewer.ScriptedReviewer(root=verifier.root).work(NOW)
+        assert replies != [], "the reviewer found nothing to answer"
+
+        # The market moves before the next pass: every option mid +10%.
+        ib = FakeIB()
+        second = run_pass(
+            FakeBroker(ib=ib),
+            gate,
+            store,
+            armed=False,
+            market_data=FakeMarketDataPort(price_factor=D("1.1")),
+            verifier=verifier,
+        )
+
+        # The move reached the candidate: a different credit was priced.
+        assert first.candidate is not None and second.candidate is not None
+        assert second.candidate.limit_price != first.candidate.limit_price
+
+        # Nothing transmitted, nothing entered.
+        assert second.entered is False
+        assert second.transmissions == []
+        assert ib.placed == []
+
+        # The old approval was not consumed: the changed market produced a new
+        # spec digest, so the pass filed a new request and is AWAITING again.
+        assert "OPTIONS_AWAITING_VERIFICATION" in second.refusal_codes
+        assert second.verification_request, second.describe()
+        assert second.verification_request != first.verification_request
+
+        # And no approval anywhere was spent: the consumed-markers directory
+        # under the gate's ledger is empty.
+        consumed = verifier.ledger / "consumed"
+        assert not consumed.exists() or list(consumed.iterdir()) == []

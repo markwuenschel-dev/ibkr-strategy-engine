@@ -44,10 +44,8 @@ from engine.options.orderstate import OrderLifecycleState
 from engine.options.policy import RiskPolicy
 from engine.options.portfolio import PortfolioSnapshot
 from engine.options.risk import (
-    CHECK_BROKER_MARGIN,
-    CHECK_DEFINED_LOSS,
     CHECK_MARKET_DATA_ENTITLEMENT,
-    CHECK_STRESS_LOSS,
+    REQUIRED_CHECKS,
     CandidateRiskAssessment,
     CheckResult,
     RiskRefusalReason,
@@ -132,18 +130,16 @@ def gate_for(tmp_path: Path, **overrides: Any) -> SafetyGate:
 
 
 def approving_risk(strategy_id: UUID) -> CandidateRiskAssessment:
+    # Built from REQUIRED_CHECKS rather than a hand-enumerated tuple, so a
+    # check added to the risk module is automatically present here instead of
+    # making every assessment in this file unconstructable.
     return CandidateRiskAssessment(
         strategy_id=strategy_id,
         evaluated_at=NOW,
         policy_version="test",
         results=tuple(
             CheckResult(check=name, approved=True, detail="ok")
-            for name in (
-                CHECK_MARKET_DATA_ENTITLEMENT,
-                CHECK_DEFINED_LOSS,
-                CHECK_BROKER_MARGIN,
-                CHECK_STRESS_LOSS,
-            )
+            for name in REQUIRED_CHECKS
         ),
     )
 
@@ -151,7 +147,8 @@ def approving_risk(strategy_id: UUID) -> CandidateRiskAssessment:
 def refusing_risk(strategy_id: UUID) -> CandidateRiskAssessment:
     results = [
         CheckResult(check=name, approved=True, detail="ok")
-        for name in (CHECK_DEFINED_LOSS, CHECK_BROKER_MARGIN, CHECK_STRESS_LOSS)
+        for name in REQUIRED_CHECKS
+        if name != CHECK_MARKET_DATA_ENTITLEMENT
     ]
     results.insert(
         0,

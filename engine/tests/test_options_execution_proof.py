@@ -36,7 +36,7 @@ import pytest
 
 from engine.errors import ConfigError
 from engine.options import proof as proof_module
-from engine.options.marketdata import MarketDataType
+from engine.options.marketdata import MarketDataType, OptionGreeks, OptionQuote
 from engine.options.policy import ENV_PREFIX, RiskPolicy
 from engine.options.proof import (
     PROOF_AUDIT_TAG,
@@ -75,7 +75,10 @@ from test_options_runner import (  # noqa: E402 - sibling test module, see docst
     FakeMarketDataPort,
     FakePortfolioPort,
     gate_for,
+    leg_delta,
     leg_mid,
+    provenance,
+    quote_snapshot,
     spread_intent,
     store_for,
 )
@@ -164,7 +167,63 @@ class ProofIB(FakeIB):
         return _ProofOrderState()
 
 
-class DriftingMarketDataPort(FakeMarketDataPort):
+#: SPY quotes in pennies. The strategy suite's nickel half-spread is fine for a
+#: five-wide 1.50 credit (crossing cost 0.07 of mid), but the proof's structure
+#: is one point wide with a 0.30 mid credit, where the same nickel puts the
+#: crossing cost at 0.33 of mid -- over the liquidity gate's 0.25 cap. The
+#: proof's liquid baseline is the penny book SPY actually shows.
+PROOF_HALF_SPREAD = D("0.01")
+
+
+class ProofMarketDataPort(FakeMarketDataPort):
+    """The strategy suite's port, quoting the penny-wide book the proof needs.
+
+    Everything except the half-spread is inherited unchanged: mids, deltas,
+    liveness, ``price_factor`` drift and the ``calls`` log all behave exactly
+    as in :class:`FakeMarketDataPort`, so ``EXPECTED_CREDIT`` (a mid-to-mid
+    number) is untouched. Open interest and volume sit comfortably above the
+    liquidity floors (OI 500, volume 100) for the same reason the runner
+    suite's do: unmeasured counts as insufficient.
+    """
+
+    def strategy_quotes(
+        self,
+        *,
+        underlying_symbol: str,
+        con_ids: Any,
+        require_two_sided: bool = False,
+    ) -> Any:
+        con_ids = tuple(int(c) for c in con_ids)
+        self.calls.append((underlying_symbol, con_ids))
+        legs = tuple(self._penny_quote(con_id) for con_id in con_ids)
+        return quote_snapshot(
+            legs,
+            symbol=underlying_symbol,
+            underlying_reported=self.reported,
+            at=self.at,
+        )
+
+    def _penny_quote(self, con_id: int) -> OptionQuote:
+        from uuid import uuid4
+
+        mid = leg_mid(D(con_id)) * self.price_factor
+        generation = uuid4()
+        return OptionQuote(
+            con_id=con_id,
+            provenance=provenance(generation, reported=self.reported, at=self.at),
+            bid=mid - PROOF_HALF_SPREAD,
+            ask=mid + PROOF_HALF_SPREAD,
+            open_interest=1000,
+            volume=500,
+            greeks=OptionGreeks(
+                received_at=self.at,
+                subscription_generation=generation,
+                delta=leg_delta(D(con_id)),
+            ),
+        )
+
+
+class DriftingMarketDataPort(ProofMarketDataPort):
     """Prices normally until ``drift_after`` calls, then scales every mid.
 
     The entry path pulls the chain once; the proof's preflight pulls the two
@@ -178,11 +237,13 @@ class DriftingMarketDataPort(FakeMarketDataPort):
         self.drift_after = drift_after
         self.factor = D(factor)
 
-    def strategy_quotes(self, *, underlying_symbol: str, con_ids: Any) -> Any:
+    def strategy_quotes(
+        self, *, underlying_symbol: str, con_ids: Any, **kwargs: Any
+    ) -> Any:
         if len(self.calls) >= self.drift_after:
             self.price_factor = self.factor
         return super().strategy_quotes(
-            underlying_symbol=underlying_symbol, con_ids=con_ids
+            underlying_symbol=underlying_symbol, con_ids=con_ids, **kwargs
         )
 
 
@@ -226,7 +287,7 @@ def run_proof(
         entry_mode=EntryMode.FULL,
         symbol=profile.symbol,
         bias=Bias.BULLISH,
-        market_data=market_data if market_data is not None else FakeMarketDataPort(),
+        market_data=market_data if market_data is not None else ProofMarketDataPort(),
         portfolio=FakePortfolioPort(),
         now=NOW,
         today=TODAY,
@@ -294,7 +355,7 @@ def _patch_adapters(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         adapters,
         "IBKRLiveMarketDataAdapter",
-        lambda _ib, requested_type=1: FakeMarketDataPort(
+        lambda _ib, requested_type=1: ProofMarketDataPort(
             at=dt.datetime.now(dt.timezone.utc)
         ),
     )
@@ -995,12 +1056,14 @@ class TestTheProofRefusesWhenABoundWouldBeBroken:
         """Fail closed. An unpriceable book is exactly when a limit order is
         most dangerous, not a reason to fall back on the stale price."""
 
-        class Breaking(FakeMarketDataPort):
-            def strategy_quotes(self, *, underlying_symbol: str, con_ids: Any) -> Any:
+        class Breaking(ProofMarketDataPort):
+            def strategy_quotes(
+                self, *, underlying_symbol: str, con_ids: Any, **kwargs: Any
+            ) -> Any:
                 if self.calls:
                     raise RuntimeError("subscription dropped")
                 return super().strategy_quotes(
-                    underlying_symbol=underlying_symbol, con_ids=con_ids
+                    underlying_symbol=underlying_symbol, con_ids=con_ids, **kwargs
                 )
 
         report, preflight, _, broker = run_proof(
@@ -1080,7 +1143,10 @@ class TestTheProofRefusesWhenABoundWouldBeBroken:
             entry_mode=EntryMode.FULL,
             symbol="SPY",
             bias=Bias.BULLISH,
-            market_data=FakeMarketDataPort(),
+            # The penny book: the candidate must clear every real gate so the
+            # refusal this test observes is the exploding preflight's, not a
+            # liquidity refusal that fired before the preflight was reached.
+            market_data=ProofMarketDataPort(),
             portfolio=FakePortfolioPort(),
             now=NOW,
             today=TODAY,

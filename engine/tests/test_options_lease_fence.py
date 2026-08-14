@@ -526,7 +526,9 @@ class TestExitsAreNeverFenced:
         ``is OPEN`` comparison continuing to be written correctly.
         """
         exit_calls = place_combo_calls(function_in(RUNNER_SOURCE, "_manage_one"))
-        entry_calls = place_combo_calls(function_in(RUNNER_SOURCE, "run_once"))
+        entry_calls = place_combo_calls(
+            function_in(RUNNER_SOURCE, "_authorize_and_transmit_entry")
+        )
         assert len(exit_calls) == 1, f"expected one exit send, found {len(exit_calls)}"
         assert len(entry_calls) == 1, f"expected one entry send, found {len(entry_calls)}"
 
@@ -537,8 +539,8 @@ class TestExitsAreNeverFenced:
             "be fenced by a session that has gone away"
         )
         assert "session_lease" in entry_keywords, (
-            "run_once does not pass its session lease to the entry send, so the "
-            "door fence is unreachable from the strategy path"
+            "the shared entry corridor does not pass its session lease to the "
+            "entry send, so the door fence is unreachable from the strategy path"
         )
 
     def test_the_door_fence_is_guarded_on_the_opening_action(self) -> None:

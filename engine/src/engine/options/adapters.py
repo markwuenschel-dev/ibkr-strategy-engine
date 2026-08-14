@@ -104,6 +104,32 @@ NET_LIQUIDATION_TAG = "NetLiquidation"
 INITIAL_MARGIN_TAG = "FullInitMarginReq"
 
 
+def quote_priority(
+    *, require_two_sided: bool, per_call: Any = None, instance_default: Any = None
+) -> Any:
+    """Which pacing priority one ``strategy_quotes`` call draws at.
+
+    An **explicit per-call priority outranks the two-sided heuristic**. The
+    heuristic -- two-sided means a held structure's own legs, so spend at
+    ``EXITS_MANAGEMENT`` -- is only right for the management path. The runner's
+    binding revalidation also demands a two-sided book for a candidate that is
+    *not* held, and letting the heuristic win there would spend the 25%
+    management reserve at priority 1 on work the audit places at
+    ``AUTHORIZATION`` (docs/INTEGRATION-M3-M4.md section 6). The heuristic
+    stays as the default only for callers that state nothing.
+
+    Pure and module-level so the resolution order is pinned by a test rather
+    than living inline where a refactor could silently reorder it.
+    """
+    from .pacing import Priority  # noqa: PLC0415 - keeps import optional
+
+    if per_call is not None:
+        return per_call
+    if require_two_sided:
+        return Priority.EXITS_MANAGEMENT
+    return instance_default or Priority.CANDIDATE_CONSTRUCTION
+
+
 def _utcnow() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
@@ -139,6 +165,26 @@ def _int_or_none(value: Any) -> int | None:
     if abs(value) >= IB_UNSET:
         return None
     return int(value)
+
+
+def _open_interest_for(ticker: Any) -> int | None:
+    """The right side's open interest, chosen by the ticker's own contract.
+
+    ib_async exposes ``callOpenInterest`` and ``putOpenInterest`` as separate
+    fields (tick 101 fills exactly one of them per contract). Reading
+    ``putOpenInterest`` unconditionally -- the pre-2026-08-01 behaviour --
+    reports None for every call. Falling back to the other field when the
+    right cannot be read keeps a mislabeled ticker from erasing a real figure;
+    both absent is honestly None.
+    """
+    right = str(getattr(getattr(ticker, "contract", None), "right", "")).upper()
+    call_oi = _int_or_none(getattr(ticker, "callOpenInterest", None))
+    put_oi = _int_or_none(getattr(ticker, "putOpenInterest", None))
+    if right.startswith("C"):
+        return call_oi if call_oi is not None else put_oi
+    if right.startswith("P"):
+        return put_oi if put_oi is not None else call_oi
+    return put_oi if put_oi is not None else call_oi
 
 
 def _aware(value: Any) -> dt.datetime | None:
@@ -201,9 +247,22 @@ class IBKRVolatilityHistoryAdapter:
     that is not blocked on the entitlement.
     """
 
-    def __init__(self, ib: Any, contract_data: IBKRContractDataAdapter) -> None:
+    def __init__(
+        self,
+        ib: Any,
+        contract_data: IBKRContractDataAdapter,
+        *,
+        budget: Any = None,
+        budget_priority: Any = None,
+    ) -> None:
         self.ib = ib
         self.contract_data = contract_data
+        # The connection-scoped request budget, when the caller runs inside
+        # one. Historical pulls are the hard-limited request class; a scanner
+        # constructs this adapter with DISCOVERY priority so ninety pulls
+        # queue behind anything the held book needs.
+        self.budget = budget
+        self.budget_priority = budget_priority
 
     def implied_volatility_history(
         self, symbol: str, *, duration: str = "1 Y"
@@ -211,9 +270,23 @@ class IBKRVolatilityHistoryAdapter:
         from ib_async import Stock  # noqa: PLC0415 - optional dependency
 
         key = symbol.strip().upper()
+        if self.budget is not None:
+            from .pacing import Priority, RequestKind  # noqa: PLC0415
+
+            self.budget.acquire(
+                RequestKind.GENERAL,
+                priority=self.budget_priority or Priority.DISCOVERY,
+            )
         qualified = self.ib.qualifyContracts(Stock(key, "SMART", "USD"))
         if not qualified:
             return []
+        if self.budget is not None:
+            from .pacing import Priority, RequestKind  # noqa: PLC0415
+
+            self.budget.acquire(
+                RequestKind.HISTORICAL,
+                priority=self.budget_priority or Priority.DISCOVERY,
+            )
         bars = self.ib.reqHistoricalData(
             qualified[0],
             endDateTime="",
@@ -268,8 +341,17 @@ class IBKRLiveMarketDataAdapter:
         underlying_lead_seconds: float = 2.0,
         poll_seconds: float = 0.25,
         clock: Any = time.monotonic,
+        budget: Any = None,
+        budget_priority: Any = None,
     ) -> None:
         self.ib = ib
+        # Connection-scoped pacing, when the caller runs inside a budget.
+        # A ``require_two_sided`` call is by definition about a held
+        # structure's own legs, so it draws at EXITS_MANAGEMENT priority
+        # regardless of the constructor default -- managing what exists
+        # outranks whatever this adapter instance was built for.
+        self.budget = budget
+        self.budget_priority = budget_priority
         # A seam, so the deadline can be exercised without a test spending the
         # real seconds. ``ib.sleep`` is the only thing that yields to the event
         # loop; this only measures.
@@ -288,6 +370,7 @@ class IBKRLiveMarketDataAdapter:
         underlying_symbol: str,
         con_ids: Sequence[int],
         require_two_sided: bool = False,
+        budget_priority: Any = None,
     ) -> StrategyQuoteSnapshot:
         from ib_async import Contract, Stock  # noqa: PLC0415 - optional dependency
 
@@ -295,6 +378,24 @@ class IBKRLiveMarketDataAdapter:
 
         symbol = underlying_symbol.strip().upper()
         subscribed_at = _utcnow()
+
+        if self.budget is not None:
+            from .pacing import RequestKind  # noqa: PLC0415
+
+            # Explicit per-call priority outranks the two-sided heuristic:
+            # binding revalidation demands two-sided for a candidate that is
+            # NOT held and must draw at AUTHORIZATION, not spend the
+            # management reserve. See quote_priority.
+            priority = quote_priority(
+                require_two_sided=require_two_sided,
+                per_call=budget_priority,
+                instance_default=self.budget_priority,
+            )
+            # One token per subscription line this call will open, acquired up
+            # front: the underlying plus every leg. Acquiring before the first
+            # request keeps a paced scan from half-subscribing a structure.
+            for _ in range(1 + len(con_ids)):
+                self.budget.acquire(RequestKind.GENERAL, priority=priority)
 
         underlying_contract = self.ib.qualifyContracts(Stock(symbol, "SMART", "USD"))
         if not underlying_contract:
@@ -335,7 +436,14 @@ class IBKRLiveMarketDataAdapter:
             self.ib.sleep(min(self.underlying_lead_seconds, self.settle_seconds))
             option_ids = [c for c in contracts if c != underlying_con_id]
             for con_id in option_ids:
-                tickers[con_id] = self.ib.reqMktData(contracts[con_id], "", False, False)
+                # Generic ticks 100 (option volume) and 101 (open interest):
+                # neither arrives on the default tick set, so an empty list here
+                # is why open interest was None on every live run before
+                # 2026-08-01. The underlying keeps the default set -- OI is an
+                # option concept.
+                tickers[con_id] = self.ib.reqMktData(
+                    contracts[con_id], "100,101", False, False
+                )
 
             # Wait for the greeks themselves rather than for a fixed number of
             # seconds. A flat sleep is a bet that every model computation lands
@@ -345,12 +453,14 @@ class IBKRLiveMarketDataAdapter:
             # recorder (rather than ``waitOnUpdate``, which drops ticks) lets a
             # good run finish early and a slow one keep waiting.
             #
-            # ``require_two_sided`` is only for an exact selected structure.
-            # A chain scan must not wait for every deep wing to acquire both
-            # sides, because one illiquid contract would consume the entire
-            # scan deadline. At the deadline this deliberately returns the
-            # observed one-sided book; truthfulness belongs to the snapshot's
-            # downstream gates, not to this bounded wait.
+            # ``require_two_sided`` additionally holds out for a bid AND an ask
+            # on every leg. Callers quoting a *selected structure* (marking a
+            # held position, pricing an exit) pass True, because a one-sided
+            # snapshot is precisely the coin-flip that made in-pass marking
+            # fail 7 of 10 passes on 2026-07-31. Callers sweeping a chain
+            # window must NOT: deep wings without bids would pin the wait at
+            # its ceiling on every pass. At the deadline a one-sided snapshot
+            # is still returned for downstream truthfulness gates.
             deadline = self.clock() + self.settle_seconds
             while self.clock() < deadline:
                 self.ib.sleep(self.poll_seconds)
@@ -421,7 +531,7 @@ class IBKRLiveMarketDataAdapter:
                     ask=_price(getattr(ticker, "ask", None)),
                     last=_price(getattr(ticker, "last", None)),
                     close=_price(getattr(ticker, "close", None)),
-                    open_interest=_int_or_none(getattr(ticker, "putOpenInterest", None)),
+                    open_interest=_open_interest_for(ticker),
                     volume=_int_or_none(getattr(ticker, "volume", None)),
                     greeks=subscription.current_greeks(),
                 )
