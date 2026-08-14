@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 from pathlib import Path
 
 import pytest
@@ -99,6 +100,12 @@ def test_discovery_backlog_is_not_timer_slot_replay(tmp_path: Path) -> None:
 def test_lifecycle_events_pair_a_started_tick_with_a_terminal_receipt(tmp_path: Path) -> None:
     paths = paths_for(tmp_path)
     write_lock(paths)
+    paths.pid.write_text(
+        json.dumps(
+            {"pid": 4242, "session_id": identity().session_id, "nonce": identity().nonce}
+        ),
+        encoding="utf-8",
+    )
     clock = FakeClock(start=ANCHOR)
     loop = SchedulerLoop(
         identity=identity(),

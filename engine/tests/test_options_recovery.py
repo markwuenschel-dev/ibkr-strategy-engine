@@ -920,6 +920,11 @@ def run_pass(
         account="DU1234567",
         verifier=verifier,
         approval_context=approval_context,
+        # These tests intentionally exercise broker outcome recovery, not
+        # paper-day authority. Supply the explicit production lease seam so
+        # the FULL runner reaches the scripted broker instead of being
+        # correctly stopped at FAIL-LEASE-MISSING.
+        session_lease=lambda: None,
     )
 
 
@@ -1290,8 +1295,11 @@ class TestTimeoutWithNoAcknowledgement:
 
         assert second.placed == [], report.describe()
         assert report.entered is False
-        assert "RUNNER_UNRESOLVED_ORDER" in report.refusal_codes
-        assert any("unresolved" in blocker for blocker in report.blockers)
+        assert "FAIL-BROKER-AMBIGUOUS" in report.refusal_codes
+        assert any(
+            term in " ".join(report.blockers).lower()
+            for term in ("ambiguous", "unknown", "outbox")
+        )
         # Management still evaluated the uncertain position rather than skipping
         # the whole pass.
         assert len(report.decisions) == 1
@@ -2213,7 +2221,7 @@ class TestTheStoreDoesNotLagTheBroker:
         )
 
         assert healthy.placed == [], report.describe()
-        assert "RUNNER_UNRESOLVED_ORDER" in report.refusal_codes
+        assert "FAIL-BROKER-AMBIGUOUS" in report.refusal_codes
 
 
 # ===========================================================================
@@ -2477,6 +2485,7 @@ class TestAWorkingEntryIsNotLeftResting:
             verifier=reviewer.approving_gate(tmp_path / "verifier"),
             approval_context=reviewer.approval_context(),
             reprice=None,
+            session_lease=lambda: None,
         )
 
         assert report.reprice is None

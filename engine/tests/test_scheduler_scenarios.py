@@ -81,6 +81,14 @@ def loop_for(
         sleep=clock.sleep,
         monotonic=clock.monotonic,
     )
+    # Lifecycle-enabled scheduler checks require a durable nonce witness, not
+    # merely a session id in the paper-day lock. The fake PID record models
+    # the child that owns this loop; tests that exercise stale/missing locks
+    # still replace or remove it explicitly.
+    paths.pid.write_text(
+        json.dumps({"pid": 4242, "session_id": session_id, "nonce": NONCE}),
+        encoding="utf-8",
+    )
     return loop, clock, engine
 
 
@@ -91,6 +99,25 @@ def loop_for(
 
 class TestTheLoopRunsPassesOnItsCadence:
     """A driver that does not actually drive is the gap this closes (G5)."""
+
+    def test_options_cycle_receives_the_scheduler_command_timeout(
+        self, tmp_path: Path
+    ) -> None:
+        seen: dict[str, object] = {}
+
+        class TimeoutEngine(FakeEngine):
+            def run(self, args, **kwargs):
+                seen.update(kwargs)
+                return super().run(args, **kwargs)
+
+        loop, _clock, _engine = loop_for(tmp_path, engine=TimeoutEngine())
+        loop.command = ("options-cycle", "--policy")
+        loop.command_timeout = 17.0
+
+        receipt = loop.tick(0)
+
+        assert receipt.outcome is TickOutcome.RAN
+        assert seen["timeout"] == 17.0
 
     def test_each_tick_runs_one_pass_and_sleeps_the_cadence(self, tmp_path: Path) -> None:
         loop, clock, engine = loop_for(tmp_path)
@@ -117,6 +144,88 @@ class TestTheLoopRunsPassesOnItsCadence:
 
         ids = [r.tick_id for r in loop.receipts]
         assert len(ids) == len(set(ids)), ids
+
+    def test_nonzero_worker_exit_is_an_aborted_terminal_tick(
+        self, tmp_path: Path
+    ) -> None:
+        loop, _clock, _engine = loop_for(
+            tmp_path,
+            engine=FakeEngine(code=17),
+        )
+        loop.lifecycle_receipts = True
+
+        receipt = loop.tick(0)
+
+        assert receipt.outcome is TickOutcome.STOPPED_TICK_ABORTED
+        assert receipt.exit_code == 17
+        assert receipt.failure_code == "FAIL-WORKER-NONZERO-EXIT"
+        events = scheduler_module.read_tick_events(loop.paths, day=NOW.date())
+        assert events[-1]["event"] == "TICK_ABORTED"
+        assert events[-1]["failure_code"] == "FAIL-WORKER-NONZERO-EXIT"
+
+    def test_options_cycle_honors_the_policy_command_timeout(
+        self, tmp_path: Path
+    ) -> None:
+        loop, _clock, engine = loop_for(tmp_path)
+        loop.command = ("options-cycle", "--state-dir", "state")
+        loop.command_timeout = 17.5
+
+        loop.tick(0)
+
+        assert engine.timeouts == [17.5]
+
+    def test_same_session_with_a_different_scheduler_nonce_loses_the_lease(
+        self, tmp_path: Path
+    ) -> None:
+        loop, _clock, engine = loop_for(tmp_path)
+        loop.lifecycle_receipts = True
+        loop.paths.claim.write_text(
+            json.dumps(
+                {"v": 1, "session_id": loop.identity.session_id, "nonce": "old-nonce"}
+            ),
+            encoding="utf-8",
+        )
+
+        receipt = loop.tick(0)
+
+        assert receipt.outcome is TickOutcome.STOPPED_LEASE_LOST
+        assert engine.calls == []
+
+    def test_prior_session_unmatched_tick_blocks_startup_replay(
+        self, tmp_path: Path
+    ) -> None:
+        loop, _clock, engine = loop_for(tmp_path)
+        loop.lifecycle_receipts = True
+        scheduler_module.append_tick_event(
+            loop.paths,
+            scheduler_module.TickEvent.TICK_STARTED,
+            scheduler_module.TickContext(
+                session_id="paperday-yesterday",
+                lease_nonce="old-nonce",
+                tick_id="old-tick",
+                attempt_id="old-attempt",
+                scheduled_for=NOW,
+            ),
+            at=NOW,
+        )
+
+        loop.run(max_ticks=2)
+
+        assert engine.calls == []
+        assert loop.receipts[-1].outcome is TickOutcome.STOPPED_RECOVERY_REQUIRED
+
+    def test_aborted_worker_cannot_publish_a_clean_terminal_marker(
+        self, tmp_path: Path
+    ) -> None:
+        loop, _clock, _engine = loop_for(tmp_path, engine=FakeEngine(code=17))
+        loop.lifecycle_receipts = True
+
+        loop.run(max_ticks=1)
+
+        terminal = scheduler_module.read_terminal_receipt(loop.paths)
+        assert terminal is not None
+        assert terminal["outcome"] == "STOPPED_TICK_ABORTED"
+        assert terminal["clean_exit"] is False
 
 
 class TestReceiptPublication:
@@ -327,7 +436,9 @@ class TestQuiesce:
         self, tmp_path: Path
     ) -> None:
         loop, _clock, engine = loop_for(tmp_path)
-        request_quiesce(loop.paths, reason="paper-day stop", now=NOW)
+        request_quiesce(
+            loop.paths, reason="paper-day stop", now=NOW, identity=loop.identity
+        )
 
         loop.run(max_ticks=5)
 
@@ -342,7 +453,7 @@ class TestQuiesce:
 
         def run_then_request(args, **kwargs):
             result = original(args, **kwargs)
-            request_quiesce(loop.paths, reason="stop", now=NOW)
+            request_quiesce(loop.paths, reason="stop", now=NOW, identity=loop.identity)
             return result
 
         loop.engine.run = run_then_request  # type: ignore[method-assign]
@@ -848,6 +959,7 @@ class TestDrainAndStop:
         assert processes.alive(pid)
         assert processes.cmdline(pid) == "chrome.exe"
         assert quiesce_requested(paths), "the flag must be down even when we cannot watch"
+        assert paths.pid.exists(), "foreign PID evidence must be retained for reconciliation"
 
     def test_a_pid_reused_during_the_drain_is_not_terminated(self, tmp_path: Path) -> None:
         """The identity check happens up to drain_timeout before the kill. In

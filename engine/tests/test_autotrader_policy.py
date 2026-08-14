@@ -142,7 +142,23 @@ class TestAutotraderPolicy:
         with pytest.raises(ConfigError, match="requires --arm"):
             parse_autotrader_policy(record)
 
-    @pytest.mark.parametrize("token", ["--mode", "--mandate", "--enable-entry", "--policy-hash"])
+    @pytest.mark.parametrize(
+        "token",
+        [
+            "--mode",
+            "--mandate",
+            "--enable-entry",
+            "--policy-hash",
+            "--schedule-config",
+            "--schedule-config-sha256",
+            "--state-dir",
+            "--schedule-config=/tmp/other.json",
+            "--schedule-config-sha256=deadbeef",
+            "--state-dir=/tmp/other-state",
+            "--scheduler-session",
+            "--scheduler-session=foreign-session:foreign-nonce",
+        ],
+    )
     def test_policy_cannot_be_overridden_by_worker_cli(self, tmp_path: Path, token: str) -> None:
         record = policy_record(tmp_path)
         record["worker_command"] = ["options-cycle", token, "ARMED"]
@@ -206,9 +222,13 @@ class TestAutotraderPolicy:
         )
 
         assert loop.cadence_seconds == 300
-        assert loop.command == ("options-cycle", "--arm")
+        assert loop.command[:2] == ("options-cycle", "--arm")
         assert loop.lifecycle_receipts
         assert loop.policy_hash == digest
         assert loop.catalog_hash == "a" * 64
         assert spec.cadence_seconds == 300
-        assert spec.command == ("options-cycle", "--arm")
+        assert spec.command[:2] == ("options-cycle", "--arm")
+        assert "--schedule-config" in loop.command
+        assert str(path.resolve()) in loop.command
+        assert digest in loop.command
+        assert str(state_dir.resolve()) in loop.command

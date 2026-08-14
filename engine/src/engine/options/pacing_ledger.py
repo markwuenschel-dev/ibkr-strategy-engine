@@ -77,12 +77,13 @@ class PacingSnapshot:
     outstanding: int
     available: int
     management_reserve: int
+    discovery_reserve: int
     penalty_factor: float
     paused_until: dt.datetime | None
 
     @property
     def discovery_available(self) -> int:
-        return max(0, self.available - self.management_reserve)
+        return max(0, self.available - self.discovery_reserve)
 
 
 class PacingLedger:
@@ -97,11 +98,23 @@ class PacingLedger:
         general_per_window: int = 40,
         general_window_seconds: float = 60.0,
         management_reserve_fraction: float = 0.25,
+        discovery_fraction: float = 1.0,
+        minimum_management_requests: int = 0,
         reservation_ttl: dt.timedelta = dt.timedelta(minutes=5),
         clock: Callable[[], dt.datetime] | None = None,
     ) -> None:
         if not 0.0 < management_reserve_fraction < 1.0:
             raise ValueError("management_reserve_fraction must be in (0, 1)")
+        if not 0.0 < discovery_fraction <= 1.0:
+            raise ValueError("discovery_fraction must be in (0, 1]")
+        if (
+            isinstance(minimum_management_requests, bool)
+            or not isinstance(minimum_management_requests, int)
+            or minimum_management_requests < 0
+        ):
+            raise ValueError(
+                "minimum_management_requests must be a non-negative integer"
+            )
         if reservation_ttl.total_seconds() <= 0:
             raise ValueError("reservation_ttl must be positive")
         self.path = Path(path)
@@ -109,6 +122,8 @@ class PacingLedger:
             self.path = self.path / "pacing.sqlite3"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.reserve_fraction = management_reserve_fraction
+        self.discovery_fraction = discovery_fraction
+        self.minimum_management_requests = minimum_management_requests
         self.reservation_ttl = reservation_ttl
         self.clock = clock or (lambda: dt.datetime.now(dt.timezone.utc))
         self._limits = {
@@ -273,7 +288,13 @@ class PacingLedger:
     def _reserve_floor(self, kind: RequestKind, limit: int, priority: Priority) -> int:
         if priority <= Priority.WORKING_ORDERS:
             return 0
-        return min(int(limit * self.reserve_fraction), max(0, limit - 1))
+        floor = max(
+            limit * self.reserve_fraction,
+            float(self.minimum_management_requests),
+        )
+        if priority is Priority.DISCOVERY:
+            floor = max(floor, limit * (1.0 - self.discovery_fraction))
+        return min(int(floor), max(0, limit - 1))
 
     def reserve(
         self,
@@ -551,7 +572,8 @@ class PacingLedger:
                 connection, kind, now=current
             )
             limit = int(row["limit_count"])
-            reserve = int(limit * self.reserve_fraction)
+            reserve = self._reserve_floor(kind, limit, Priority.CANDIDATE_CONSTRUCTION)
+            discovery_reserve = self._reserve_floor(kind, limit, Priority.DISCOVERY)
             paused_until = _parse(str(row["paused_until"])) if row["paused_until"] else None
             return PacingSnapshot(
                 kind=kind,
@@ -561,6 +583,7 @@ class PacingLedger:
                 outstanding=outstanding,
                 available=max(0, limit - consumed - outstanding),
                 management_reserve=reserve,
+                discovery_reserve=discovery_reserve,
                 penalty_factor=float(row["penalty_factor"]),
                 paused_until=paused_until,
             )

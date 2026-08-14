@@ -14,6 +14,7 @@ from engine.options.scanbook_store import (
     ClaimCorrupt,
     ClaimLedger,
     ClaimState,
+    ImmutableScanBookClaimWriter,
     ImmutableSnapshotError,
     ObservationAges,
     PhaseCoverage,
@@ -324,3 +325,84 @@ class TestClaimLedger:
             at=NOW + dt.timedelta(minutes=1),
         )
         assert [record.symbol for record in claims.active()] == ["QQQ"]
+
+
+class TestImmutableClaimWriter:
+    def test_candidate_claim_is_idempotent_and_does_not_rewrite_snapshot(
+        self, tmp_path: Path
+    ) -> None:
+        snapshots = ScanBookSnapshotStore(tmp_path)
+        claims = ClaimLedger(tmp_path)
+        original = snapshot(scan_id="scan-1")
+        snapshots.publish(original)
+        writer = ImmutableScanBookClaimWriter(
+            snapshots,
+            claims,
+            session_date=TODAY,
+            owner_id="paperday-1",
+        )
+
+        assert writer.mark_claimed("SPY", entry_id="entry-1", at=NOW)
+        assert writer.mark_claimed("SPY", entry_id="entry-1", at=NOW)
+        assert not writer.mark_claimed("SPY", entry_id="entry-2", at=NOW)
+        assert snapshots.read_snapshot("scan-1", TODAY) == original
+        assert claims.read("SPY").claim_id == "entry-1"  # type: ignore[union-attr]
+
+    def test_non_candidate_latest_snapshot_cannot_claim_an_old_candidate(
+        self, tmp_path: Path
+    ) -> None:
+        snapshots = ScanBookSnapshotStore(tmp_path)
+        claims = ClaimLedger(tmp_path)
+        snapshots.publish(snapshot(scan_id="scan-1"))
+        writer = ImmutableScanBookClaimWriter(
+            snapshots,
+            claims,
+            session_date=TODAY,
+            owner_id="paperday-1",
+        )
+        assert writer.mark_claimed("SPY", entry_id="entry-1", at=NOW)
+
+        replacement = snapshot(
+            scan_id="scan-2",
+            generated_at=NOW + dt.timedelta(minutes=1),
+            rows=(
+                {"symbol": "SPY", "state": "INELIGIBLE", "facts": {}},
+                {"symbol": "QQQ", "state": "INELIGIBLE", "facts": {}},
+            ),
+        )
+        snapshots.publish(replacement)
+        assert not writer.mark_claimed("QQQ", entry_id="entry-2", at=NOW)
+        assert claims.read("SPY").scan_id == "scan-1"  # type: ignore[union-attr]
+
+    def test_admitted_scan_id_rejects_publication_interleaving_before_claim(
+        self, tmp_path: Path
+    ) -> None:
+        snapshots = ScanBookSnapshotStore(tmp_path)
+        claims = ClaimLedger(tmp_path)
+        first = snapshot(scan_id="scan-1")
+        snapshots.publish(first)
+
+        admitted = snapshots.read_latest(TODAY)
+        assert admitted is not None
+        writer = ImmutableScanBookClaimWriter(
+            snapshots,
+            claims,
+            session_date=TODAY,
+            owner_id="paperday-1",
+        ).for_snapshot(admitted.scan_id)
+
+        # Model the interleaving between admission and the logical-entry CAS:
+        # the replaceable latest pointer advances before the claim is attempted.
+        snapshots.publish(
+            snapshot(
+                scan_id="scan-2",
+                generated_at=NOW + dt.timedelta(minutes=1),
+                rows=(
+                    {"symbol": "SPY", "state": "CANDIDATE", "facts": {"ivr": 72}},
+                    {"symbol": "QQQ", "state": "INELIGIBLE", "facts": {}},
+                ),
+            )
+        )
+
+        assert not writer.mark_claimed("SPY", entry_id="entry-1", at=NOW)
+        assert claims.read("SPY") is None

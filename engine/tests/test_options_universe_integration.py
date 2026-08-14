@@ -123,6 +123,8 @@ def _run(
     tick_id: str | None = None,
     attempt_id: str | None = None,
     now: dt.datetime = NOW,
+    refresh_enabled: bool = True,
+    allow_stale_cache: bool = False,
 ):
     state = root / "state"
     return run_catalog_universe_pass(
@@ -145,6 +147,8 @@ def _run(
         now=now,
         tick_id=tick_id,
         attempt_id=attempt_id,
+        refresh_enabled=refresh_enabled,
+        allow_stale_cache=allow_stale_cache,
     )
 
 
@@ -231,6 +235,30 @@ def test_fair_refresh_ring_rotates_never_seen_symbols_and_records_outcomes(tmp_p
     assert second.complete
 
 
+def test_probe_pass_is_cache_first_and_does_not_consume_refresh_budget(
+    tmp_path: Path,
+) -> None:
+    catalog = _catalog("AAA", "BBB")
+    cache = SQLiteObservationCache(tmp_path / "observations.sqlite3")
+    _seed_cache(cache, catalog, ("AAA", "BBB"), high=False)
+    history = RecordingHistory({symbol: _series(high=False) for symbol in ("AAA", "BBB")})
+
+    result = _run(
+        tmp_path,
+        catalog,
+        cache=cache,
+        history=history,
+        config=UniverseScanConfig(refresh_limit=1, phase2_limit=1),
+        refresh_enabled=False,
+        tick_id="probe-tick",
+        attempt_id="probe-attempt",
+    )
+
+    assert result.complete
+    assert result.refresh_symbols == ()
+    assert history.calls == []
+
+
 class CheapContractData:
     def expirations(self, symbol: str) -> list[str]:
         return [(NOW.date() + dt.timedelta(days=45)).strftime("%Y%m%d")]
@@ -250,7 +278,7 @@ def test_deep_shortlist_reserves_cost_and_preserves_management_floor(tmp_path: P
     _seed_cache(cache, catalog, ("AAA", "BBB"), high=True)
     ledger = PacingLedger(
         tmp_path / "pacing.sqlite3",
-        general_per_window=5,
+        general_per_window=7,
         management_reserve_fraction=0.20,
     )
 
@@ -360,3 +388,33 @@ def test_catalog_snapshot_never_promotes_unclassified_candidate(tmp_path: Path, 
     assert result.book.rows[0].state is ScanState.INELIGIBLE_REGIME
     assert result.book.rows[0].reason == "UNIVERSE_CATALOG_ENTRY_INELIGIBLE"
     assert result.snapshot.rows[0]["automated_entry_allowed"] is False
+
+
+def test_catalog_manifest_counts_missing_rows_as_incomplete_coverage(
+    tmp_path: Path, monkeypatch
+) -> None:
+    catalog = _catalog("AAA", "BBB")
+    cache = SQLiteObservationCache(tmp_path / "observations.sqlite3")
+    _seed_cache(cache, catalog, ("AAA", "BBB"), high=False)
+    row = ScanBookRow(
+        symbol="AAA",
+        state=ScanState.INELIGIBLE_REGIME,
+        reason="TEST_MISSING_CATALOG_ROW",
+        evaluated_at=NOW,
+    )
+
+    def fake_pass(**_kwargs):
+        return ScanBook(
+            session_date=NOW.date(),
+            generated_at=NOW,
+            rows=(row,),
+            coverage=CoverageSummary.from_rows((row,)),
+        )
+
+    monkeypatch.setattr(universe_module, "run_universe_pass", fake_pass)
+    result = _run(tmp_path, catalog, cache=cache)
+
+    assert result.snapshot.expected_symbols == 2
+    assert result.snapshot.evaluated_symbols == 1
+    assert result.snapshot.deferred_symbols == 1
+    assert not result.complete

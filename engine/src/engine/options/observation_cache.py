@@ -515,6 +515,51 @@ class FairRefreshQueue:
                 ),
             )
 
+    def phase_two_order(
+        self,
+        *,
+        symbols: Iterable[str],
+        catalog_version: str,
+        configuration_version: str,
+    ) -> tuple[str, ...]:
+        """Return a starvation-safe order for the deep ring.
+
+        Deep work is deliberately ordered by the oldest (or never-recorded)
+        ``last_phase_two_at`` before rank.  Rank remains a deterministic tie
+        breaker, but it cannot repeatedly occupy every deep slot while an
+        otherwise eligible symbol waits forever.  The caller records the
+        attempt with :meth:`mark_phase_two` after the probe, including a
+        pacing deferral, so the ring advances durably across restarts.
+        """
+
+        normalized = tuple(dict.fromkeys(_normal_symbol(symbol) for symbol in symbols))
+        if not normalized:
+            return ()
+        placeholders = ", ".join("?" for _ in normalized)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM refresh_queue
+                 WHERE catalog_version = ?
+                   AND configuration_version = ?
+                   AND symbol IN ({placeholders})
+                """,
+                (catalog_version, configuration_version, *normalized),
+            ).fetchall()
+        states = [self._row_to_state(row) for row in rows]
+        by_symbol = {state.symbol: state for state in states}
+        missing = [symbol for symbol in normalized if symbol not in by_symbol]
+        states.sort(
+            key=lambda state: (
+                state.last_phase_two_at is not None,
+                state.last_phase_two_at
+                or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
+                -(state.previous_rank if state.previous_rank is not None else float("-inf")),
+                state.symbol,
+            )
+        )
+        return tuple(state.symbol for state in states) + tuple(missing)
+
     def defer(
         self,
         symbol: str,

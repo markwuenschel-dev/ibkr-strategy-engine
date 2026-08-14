@@ -141,6 +141,14 @@ class EngineCommandRunner:
             "import sys; from engine.cli import main; sys.exit(main(sys.argv[1:]))",
             *args,
         ]
+        # ``options-cycle`` is the one persistent broker-owning worker. The
+        # scheduler command timeout still travels through the supervisor API
+        # (so policy wiring remains observable), but applying it to
+        # ``subprocess.run`` would kill the worker after five minutes and
+        # silently collapse the one-connection topology into a partial day.
+        # Its durable tick receipts and paper-day quiesce are the lifecycle
+        # boundary; finite timeouts remain in force for every one-shot command.
+        persistent_worker = bool(args and args[0] == "options-cycle")
         run_kwargs: dict[str, object] = {
             "capture_output": True,
             "text": True,
@@ -148,7 +156,7 @@ class EngineCommandRunner:
             "cwd": str(_engine_dir()),
             "check": False,
         }
-        if timeout is not None:
+        if timeout is not None and not persistent_worker:
             run_kwargs["timeout"] = timeout
         completed = subprocess.run(  # noqa: S603
             command,

@@ -9,6 +9,7 @@ import pytest
 
 from engine.paperday import (
     BLOCKED,
+    GATE_CONFIGURATION_FINGERPRINT,
     GATE_CLOSED,
     GATE_OPEN,
     GATE_RECOVERY_REQUIRED,
@@ -79,6 +80,7 @@ def _strict_gate(paths: PaperDayPaths, *, session_date=None) -> None:
         policy_sha256=HASH,
         catalog_sha256=HASH,
         config_sha256=HASH,
+        configuration_fingerprint=HASH,
         authority_required=True,
         controller_pid=123,
         scheduler_identity={"session_id": session_id, "nonce": nonce, "pid": pid},
@@ -91,6 +93,20 @@ class TestPaperDayAuthority:
     def test_relative_state_dir_is_rejected(self) -> None:
         with pytest.raises(ValueError, match="absolute"):
             PaperDayPaths(state_dir=Path("relative-state"))
+
+    def test_full_controller_requires_configuration_fingerprint(self, tmp_path: Path) -> None:
+        h = harness(tmp_path)
+        h.controller.mandate = MANDATE_FULL
+        h.controller.policy_sha256 = HASH
+        h.controller.catalog_sha256 = HASH
+        h.controller.config_sha256 = HASH
+
+        report = h.controller.start()
+
+        assert report.state == BLOCKED, report.render()
+        authority = next(step for step in report.checks if step.name == "authority inputs")
+        assert not authority.ok
+        assert "configuration_fingerprint" in authority.detail
 
     def test_full_authority_rejects_a_stale_session_date(self, tmp_path: Path) -> None:
         h = harness(tmp_path)
@@ -109,6 +125,28 @@ class TestPaperDayAuthority:
         assert refusal is not None
         assert "FAIL-STALE-PAPERDAY-AUTHORITY" in refusal
         assert "session date" in refusal
+
+    def test_full_authority_rejects_a_missing_configuration_fingerprint(
+        self, tmp_path: Path
+    ) -> None:
+        h = harness(tmp_path)
+        _strict_gate(h.paths)
+        gate = read_gate(h.paths)
+        assert gate is not None
+        gate.pop(GATE_CONFIGURATION_FINGERPRINT, None)
+        h.paths.gate.write_text(json.dumps(gate), encoding="utf-8")
+        h.processes.add(
+            "python scheduler_main.py "
+            "--scheduler-session=paperday-authority:nonce-authority",
+            pid=9123,
+        )
+
+        refusal = entry_gate_preflight(h.paths, processes=h.processes)(
+            armed=True, now=NOW
+        )
+
+        assert refusal is not None
+        assert "FAIL-CONFIGURATION-FINGERPRINT" in refusal
 
     def test_full_authority_rejects_dead_scheduler_without_a_current_heartbeat(
         self, tmp_path: Path
@@ -161,3 +199,29 @@ class TestPaperDayAuthority:
         assert "policy SHA-256" in rows
         assert "catalog SHA-256" in rows
         assert "config SHA-256" in rows
+
+    def test_status_surfaces_a_worker_failure_code_from_the_latest_tick(
+        self, tmp_path: Path
+    ) -> None:
+        h = harness(tmp_path)
+        tick_path = SchedulerPaths(root=h.paths.root).receipts_for(NOW.date())
+        tick_path.parent.mkdir(parents=True, exist_ok=True)
+        tick_path.write_text(
+            json.dumps(
+                {
+                    "outcome": "STOPPED_TICK_ABORTED",
+                    "tick_id": "failed-tick",
+                    "at": NOW.isoformat(),
+                    "exit_code": 17,
+                    "failure_code": "FAIL-WORKER-NONZERO-EXIT",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        rows = dict(h.controller.status().rows)
+
+        assert "STOPPED_TICK_ABORTED" in rows["latest tick"]
+        assert "exit=17" in rows["latest tick"]
+        assert "FAIL-WORKER-NONZERO-EXIT" in rows["latest tick"]

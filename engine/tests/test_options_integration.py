@@ -37,6 +37,7 @@ import datetime as dt
 import json
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -68,6 +69,8 @@ from engine.options.universe import (
     ScanState,
     StructureNomination,
 )
+from engine.cycle_adapter import _identity
+from engine.errors import ConfigError
 from integration_support import ScriptedMarketDataPort
 from test_options_runner import FakeBroker, FakeIB, FakePortfolioPort, gate_for, store_for
 
@@ -81,6 +84,31 @@ TODAY = NOW.date()
 SECONDS_BETWEEN_PASSES = 60
 
 EXPIRY = TODAY + dt.timedelta(days=45)
+
+
+def test_cycle_identity_cannot_be_overridden_with_a_foreign_live_lease(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    paperday = state_dir / "paperday"
+    paperday.mkdir(parents=True)
+    (paperday / "session.lock").write_text(
+        json.dumps({"session_id": "session-current", "fencing_token": "fence-current"}),
+        encoding="utf-8",
+    )
+    (paperday / "scheduler.pid").write_text(
+        json.dumps({"session_id": "session-current", "nonce": "nonce-current"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="FAIL-STALE-PAPERDAY-AUTHORITY"):
+        _identity(
+            state_dir,
+            SimpleNamespace(scheduler_session="session-current:nonce-foreign"),
+        )
+
+    assert _identity(state_dir, SimpleNamespace(scheduler_session=None)) == (
+        "session-current",
+        "nonce-current",
+    )
 
 
 def put_vertical_nomination(symbol: str) -> StructureNomination:
@@ -843,6 +871,60 @@ class TestScanbookAdmission:
         assert "SCANBOOK_MISSING" in report.refusal_codes
         assert len(rig.handoffs()) == 1, "a missing book filed a fresh-id review"
         assert report.candidate is not None  # the serviced entry's rebuild
+
+
+class TestProductionVerifierBoundary:
+    def test_missing_verifier_blocks_before_legacy_candidate_or_claim_work(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rig = Rig(tmp_path, write_book=False)
+        candidate_calls: list[str] = []
+        claim_calls: list[str] = []
+
+        def fail_if_legacy_candidate_is_built(**_: Any) -> Any:
+            candidate_calls.append("legacy")
+            raise AssertionError("production entry reached legacy candidate construction")
+
+        class ClaimProbe:
+            def mark_claimed(self, symbol: str, **_: Any) -> bool:
+                claim_calls.append(symbol)
+                raise AssertionError("production entry attempted a ScanBook claim")
+
+        monkeypatch.setattr(
+            "engine.options.runner._build_candidate", fail_if_legacy_candidate_is_built
+        )
+
+        report = run_once(
+            rig.broker,
+            gate=rig.gate,
+            journal=rig.gate.journal,
+            store=rig.store,
+            policy=rig.policy,
+            armed=True,
+            symbol="SPY",
+            bias=Bias.BULLISH,
+            market_data=rig.market,
+            portfolio=rig.portfolio,
+            now=NOW,
+            today=TODAY,
+            account="DU1234567",
+            entry_mode=EntryMode.FULL,
+            verifier=None,
+            approval_context=None,
+            manager=None,
+            scanbook_writer=ClaimProbe(),
+            session_id="paperday-production",
+            session_lease=lambda: None,
+        )
+
+        assert "OPTIONS_VERIFIER_NOT_CONFIGURED" in report.refusal_codes
+        assert report.entry_refusal_code == "OPTIONS_VERIFIER_NOT_CONFIGURED"
+        assert report.candidate is None
+        assert report.transmissions == []
+        assert rig.broker.ib.placed == []
+        assert candidate_calls == []
+        assert claim_calls == []
+        assert rig.lstore.entries() == {}
 
 
 # ===========================================================================

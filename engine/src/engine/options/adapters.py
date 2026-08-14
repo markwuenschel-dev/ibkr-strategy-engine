@@ -63,7 +63,12 @@ from .ports import UNDERLYING_GENERATION_KEY, StrategyQuoteSnapshot
 OPEN_ORDER_READERS = ("openTrades", "openOrders", "trades")
 
 
-def read_open_orders(ib: Any) -> tuple[Any, ...] | None:
+def read_open_orders(
+    ib: Any,
+    *,
+    budget: Any = None,
+    budget_priority: Any = None,
+) -> tuple[Any, ...] | None:
     """What the broker is working, or ``None`` if it could not be asked.
 
     ``None`` and ``()`` are different answers and
@@ -75,11 +80,22 @@ def read_open_orders(ib: Any) -> tuple[Any, ...] | None:
 
     Raises whatever the client raises. A caller that cannot tolerate that is
     telling itself the query succeeded, which is the same mistake one layer up.
+
+    ``budget`` is optional for manual commands and legacy callers. The
+    persistent worker supplies the connection-scoped shared budget so fallback
+    readers cannot quietly spend unreserved working-order capacity.
     """
     for name in OPEN_ORDER_READERS:
         reader = getattr(ib, name, None)
         if not callable(reader):
             continue
+        if budget is not None:
+            from .pacing import Priority, RequestKind  # noqa: PLC0415
+
+            budget.acquire(
+                RequestKind.GENERAL,
+                priority=budget_priority or Priority.WORKING_ORDERS,
+            )
         answer = reader()
         if answer is None:
             continue
@@ -205,9 +221,26 @@ def _aware(value: Any) -> dt.datetime | None:
 class IBKRContractDataAdapter:
     """:class:`~engine.options.ports.ContractDataPort` over ``ib_async``."""
 
-    def __init__(self, ib: Any) -> None:
+    def __init__(self, ib: Any, *, budget: Any = None, budget_priority: Any = None) -> None:
         self.ib = ib
+        # Contract discovery is broker traffic too.  The original adapter was
+        # a pacing hole because qualification and option-chain requests went
+        # straight to ib_async while market/history adapters used the shared
+        # connection budget.  Keep the dependency structural and optional so
+        # manual/test adapters retain their old behaviour.
+        self.budget = budget
+        self.budget_priority = budget_priority
         self._con_ids: dict[str, int] = {}
+
+    def _acquire(self) -> None:
+        if self.budget is None:
+            return
+        from .pacing import Priority, RequestKind  # noqa: PLC0415
+
+        self.budget.acquire(
+            RequestKind.GENERAL,
+            priority=self.budget_priority or Priority.DISCOVERY,
+        )
 
     def underlying_con_id(self, symbol: str) -> int:
         """Qualify the underlying once and remember its contract id."""
@@ -215,6 +248,7 @@ class IBKRContractDataAdapter:
         if key not in self._con_ids:
             from ib_async import Stock  # noqa: PLC0415 - optional dependency
 
+            self._acquire()
             qualified = self.ib.qualifyContracts(Stock(key, "SMART", "USD"))
             if not qualified:
                 raise LookupError(f"IBKR did not qualify the underlying {key}")
@@ -222,11 +256,13 @@ class IBKRContractDataAdapter:
         return self._con_ids[key]
 
     def expirations(self, symbol: str) -> Sequence[str]:
+        self._acquire()
         return discover_expirations(
             self.ib, symbol.strip().upper(), self.underlying_con_id(symbol)
         )
 
     def strikes(self, symbol: str, expiry: str, right: str) -> Sequence[Decimal]:
+        self._acquire()
         return enumerate_strikes(self.ib, symbol.strip().upper(), expiry, right)
 
     def qualify(
@@ -236,6 +272,7 @@ class IBKRContractDataAdapter:
         strikes: Sequence[Decimal],
         right: str,
     ) -> Sequence[QualifiedOption]:
+        self._acquire()
         return qualify_strikes(self.ib, symbol.strip().upper(), expiry, strikes, right)
 
 
@@ -307,12 +344,27 @@ class IBKRWhatIfAdapter:
     assessment in tests without any of them importing ``ib_async``.
     """
 
-    def __init__(self, ib: Any) -> None:
+    def __init__(
+        self, ib: Any, *, budget: Any = None, budget_priority: Any = None
+    ) -> None:
         self.ib = ib
+        self.budget = budget
+        self.budget_priority = budget_priority
+
+    def _acquire(self) -> None:
+        if self.budget is None:
+            return
+        from .pacing import Priority, RequestKind  # noqa: PLC0415
+
+        self.budget.acquire(
+            RequestKind.GENERAL,
+            priority=self.budget_priority or Priority.AUTHORIZATION,
+        )
 
     def what_if(
         self, intent: OptionStrategyIntent, *, observed_at: dt.datetime
     ) -> MarginAssessment:
+        self._acquire()
         return what_if(self.ib, intent, observed_at=observed_at)
 
 
@@ -396,6 +448,11 @@ class IBKRLiveMarketDataAdapter:
             # request keeps a paced scan from half-subscribing a structure.
             for _ in range(1 + len(con_ids)):
                 self.budget.acquire(RequestKind.GENERAL, priority=priority)
+            # Qualification is broker traffic too, and it happens before the
+            # subscription calls below. Reserve both qualification calls so a
+            # large candidate probe cannot consume untracked general-message
+            # capacity before the advertised subscription budget is used.
+            self.budget.acquire(RequestKind.GENERAL, priority=priority)
 
         underlying_contract = self.ib.qualifyContracts(Stock(symbol, "SMART", "USD"))
         if not underlying_contract:
@@ -403,6 +460,8 @@ class IBKRLiveMarketDataAdapter:
         underlying_contract = underlying_contract[0]
         underlying_con_id = int(getattr(underlying_contract, "conId", 0))
 
+        if self.budget is not None:
+            self.budget.acquire(RequestKind.GENERAL, priority=priority)
         leg_contracts = self.ib.qualifyContracts(
             *[Contract(conId=int(con_id), exchange="SMART") for con_id in con_ids]
         )
@@ -563,12 +622,23 @@ class IBKRExecutionReportAdapter:
     Reads only. Both calls are queries.
     """
 
-    def __init__(self, ib: Any) -> None:
+    def __init__(
+        self, ib: Any, *, budget: Any = None, budget_priority: Any = None
+    ) -> None:
         self.ib = ib
+        self.budget = budget
+        self.budget_priority = budget_priority
 
     def executions(self) -> Sequence[Any]:
         request = getattr(self.ib, "reqExecutions", None)
         if callable(request):
+            if self.budget is not None:
+                from .pacing import Priority, RequestKind  # noqa: PLC0415
+
+                self.budget.acquire(
+                    RequestKind.GENERAL,
+                    priority=self.budget_priority or Priority.WORKING_ORDERS,
+                )
             try:
                 request()
             except Exception:  # noqa: BLE001 - a refill failure is not a result
@@ -606,8 +676,12 @@ class IBKRPortfolioStateAdapter:
     it closes when open structures are persisted.
     """
 
-    def __init__(self, broker: Any) -> None:
+    def __init__(
+        self, broker: Any, *, budget: Any = None, budget_priority: Any = None
+    ) -> None:
         self.broker = broker
+        self.budget = budget
+        self.budget_priority = budget_priority
 
     def _summary_value(self, rows: Sequence[tuple[str, str, str]], tag: str) -> Decimal | None:
         for row_tag, value, _currency in rows:
@@ -625,6 +699,13 @@ class IBKRPortfolioStateAdapter:
         as_of: dt.datetime,
         exposures: Sequence[PositionExposure] = (),
     ) -> PortfolioSnapshot:
+        if self.budget is not None:
+            from .pacing import Priority, RequestKind  # noqa: PLC0415
+
+            self.budget.acquire(
+                RequestKind.GENERAL,
+                priority=self.budget_priority or Priority.AUTHORIZATION,
+            )
         rows = self.broker.account_summary()
         net_liquidation = self._summary_value(rows, NET_LIQUIDATION_TAG)
         if net_liquidation is None:

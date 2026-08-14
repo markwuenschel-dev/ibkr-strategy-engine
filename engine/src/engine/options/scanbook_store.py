@@ -51,6 +51,7 @@ __all__ = [
     "ClaimConflict",
     "ClaimCorrupt",
     "ClaimLedger",
+    "ImmutableScanBookClaimWriter",
     "ClaimRecord",
     "ClaimState",
     "CoverageAdmission",
@@ -391,6 +392,8 @@ class ScanBookSnapshot:
     shard_state: Mapping[str, Any]
     tick_id: str | None = None
     attempt_id: str | None = None
+    catalog_version: str | None = None
+    behavior_hash: str | None = None
     version: str = SNAPSHOT_SCHEMA
 
     def __post_init__(self) -> None:
@@ -400,6 +403,16 @@ class ScanBookSnapshot:
             object.__setattr__(self, "tick_id", _identifier(self.tick_id, name="tick_id"))
         if self.attempt_id is not None:
             object.__setattr__(self, "attempt_id", _identifier(self.attempt_id, name="attempt_id"))
+        if self.catalog_version is not None:
+            if not isinstance(self.catalog_version, str) or not self.catalog_version.strip():
+                raise ValueError("catalog_version must be non-empty when supplied")
+            object.__setattr__(self, "catalog_version", self.catalog_version.strip())
+        if self.behavior_hash is not None:
+            object.__setattr__(
+                self,
+                "behavior_hash",
+                _digest(self.behavior_hash, name="behavior_hash"),
+            )
         if self.version != SNAPSHOT_SCHEMA:
             raise ValueError(f"unsupported snapshot version {self.version!r}")
         if not isinstance(self.session_date, dt.date) or isinstance(
@@ -488,6 +501,8 @@ class ScanBookSnapshot:
         policy_hash: str,
         calendar_hash: str,
         config_hash: str,
+        catalog_version: str | None = None,
+        behavior_hash: str | None = None,
     ) -> SnapshotAdmissionResult:
         """Evaluate the complete entry-admission contract.
 
@@ -518,7 +533,21 @@ class ScanBookSnapshot:
             name: getattr(self, name)
             for name in ("catalog_hash", "policy_hash", "calendar_hash", "config_hash")
         }
-        if actual != expected:
+        manifest_mismatch = actual != expected
+        # New production snapshots bind both the catalog *version* and the
+        # behavior manifest.  A legacy snapshot that omits either field must
+        # not be accepted merely because the active caller supplied it: that
+        # would let an old book survive a policy/catalog change.
+        if catalog_version is not None:
+            manifest_mismatch = manifest_mismatch or (
+                self.catalog_version is None or catalog_version != self.catalog_version
+            )
+        if behavior_hash is not None:
+            manifest_mismatch = manifest_mismatch or (
+                self.behavior_hash is None
+                or _digest(behavior_hash, name="behavior_hash") != self.behavior_hash
+            )
+        if manifest_mismatch:
             return SnapshotAdmissionResult(
                 SnapshotAdmission.MANIFEST_MISMATCH,
                 self,
@@ -554,6 +583,8 @@ class ScanBookSnapshot:
             "generated_at": self.generated_at.isoformat(),
             "tick_id": self.tick_id,
             "attempt_id": self.attempt_id,
+            "catalog_version": self.catalog_version,
+            "behavior_hash": self.behavior_hash,
             "catalog_hash": self.catalog_hash,
             "policy_hash": self.policy_hash,
             "calendar_hash": self.calendar_hash,
@@ -583,6 +614,16 @@ class ScanBookSnapshot:
                 generated_at=dt.datetime.fromisoformat(str(record["generated_at"])),
                 tick_id=(str(record["tick_id"]) if record.get("tick_id") else None),
                 attempt_id=(str(record["attempt_id"]) if record.get("attempt_id") else None),
+                catalog_version=(
+                    str(record["catalog_version"])
+                    if record.get("catalog_version") is not None
+                    else None
+                ),
+                behavior_hash=(
+                    str(record["behavior_hash"])
+                    if record.get("behavior_hash") is not None
+                    else None
+                ),
                 catalog_hash=str(record["catalog_hash"]),
                 policy_hash=str(record["policy_hash"]),
                 calendar_hash=str(record["calendar_hash"]),
@@ -710,6 +751,8 @@ class ScanBookSnapshotStore:
         policy_hash: str,
         calendar_hash: str,
         config_hash: str,
+        catalog_version: str | None = None,
+        behavior_hash: str | None = None,
     ) -> SnapshotAdmissionResult:
         try:
             snapshot = self.read_latest(session_date)
@@ -729,6 +772,8 @@ class ScanBookSnapshotStore:
             policy_hash=policy_hash,
             calendar_hash=calendar_hash,
             config_hash=config_hash,
+            catalog_version=catalog_version,
+            behavior_hash=behavior_hash,
         )
 
     def list_snapshots(self, session_date: dt.date) -> tuple[ScanBookSnapshot, ...]:
@@ -743,6 +788,131 @@ class ScanBookSnapshotStore:
                 raise SnapshotCorrupt("snapshot session does not match its directory")
             snapshots.append(snapshot)
         return tuple(snapshots)
+
+
+class ImmutableScanBookClaimWriter:
+    """Claim the current immutable snapshot through the separate CAS ledger.
+
+    The legacy logical-entry writer rewrites a mutable whole-book file.  That
+    is incompatible with immutable scan publication: a later discovery must
+    be able to advance the latest pointer without erasing an earlier claim.
+    This adapter re-reads the latest snapshot, verifies that the row is still
+    a candidate, and records ownership only in :class:`ClaimLedger`.
+    """
+
+    def __init__(
+        self,
+        snapshot_store: ScanBookSnapshotStore,
+        claims: "ClaimLedger",
+        *,
+        session_date: dt.date,
+        owner_id: str,
+        expected_scan_id: str | None = None,
+    ) -> None:
+        self.snapshot_store = snapshot_store
+        self.claims = claims
+        self.session_date = session_date
+        self.owner_id = owner_id
+        self.expected_scan_id = (
+            _identifier(expected_scan_id, name="expected scan_id")
+            if expected_scan_id is not None
+            else None
+        )
+
+    def for_snapshot(self, scan_id: str) -> "ImmutableScanBookClaimWriter":
+        """Return a writer bound to one admitted immutable snapshot.
+
+        The latest pointer is intentionally replaceable.  Admission therefore
+        cannot be represented by rereading that pointer during claim creation:
+        a newer publication between admission and the CAS would otherwise let
+        an entry nominated from one snapshot be recorded against another.
+        """
+
+        return ImmutableScanBookClaimWriter(
+            self.snapshot_store,
+            self.claims,
+            session_date=self.session_date,
+            owner_id=self.owner_id,
+            expected_scan_id=scan_id,
+        )
+
+    def _candidate_snapshot(
+        self, symbol: str
+    ) -> tuple[ScanBookSnapshot, Mapping[str, Any]] | None:
+        snapshot = self.snapshot_store.read_latest(self.session_date)
+        if snapshot is None:
+            return None
+        if (
+            self.expected_scan_id is not None
+            and snapshot.scan_id != self.expected_scan_id
+        ):
+            return None
+        wanted = str(symbol).strip().upper()
+        row = next(
+            (row for row in snapshot.rows if str(row.get("symbol", "")).upper() == wanted),
+            None,
+        )
+        if row is None or str(row.get("state", "")) != "CANDIDATE":
+            return None
+        # Return the exact immutable snapshot that supplied the row.  The
+        # caller must not read ``latest`` again: a concurrent publication
+        # between two reads would otherwise validate one scan and record a
+        # claim against another.
+        return snapshot, row
+
+    def mark_claimed(self, symbol: str, *, entry_id: Any, at: dt.datetime) -> bool:
+        selected = self._candidate_snapshot(symbol)
+        if selected is None:
+            return False
+        snapshot, _row = selected
+        wanted = str(symbol).strip().upper()
+        current = self.claims.read(wanted)
+        if current is not None and current.state is ClaimState.CLAIMED:
+            # The same logical entry may retry after a crash; a different
+            # logical entry must lose rather than inherit that identity.
+            return current.claim_id == str(entry_id)
+        try:
+            record = self.claims.claim(
+                snapshot.scan_id,
+                wanted,
+                self.owner_id,
+                at=at,
+                expected_version=current.version if current is not None else 0,
+                claim_id=str(entry_id),
+                metadata={
+                    "catalog_hash": snapshot.catalog_hash,
+                    "policy_hash": snapshot.policy_hash,
+                    "calendar_hash": snapshot.calendar_hash,
+                    "config_hash": snapshot.config_hash,
+                },
+            )
+        except ClaimConflict:
+            return False
+        return record.claim_id == str(entry_id)
+
+    def mark_superseded(self, symbol: str, *, reason: str, at: dt.datetime) -> bool:
+        wanted = str(symbol).strip().upper()
+        current = self.claims.read(wanted)
+        if current is None or current.state is not ClaimState.CLAIMED:
+            return False
+        if (
+            self.expected_scan_id is not None
+            and current.scan_id != self.expected_scan_id
+        ):
+            return False
+        try:
+            self.claims.supersede(
+                wanted,
+                owner_id=self.owner_id,
+                at=at,
+                expected_version=current.version,
+                scan_id=current.scan_id,
+                symbol=wanted,
+                metadata={"reason": str(reason)},
+            )
+        except ClaimConflict:
+            return False
+        return True
 
 
 class ClaimState(str, Enum):

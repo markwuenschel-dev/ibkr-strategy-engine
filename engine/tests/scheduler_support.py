@@ -149,12 +149,14 @@ class FakeEngine:
         on_run: Callable[[], None] | None = None,
     ) -> None:
         self.calls: list[list[str]] = []
+        self.timeouts: list[float | None] = []
         self.code = code
         self.stdout = stdout
         self.on_run = on_run
 
     def run(self, args: list[str], **_: Any) -> EngineCommandResult:
         self.calls.append(list(args))
+        self.timeouts.append(_.get("timeout"))
         if self.on_run is not None:
             self.on_run()
         return EngineCommandResult(self.code, self.stdout)

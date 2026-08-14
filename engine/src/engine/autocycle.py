@@ -306,28 +306,78 @@ class ReceiptStore:
         self.events_root.mkdir(parents=True, exist_ok=True)
         try:
             previous = json.loads(self.sequence_path.read_text(encoding="utf-8"))
-            sequence = int(previous["sequence"])
-        except (FileNotFoundError, OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            if not isinstance(previous, dict) or previous.get("schema") != RECEIPT_SCHEMA:
+                raise ValueError("unknown receipt sequence schema")
+            raw_sequence = previous.get("sequence")
+            if (
+                isinstance(raw_sequence, bool)
+                or not isinstance(raw_sequence, int)
+                or raw_sequence <= 0
+            ):
+                raise ValueError("malformed receipt sequence")
+            sequence = raw_sequence
+        except FileNotFoundError:
             sequence = 0
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise CycleError(
+                f"FAIL-RECOVERY-BLOCKED: cycle receipt sequence is corrupt: "
+                f"{self.sequence_path}"
+            ) from exc
+        if sequence < 0:
+            raise CycleError(
+                "FAIL-RECOVERY-BLOCKED: cycle receipt sequence is negative"
+            )
         sequence += 1
         _atomic_json(self.sequence_path, {"schema": RECEIPT_SCHEMA, "sequence": sequence})
         return sequence
 
     def records(self) -> tuple[dict[str, Any], ...]:
         records: list[dict[str, Any]] = []
+        seen_sequences: set[int] = set()
         for path in sorted(self.events_root.glob("[0-9]*-*.json")):
             try:
                 value = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            if isinstance(value, dict):
-                records.append(value)
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise CycleError(
+                    f"FAIL-RECOVERY-BLOCKED: cycle receipt is unreadable: {path}"
+                ) from exc
+            if not isinstance(value, dict):
+                raise CycleError(
+                    f"FAIL-RECOVERY-BLOCKED: cycle receipt is not an object: {path}"
+                )
+            if value.get("schema") != RECEIPT_SCHEMA:
+                raise CycleError(
+                    f"FAIL-RECOVERY-BLOCKED: cycle receipt schema is unknown: {path}"
+                )
+            if (
+                isinstance(value.get("sequence"), bool)
+                or not isinstance(value.get("sequence"), int)
+                or value["sequence"] <= 0
+                or not isinstance(value.get("event"), str)
+                or not value["event"].strip()
+            ):
+                raise CycleError(
+                    f"FAIL-RECOVERY-BLOCKED: cycle receipt identity is malformed: {path}"
+                )
+            try:
+                filename_sequence = int(path.name.split("-", 1)[0])
+            except (ValueError, IndexError) as exc:
+                raise CycleError(
+                    f"FAIL-RECOVERY-BLOCKED: cycle receipt filename is malformed: {path}"
+                ) from exc
+            if filename_sequence != value["sequence"] or value["sequence"] in seen_sequences:
+                raise CycleError(
+                    f"FAIL-RECOVERY-BLOCKED: cycle receipt sequence collision: {path}"
+                )
+            seen_sequences.add(value["sequence"])
+            records.append(value)
         return tuple(records)
 
     def unmatched_ticks(self, *, session_id: str | None = None) -> tuple[dict[str, Any], ...]:
         starts: dict[str, dict[str, Any]] = {}
         terminal: set[str] = set()
         reconciled: set[str] = set()
+        unresolved: set[str] = set()
         for record in self.records():
             if session_id is not None and record.get("session_id") != session_id:
                 continue
@@ -337,6 +387,12 @@ class ReceiptStore:
             event = record.get("event")
             if event == ReceiptKind.TICK_STARTED.value:
                 starts[tick_id] = record
+            elif event == ReceiptKind.TICK_UNRESOLVED.value:
+                # UNRESOLVED is a durable terminal *observation* but not a
+                # clearance.  A later normal finish must not make a crash
+                # look clean; only TICK_RECONCILED closes this fence.
+                terminal.add(tick_id)
+                unresolved.add(tick_id)
             elif event in {
                 ReceiptKind.TICK_FINISHED.value,
                 ReceiptKind.TICK_ABORTED.value,
@@ -348,57 +404,351 @@ class ReceiptStore:
         return tuple(
             record
             for tick_id, record in starts.items()
-            if tick_id not in terminal or (tick_id in terminal and tick_id not in reconciled and record.get("outcome") == "UNRESOLVED")
+            if tick_id not in reconciled
+            and (tick_id not in terminal or tick_id in unresolved)
         )
 
 
 class FixedRateSchedule:
-    """Durable fixed-rate slots; late wakeups coalesce to one current slot."""
+    """Durable fixed-rate slots; late wakeups coalesce to one current slot.
 
-    def __init__(self, root: Path, *, anchor: dt.datetime, cadences: Mapping[JobKind, int]):
+    ``pending`` is a crash witness for the small interval between selecting a
+    slot and publishing ``TICK_STARTED``.  Without it, a process dying in that
+    interval would silently consume the slot with no receipt to reconcile.
+    Production callers also bind the state to the session/fencing/policy
+    identity, so a reused state directory cannot silently change cadence.
+    """
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        anchor: dt.datetime,
+        cadences: Mapping[JobKind, int],
+        session_id: str | None = None,
+        lease_nonce: str | None = None,
+        policy_hash: str | None = None,
+        catalog_hash: str | None = None,
+    ):
         self.root = Path(root)
         self.path = self.root / "schedule.json"
         self.anchor = _utc(anchor)
         self.cadences = dict(cadences)
-        if not self.cadences or any(isinstance(v, bool) or v <= 0 for v in self.cadences.values()):
+        if set(self.cadences) != set(JobKind):
+            raise CycleError(
+                "fixed-rate schedule must declare exactly one positive cadence per job"
+            )
+        if any(
+            isinstance(v, bool) or not isinstance(v, int) or v <= 0
+            for v in self.cadences.values()
+        ):
             raise CycleError("fixed-rate schedule cadences must be positive")
+        self.identity = {
+            "session_id": session_id,
+            "lease_nonce": lease_nonce,
+            "policy_hash": policy_hash,
+            "catalog_hash": catalog_hash,
+        }
+        supplied_identity = tuple(value is not None for value in self.identity.values())
+        if any(supplied_identity) and not all(supplied_identity):
+            raise CycleError(
+                "fixed-rate schedule identity must include session, lease, policy, and catalog"
+            )
+        if any(
+            value is not None and (not isinstance(value, str) or not value.strip())
+            for value in self.identity.values()
+        ):
+            raise CycleError("fixed-rate schedule identity values must be non-empty strings")
         self._lock = threading.Lock()
 
     def due(self, now: dt.datetime) -> tuple[DueSlot, ...]:
         moment = _utc(now)
         with self._lock:
             state = self._read()
+            if state.get("pending"):
+                # Recovery owns the pending selection; never select a second
+                # slot while the first has no acknowledged TICK_STARTED.
+                return ()
+            slots = dict(state["slots"])
             due: list[DueSlot] = []
             for job in JobKind:
                 cadence = self.cadences[job]
                 if moment < self.anchor:
                     continue
                 index = int((moment - self.anchor).total_seconds() // cadence)
-                previous = state.get(job.value)
+                previous = slots.get(job.value)
                 if previous is not None and index <= int(previous):
                     continue
                 missed = 0 if previous is None else max(0, index - int(previous) - 1)
                 scheduled = self.anchor + dt.timedelta(seconds=index * cadence)
                 due.append(DueSlot(job, index, scheduled, missed))
-                state[job.value] = index
+                slots[job.value] = index
             if due:
-                _atomic_json(
-                    self.path,
+                self._write(
                     {
-                        "schema": SCHEDULE_SCHEMA,
-                        "anchor": self.anchor.isoformat(),
-                        "slots": state,
-                    },
+                        "slots": slots,
+                        "pending": [self._pending_record(slot) for slot in due],
+                    }
                 )
             return tuple(due)
 
-    def _read(self) -> dict[str, int]:
+    def pending_slots(self) -> tuple[DueSlot, ...]:
+        """Return the selected-but-unacknowledged slots for recovery only."""
+
+        with self._lock:
+            pending = self._read()["pending"]
+            return tuple(
+                DueSlot(
+                    JobKind(item["job"]),
+                    item["slot_index"],
+                    _utc(dt.datetime.fromisoformat(item["scheduled_at"])),
+                    item["missed_count"],
+                )
+                for item in pending
+            )
+
+    def bind_identity(
+        self,
+        *,
+        session_id: str,
+        lease_nonce: str,
+        policy_hash: str,
+        catalog_hash: str,
+    ) -> None:
+        """Bind a legacy-constructed schedule before its first production read.
+
+        The current cycle adapter may construct this value before it has the
+        worker context.  A brand-new state file can be bound at that point;
+        an existing file must already carry the exact requested identity.  An
+        old unbound file is not upgraded in place because doing so would turn
+        stale schedule history into current authority.
+        """
+
+        expected = {
+            "session_id": session_id,
+            "lease_nonce": lease_nonce,
+            "policy_hash": policy_hash,
+            "catalog_hash": catalog_hash,
+        }
+        if any(not isinstance(value, str) or not value.strip() for value in expected.values()):
+            raise CycleError("fixed-rate schedule identity values must be non-empty strings")
+        with self._lock:
+            if self.identity == expected:
+                return
+            if any(value is not None for value in self.identity.values()):
+                raise CycleError(
+                    "FAIL-STALE-PAPERDAY-AUTHORITY: schedule identity is already bound"
+                )
+            if self.path.exists():
+                try:
+                    loaded = json.loads(self.path.read_text(encoding="utf-8"))
+                except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                    raise CycleError(
+                        "FAIL-RECOVERY-BLOCKED: fixed-rate schedule is unreadable"
+                    ) from exc
+                if not isinstance(loaded, dict) or loaded.get("identity") != expected:
+                    raise CycleError(
+                        "FAIL-STALE-PAPERDAY-AUTHORITY: refusing to adopt an unbound or foreign schedule"
+                    )
+            self.identity = expected
+            if self.path.exists():
+                # Validate the complete persisted state under the newly bound
+                # identity before allowing the worker to proceed.
+                self._read()
+
+    def _read(self) -> dict[str, Any]:
         try:
             loaded = json.loads(self.path.read_text(encoding="utf-8"))
-            values = loaded.get("slots", {})
-            return {str(key): int(value) for key, value in values.items()}
-        except (FileNotFoundError, OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
-            return {}
+        except FileNotFoundError:
+            return {"slots": {}, "pending": []}
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            raise CycleError(
+                f"FAIL-RECOVERY-BLOCKED: fixed-rate schedule is unreadable: {self.path}"
+            ) from exc
+        if not isinstance(loaded, dict):
+            raise CycleError("FAIL-RECOVERY-BLOCKED: fixed-rate schedule state is malformed")
+        if set(loaded) != {
+            "schema",
+            "anchor",
+            "identity",
+            "cadences",
+            "slots",
+            "pending",
+        }:
+            raise CycleError("FAIL-RECOVERY-BLOCKED: fixed-rate schedule state shape is unknown")
+        if loaded.get("schema") != SCHEDULE_SCHEMA:
+            raise CycleError(
+                "FAIL-CADENCE-DRIFT: fixed-rate schedule schema is unknown"
+            )
+        if loaded.get("anchor") != self.anchor.isoformat():
+            raise CycleError(
+                "FAIL-CADENCE-DRIFT: fixed-rate schedule anchor changed"
+            )
+        expected_cadences = {
+            job.value: cadence for job, cadence in self.cadences.items()
+        }
+        if loaded.get("cadences") != expected_cadences:
+            raise CycleError(
+                "FAIL-CADENCE-DRIFT: fixed-rate schedule cadence changed"
+            )
+        recorded_identity = loaded.get("identity")
+        if recorded_identity != self.identity:
+            raise CycleError(
+                "FAIL-STALE-PAPERDAY-AUTHORITY: fixed-rate schedule identity changed"
+            )
+        values = loaded.get("slots")
+        pending = loaded.get("pending", [])
+        if not isinstance(values, dict) or not isinstance(pending, list):
+            raise CycleError("FAIL-RECOVERY-BLOCKED: fixed-rate schedule state is malformed")
+        unknown_slots = set(values) - set(expected_cadences)
+        if unknown_slots:
+            raise CycleError("FAIL-CADENCE-DRIFT: schedule contains an unknown job")
+        slots: dict[str, int] = {}
+        for key, value in values.items():
+            if (
+                not isinstance(key, str)
+                or isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+            ):
+                raise CycleError("FAIL-RECOVERY-BLOCKED: schedule slot counter is malformed")
+            slots[key] = value
+        checked_pending: list[dict[str, Any]] = []
+        for item in pending:
+            if not isinstance(item, dict) or set(item) != {
+                "job",
+                "slot_index",
+                "scheduled_at",
+                "missed_count",
+            }:
+                raise CycleError("FAIL-RECOVERY-BLOCKED: schedule pending state is malformed")
+            if item["job"] not in expected_cadences:
+                raise CycleError("FAIL-CADENCE-DRIFT: schedule pending job is unknown")
+            for key in ("slot_index", "missed_count"):
+                if (
+                    isinstance(item[key], bool)
+                    or not isinstance(item[key], int)
+                    or item[key] < 0
+                ):
+                    raise CycleError("FAIL-RECOVERY-BLOCKED: schedule pending counter is malformed")
+            try:
+                scheduled_at = _utc(dt.datetime.fromisoformat(item["scheduled_at"]))
+            except (TypeError, ValueError) as exc:
+                raise CycleError(
+                    "FAIL-RECOVERY-BLOCKED: schedule pending timestamp is malformed"
+                ) from exc
+            checked_pending.append(
+                {
+                    "job": item["job"],
+                    "slot_index": item["slot_index"],
+                    "scheduled_at": scheduled_at.isoformat(),
+                    "missed_count": item["missed_count"],
+                }
+            )
+        for item in checked_pending:
+            if slots.get(item["job"]) != item["slot_index"]:
+                raise CycleError(
+                    "FAIL-RECOVERY-BLOCKED: pending slot does not match its durable counter"
+                )
+        return {"slots": slots, "pending": checked_pending}
+
+    @staticmethod
+    def _pending_record(slot: DueSlot) -> dict[str, Any]:
+        return {
+            "job": slot.job.value,
+            "slot_index": slot.slot_index,
+            "scheduled_at": _utc(slot.scheduled_at).isoformat(),
+            "missed_count": slot.missed_count,
+        }
+
+    def acknowledge(self, slots: Iterable[DueSlot]) -> None:
+        """Acknowledge a selection immediately after ``TICK_STARTED``."""
+
+        selected = tuple(slots)
+        with self._lock:
+            state = self._read()
+            pending = state.get("pending", [])
+            expected = tuple(
+                sorted(
+                    (
+                        item["job"],
+                        item["slot_index"],
+                        item["scheduled_at"],
+                        item["missed_count"],
+                    )
+                    for item in pending
+                )
+            )
+            actual = tuple(
+                sorted(
+                    (
+                        slot.job.value,
+                        slot.slot_index,
+                        _utc(slot.scheduled_at).isoformat(),
+                        slot.missed_count,
+                    )
+                    for slot in selected
+                )
+            )
+            if len(actual) != len(set(actual)) or expected != actual:
+                raise CycleError(
+                    "FAIL-CADENCE-DRIFT: scheduled slot changed before TICK_STARTED"
+                )
+            state["pending"] = []
+            self._write(state)
+
+    def unresolved(self) -> bool:
+        with self._lock:
+            return bool(self._read().get("pending"))
+
+    def reconcile_pending(self, slots: Iterable[DueSlot] | None = None) -> None:
+        """Clear selected slots after recovery or an intentional window skip.
+
+        Passing slots clears only that subset, which lets the worker discard
+        jobs outside their session window while retaining the allowed jobs as
+        the crash witness until ``TICK_STARTED`` is durable.  Omitting slots is
+        reserved for an explicit broker-recovery decision.
+        """
+
+        with self._lock:
+            state = self._read()
+            pending = list(state["pending"])
+            if slots is None:
+                selected = None
+            else:
+                selected = {(slot.job.value, slot.slot_index) for slot in slots}
+                pending_keys = {(item["job"], item["slot_index"]) for item in pending}
+                if not selected <= pending_keys:
+                    raise CycleError(
+                        "FAIL-CADENCE-DRIFT: cannot reconcile an unselected schedule slot"
+                    )
+            remaining = (
+                []
+                if selected is None
+                else [
+                    item
+                    for item in pending
+                    if (item["job"], item["slot_index"]) not in selected
+                ]
+            )
+            if remaining != pending:
+                state["pending"] = remaining
+                self._write(state)
+
+    def _write(self, state: Mapping[str, Any]) -> None:
+        _atomic_json(
+            self.path,
+            {
+                "schema": SCHEDULE_SCHEMA,
+                "anchor": self.anchor.isoformat(),
+                "identity": self.identity,
+                "cadences": {
+                    job.value: cadence for job, cadence in self.cadences.items()
+                },
+                "slots": state.get("slots", {}),
+                "pending": state.get("pending", []),
+            },
+        )
 
 
 class OptionsCycleWorker:
@@ -419,6 +769,8 @@ class OptionsCycleWorker:
         poll_seconds: float = 1.0,
         stop_requested: Callable[[], bool] | None = None,
         job_allowed: Callable[[JobKind, dt.datetime], bool] | None = None,
+        heartbeat: Callable[[], None] | None = None,
+        recovery_required: Callable[[], bool] | None = None,
     ) -> None:
         self.config = config
         self.session_id = session_id
@@ -432,9 +784,20 @@ class OptionsCycleWorker:
         self.poll_seconds = poll_seconds
         self.stop_requested = stop_requested or (lambda: False)
         self.job_allowed = job_allowed or (lambda _job, _at: True)
+        self.heartbeat = heartbeat
+        self.recovery_required = recovery_required
         self._stop = threading.Event()
         self._single_flight = threading.Lock()
-        self._recovery_blocked = bool(receipts.unmatched_ticks(session_id=session_id))
+        schedule.bind_identity(
+            session_id=session_id,
+            lease_nonce=lease_nonce,
+            policy_hash=config.policy_hash,
+            catalog_hash=config.catalog_hash,
+        )
+        # The state root is shared across paper-day restarts.  A prior
+        # session's unmatched tick is still a broker-ambiguity witness; do not
+        # let a fresh session hide it merely because its session id differs.
+        self._recovery_blocked = bool(receipts.unmatched_ticks()) or schedule.unresolved()
         if self._recovery_blocked:
             self.receipts.emit(
                 ReceiptKind.RECOVERY_REQUIRED,
@@ -448,8 +811,33 @@ class OptionsCycleWorker:
     def clear_recovery(self, *, reason: str, context: CycleContext | None = None) -> None:
         if not reason.strip():
             raise CycleError("recovery clearance requires a durable reason")
+        # The schedule witness is cleared in the same explicit recovery
+        # decision as the tick receipts.  If its identity or bytes are wrong,
+        # this raises before any clearance receipt can claim success.
+        self.schedule.reconcile_pending()
+        unmatched = self.receipts.unmatched_ticks()
+        foreign = [
+            item
+            for item in unmatched
+            if item.get("session_id") not in {None, self.session_id}
+        ]
+        if foreign:
+            raise CycleError(
+                "FAIL-RECOVERY-BLOCKED: unresolved ticks belong to another "
+                "session authority; operator reconciliation is required"
+            )
+        for item in unmatched:
+            self.receipts.emit(
+                ReceiptKind.TICK_RECONCILED,
+                tick_id=item.get("tick_id"),
+                attempt_id=item.get("attempt_id"),
+                session_id=self.session_id,
+                lease_nonce=self.lease_nonce,
+                outcome="RECONCILED",
+                reason=reason,
+            )
         self.receipts.emit(ReceiptKind.RECOVERY_CLEARED, context=context, reason=reason)
-        self._recovery_blocked = False
+        self._recovery_blocked = bool(self.receipts.unmatched_ticks())
 
     def stop(self) -> None:
         self._stop.set()
@@ -475,13 +863,29 @@ class OptionsCycleWorker:
             if self.stop_requested():
                 self.stop()
                 break
+            if self.recovery_required is not None and self.recovery_required():
+                self._recovery_blocked = True
             moment = _utc(self.clock())
-            due = tuple(
-                slot
-                for slot in self.schedule.due(moment)
-                if self.job_allowed(slot.job, moment)
-            )
+            pending = self.schedule.pending_slots()
+            if pending:
+                # A selection persisted without an acknowledged TICK_STARTED
+                # is a recovery pass, never a normal replay.  The reconciler
+                # may inspect the broker and clear it; entry/probe/discovery
+                # remain suppressed while the witness is unresolved.
+                due = pending
+            else:
+                selected = self.schedule.due(moment)
+                due = tuple(
+                    slot
+                    for slot in selected
+                    if self.job_allowed(slot.job, moment)
+                )
+                skipped = tuple(slot for slot in selected if slot not in due)
+                if skipped:
+                    self.schedule.reconcile_pending(skipped)
             if due:
+                if self.heartbeat is not None:
+                    self.heartbeat()
                 self.run_tick(due=due, arm=arm, broker=broker)
                 completed += 1
                 if max_cycles is not None and completed >= max_cycles:
@@ -526,6 +930,11 @@ class OptionsCycleWorker:
             missed_slots=missed,
         )
         try:
+            # ``due`` is produced by FixedRateSchedule and leaves a durable
+            # pending witness.  Acknowledge it only after TICK_STARTED is
+            # durable; a crash before this line is therefore recoverable even
+            # though no broker call has happened yet.
+            self.schedule.acknowledge(slots)
             broker_context = (
                 contextlib.nullcontext(broker)
                 if broker is not None
@@ -542,25 +951,55 @@ class OptionsCycleWorker:
                     due=slots,
                 )
                 due_jobs = {slot.job for slot in slots}
+                recovery_was_blocked = self._recovery_blocked
+                if recovery_was_blocked:
+                    if self.phases.reconcile is not None:
+                        recovery_result = dict(
+                            self.phases.reconcile(phase_context) or {}
+                        )
+                        phase_results["RECOVERY"] = recovery_result
+                        if recovery_result.get("recovery_cleared") is True:
+                            self.clear_recovery(
+                                reason=str(
+                                    recovery_result.get(
+                                        "reason", "broker and durable state reconciled"
+                                    )
+                                ),
+                                context=context,
+                            )
+                    else:
+                        phase_results["RECOVERY"] = {
+                            "outcome": "RECOVERY_REQUIRED",
+                            "failure_code": "FAIL-RECOVERY-BLOCKED",
+                            "detail": "no recovery reconciler is configured",
+                        }
+                    # Even if reconciliation clears the in-memory flag, this
+                    # tick began under an unresolved receipt.  Do not combine
+                    # recovery and a new opening in one pass; the next tick
+                    # must prove the cleared state from disk first.
+                    outcome = "RECOVERY_BLOCKED"
                 # An entry tick includes management.  This is the coalescing
                 # rule that prevents two broker passes back-to-back at 5m.
                 if JobKind.MANAGEMENT in due_jobs or JobKind.ENTRY in due_jobs:
                     phase_results[JobKind.MANAGEMENT.value] = dict(
                         self.phases.management(phase_context) or {}
                     )
-                if self._recovery_blocked and self.phases.reconcile is not None:
-                    phase_results["RECOVERY"] = dict(self.phases.reconcile(phase_context) or {})
-                    outcome = "RECOVERY_BLOCKED"
-                if JobKind.ENTRY in due_jobs:
+                if JobKind.ENTRY in due_jobs and not recovery_was_blocked:
                     phase_results["ENTRY_SERVICE"] = dict(self.phases.entry(phase_context) or {})
+                elif JobKind.ENTRY in due_jobs:
+                    phase_results["ENTRY_SERVICE"] = {
+                        "blocked": "FAIL-RECOVERY-BLOCKED",
+                        "transmissions": 0,
+                        "claims": 0,
+                    }
                 # Candidate work has priority over breadth when both are due.
-                if JobKind.PROBE in due_jobs:
+                if not recovery_was_blocked and JobKind.PROBE in due_jobs:
                     phase_results[JobKind.PROBE.value] = dict(self.phases.probe(phase_context) or {})
-                if JobKind.DISCOVERY in due_jobs:
+                if not recovery_was_blocked and JobKind.DISCOVERY in due_jobs:
                     phase_results[JobKind.DISCOVERY.value] = dict(
                         self.phases.discovery(phase_context) or {}
                     )
-                if self._recovery_blocked and JobKind.ENTRY in due_jobs:
+                if recovery_was_blocked and JobKind.ENTRY in due_jobs:
                     phase_results.setdefault("ENTRY_SERVICE", {})
                     phase_results["ENTRY_SERVICE"] = {
                         **phase_results["ENTRY_SERVICE"],
@@ -569,8 +1008,22 @@ class OptionsCycleWorker:
                     }
                     outcome = "RECOVERY_BLOCKED"
                 for key, value in phase_results.items():
-                    transmissions = value.get("transmissions", 0)
-                    if isinstance(transmissions, int) and transmissions > self.config.max_new_entries_per_pass:
+                    openings = value.get("new_openings")
+                    if openings is None:
+                        # Keep the injected Phase contract useful for tests
+                        # and non-runner adapters, while the real runner uses
+                        # ``new_openings`` so repricing does not look like
+                        # multiple logical entries.
+                        openings = value.get("transmissions", 0)
+                    if (
+                        isinstance(openings, bool)
+                        or not isinstance(openings, int)
+                        or openings < 0
+                    ):
+                        raise CycleError(
+                            "FAIL-UNAUTHORIZED-ENTRY: phase reported an invalid opening count"
+                        )
+                    if openings > self.config.max_new_entries_per_pass:
                         raise CycleError("FAIL-UNAUTHORIZED-ENTRY: cycle exceeded opening cap")
             if outcome == "RECOVERY_BLOCKED":
                 terminal = ReceiptKind.TICK_FINISHED

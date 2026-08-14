@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
-import importlib
 from pathlib import Path
 
 import pytest
 
 from engine.errors import RefusedError
 from engine.options.logical import LogicalEntryState, ServiceOutcome
+from engine.options.order_outbox import (
+    FAIL_REPRICE_BUDGET,
+    ExecutionOutbox,
+    OutboxState,
+    TransmissionBudget,
+)
 from engine.options.transmit import place_combo
 from test_options_logical import Harness, nomination
 from test_options_transmit import RecordingIB, authorized, spread
@@ -19,25 +24,6 @@ from test_options_transmit import RecordingIB, authorized, spread
 UTC = dt.timezone.utc
 NOW = dt.datetime(2026, 8, 14, 14, 0, tzinfo=UTC)
 LATER = NOW + dt.timedelta(minutes=10)
-
-
-def _missing_contract(module_names: tuple[str, ...], symbols: tuple[str, ...]) -> None:
-    found: list[str] = []
-    for module_name in module_names:
-        try:
-            module = importlib.import_module(module_name)
-        except ModuleNotFoundError as exc:
-            if exc.name == module_name or str(exc.name).startswith(module_name + "."):
-                continue
-            raise
-        found.append(module_name)
-        if all(hasattr(module, symbol) for symbol in symbols):
-            return
-    pytest.skip(
-        "missing contract seam: "
-        + ", ".join(f"{module}.{symbol}" for module in module_names for symbol in symbols)
-        + (f" (searched {', '.join(found)})" if found else "")
-    )
 
 
 class TestReviewerRevisionAndDoorGuards:
@@ -141,17 +127,33 @@ class TestReviewerRevisionAndDoorGuards:
 
 
 class TestEntrySagaContractSkips:
-    def test_crash_after_approval_consumption_has_durable_outbox_recovery(self) -> None:
-        _missing_contract(
-            ("engine.options.outbox", "engine.execution_outbox", "engine.autocycle"),
-            ("ExecutionOutbox",),
+    def test_crash_after_approval_consumption_has_durable_outbox_recovery(
+        self, tmp_path: Path
+    ) -> None:
+        intent = spread()
+        outbox = ExecutionOutbox(tmp_path / "outbox")
+        attempt = outbox.prepare(
+            intent,
+            structure_digest="a" * 64,
+            spec_digest="b" * 64,
+            account="DU1234567",
+            approval_id="approval-1",
+            now=NOW,
         )
-        pytest.fail("the execution outbox fixture adapter is not wired")
+        outbox.approval_consumed(attempt)
 
-    def test_reprice_rungs_consume_the_shared_session_order_budget(self) -> None:
-        _missing_contract(
-            ("engine.options.budget", "engine.options.reprice", "engine.options.runner"),
-            ("TransmissionBudget",),
-        )
-        pytest.fail("the reprice-budget fixture adapter is not wired")
+        restarted = ExecutionOutbox(tmp_path / "outbox")
 
+        assert restarted.records()[0]["state"] == OutboxState.APPROVAL_CONSUMED.value
+        with pytest.raises(RefusedError, match="FAIL-BROKER-AMBIGUOUS"):
+            restarted.assert_clear()
+
+    def test_reprice_rungs_consume_the_shared_session_order_budget(
+        self, tmp_path: Path
+    ) -> None:
+        budget = TransmissionBudget(tmp_path / "budget.json", limit=1, now=NOW)
+        reservation = budget.reserve(spread().strategy_id, now=NOW)
+        budget.commit(reservation.reservation_id)
+
+        with pytest.raises(RefusedError, match=FAIL_REPRICE_BUDGET):
+            budget.reserve(spread().strategy_id, now=NOW)

@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from engine.cli import build_parser, cmd_options_cycle
+from engine.cycle_adapter import _identity
+from engine.errors import ConfigError
 
 
 def test_options_cycle_is_a_registered_persistent_command():
@@ -78,3 +84,25 @@ def test_options_cycle_handler_delegates_to_application_adapter(monkeypatch):
     assert cmd_options_cycle(args) == 37
     assert observed["args"] is args
     assert observed["config"] is sentinel
+
+
+@pytest.mark.parametrize(
+    "supplied",
+    ["replacement-session:live-nonce", "live-session:replacement-nonce"],
+)
+def test_cycle_identity_rejects_identity_different_from_live_lease(
+    tmp_path: Path, supplied: str
+):
+    paperday = tmp_path / "paperday"
+    paperday.mkdir()
+    (paperday / "session.lock").write_text(
+        json.dumps({"session_id": "live-session", "fencing_token": "live-nonce"}),
+        encoding="utf-8",
+    )
+    (paperday / "scheduler.pid").write_text(
+        json.dumps({"session_id": "live-session", "nonce": "live-nonce", "pid": 1234}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="does not match live paper-day lease"):
+        _identity(tmp_path, SimpleNamespace(scheduler_session=supplied))

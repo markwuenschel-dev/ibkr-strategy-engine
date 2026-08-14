@@ -225,13 +225,19 @@ def build_autotrader_scheduler_loop(
             hint="use one explicit state directory so paper-day authority cannot split",
         )
     paths = SchedulerPaths(root=configured_state / "paperday")
+    worker_command = _pinned_autotrader_command(
+        policy,
+        schedule_config=schedule_config,
+        schedule_config_sha256=schedule_config_sha256,
+        state_dir=configured_state,
+    )
     loop_args: dict[str, Any] = {
         "identity": identity,
         "paths": paths,
         "lock": paths.root / "session.lock",
         "cadence_seconds": policy.cadences.management_seconds,
         "is_open": policy.calendar.is_open,
-        "command": policy.worker_command,
+        "command": worker_command,
         "engine": engine if engine is not None else EngineCommandRunner(configured_state),
         "command_timeout": policy.command_timeout_seconds,
         "policy_hash": policy.policy_hash,
@@ -245,6 +251,33 @@ def build_autotrader_scheduler_loop(
     if monotonic is not None:
         loop_args["monotonic"] = monotonic
     return SchedulerLoop(**loop_args)
+
+
+def _pinned_autotrader_command(
+    policy: AutotraderPolicy,
+    *,
+    schedule_config: Path,
+    schedule_config_sha256: str,
+    state_dir: Path,
+) -> tuple[str, ...]:
+    """Complete the policy command with the bootstrap-owned authorities.
+
+    ``worker_command`` is intentionally allowed to contain operational tokens
+    such as ``--arm`` but not the policy, digest, or state-directory values.
+    Those values are supplied only after this bootstrap has verified the exact
+    policy bytes.  This prevents a policy from asking the child to load a
+    different artifact and avoids the otherwise self-referential policy hash.
+    """
+
+    return (
+        *policy.worker_command,
+        "--schedule-config",
+        str(Path(schedule_config).resolve()),
+        "--schedule-config-sha256",
+        str(schedule_config_sha256).lower(),
+        "--state-dir",
+        str(Path(state_dir).resolve()),
+    )
 
 
 def build_scheduler_spec(
@@ -271,12 +304,17 @@ def build_scheduler_spec(
             )
         return SchedulerSpec(
             cadence_seconds=policy.cadences.management_seconds,
-            command=policy.worker_command,
-            entry_script=Path(entry_script),
+            command=_pinned_autotrader_command(
+                policy,
+                schedule_config=schedule_config,
+                schedule_config_sha256=schedule_config_sha256,
+                state_dir=Path(state_dir),
+            ),
+            entry_script=Path(entry_script).resolve(),
             entry_args=(
-                f"--schedule-config={Path(schedule_config)}",
+                f"--schedule-config={Path(schedule_config).resolve()}",
                 f"--schedule-config-sha256={schedule_config_sha256}",
-                f"--state-dir={Path(state_dir)}",
+                f"--state-dir={Path(state_dir).resolve()}",
             ),
         )
 
@@ -284,11 +322,11 @@ def build_scheduler_spec(
     return SchedulerSpec(
         cadence_seconds=policy.cadence_seconds,
         command=policy.command,
-        entry_script=Path(entry_script),
+        entry_script=Path(entry_script).resolve(),
         entry_args=(
-            f"--schedule-config={Path(schedule_config)}",
+            f"--schedule-config={Path(schedule_config).resolve()}",
             f"--schedule-config-sha256={schedule_config_sha256}",
-            f"--state-dir={Path(state_dir)}",
+            f"--state-dir={Path(state_dir).resolve()}",
         ),
     )
 

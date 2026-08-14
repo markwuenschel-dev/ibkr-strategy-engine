@@ -20,7 +20,8 @@ Absolute shared state root used by paper-day, scheduler, and engine workers.
 
 .PARAMETER Mandate
 MANAGE_ONLY preserves the legacy management-only session. FULL requires the
-hash-pinned policy, catalog, and config authority inputs below.
+hash-pinned scheduler policy, catalog, config, schedule artifact, and
+configuration fingerprint below.
 #>
 [CmdletBinding()]
 param(
@@ -56,8 +57,11 @@ if (-not [IO.Path]::IsPathFullyQualified($StateDir)) {
 if ($Mandate -eq "FULL" -and (
         [string]::IsNullOrWhiteSpace($PolicySha256) -or
         [string]::IsNullOrWhiteSpace($CatalogSha256) -or
-        [string]::IsNullOrWhiteSpace($ConfigSha256))) {
-    Write-Error "FULL requires -PolicySha256, -CatalogSha256, and -ConfigSha256."
+        [string]::IsNullOrWhiteSpace($ConfigSha256) -or
+        [string]::IsNullOrWhiteSpace($ScheduleConfig) -or
+        [string]::IsNullOrWhiteSpace($ScheduleConfigSha256) -or
+        [string]::IsNullOrWhiteSpace($ConfigurationFingerprint))) {
+    Write-Error "FULL requires -ScheduleConfig, -ScheduleConfigSha256, -PolicySha256, -CatalogSha256, -ConfigSha256, and -ConfigurationFingerprint."
     exit 20
 }
 

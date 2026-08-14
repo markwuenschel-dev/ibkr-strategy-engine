@@ -20,10 +20,12 @@ clock and sleeper make the whole thing testable in microseconds.
 
 from __future__ import annotations
 
+import datetime as dt
 import time
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from typing import Callable
+from uuid import uuid4
 
 from ..errors import EngineError
 
@@ -32,26 +34,8 @@ __all__ = [
     "Priority",
     "DiscoveryPaced",
     "PacedRequestBudget",
-    "PacingLedger",
-    "DurablePacingLedger",
+    "SharedPacingBudget",
 ]
-
-
-def __getattr__(name: str):
-    """Expose the durable backend without creating an import cycle.
-
-    ``pacing_ledger`` uses the enums in this module, so eager re-export would
-    make ``from engine.options.pacing_ledger import ...`` cyclic.  Lazy module
-    attributes keep both import paths stable.
-    """
-    if name in {"PacingLedger", "DurablePacingLedger"}:
-        from .pacing_ledger import DurablePacingLedger, PacingLedger
-
-        return {
-            "PacingLedger": PacingLedger,
-            "DurablePacingLedger": DurablePacingLedger,
-        }[name]
-    raise AttributeError(name)
 
 
 class RequestKind(str, Enum):
@@ -69,9 +53,10 @@ class Priority(IntEnum):
     The ordering is the 2026-08-01 audit's, verbatim: managing what the book
     already holds outranks watching working orders, which outranks the final
     authorization of a new entry, which outranks building candidates, which
-    outranks broad discovery. The budget enforces it two ways: priorities at
-    or above WORKING_ORDERS may spend the management reserve, and a pacing
-    penalty stops DISCOVERY outright while merely slowing the rest.
+    outranks broad discovery. The budget enforces it three ways: priorities at
+    or above WORKING_ORDERS may spend the management reserve, discovery may be
+    capped at its policy share, and a pacing penalty stops DISCOVERY outright
+    while merely slowing the rest.
     """
 
     EXITS_MANAGEMENT = 1
@@ -117,6 +102,14 @@ class PacedRequestBudget:
         #: WORKING_ORDERS may spend. Sized so a full discovery burst leaves
         #: enough behind to mark and exit every held position.
         management_reserve_fraction: float = 0.25,
+        #: Maximum fraction of a bucket that DISCOVERY may consume.  The
+        #: remainder is left for candidate construction and authorization in
+        #: addition to the management reserve.  ``1.0`` preserves the legacy
+        #: budget behaviour when no autotrader policy is present.
+        discovery_fraction: float = 1.0,
+        #: Absolute floor for management/working-order capacity.  This is
+        #: useful when a small bucket makes a percentage reserve round down.
+        minimum_management_requests: int = 0,
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -125,10 +118,24 @@ class PacedRequestBudget:
                 f"management_reserve_fraction must be in (0, 1), got "
                 f"{management_reserve_fraction}"
             )
+        if not 0.0 < discovery_fraction <= 1.0:
+            raise ValueError(
+                f"discovery_fraction must be in (0, 1], got {discovery_fraction}"
+            )
+        if (
+            isinstance(minimum_management_requests, bool)
+            or not isinstance(minimum_management_requests, int)
+            or minimum_management_requests < 0
+        ):
+            raise ValueError(
+                "minimum_management_requests must be a non-negative integer"
+            )
         now = clock()
         self.clock = clock
         self.sleeper = sleeper
         self.reserve_fraction = management_reserve_fraction
+        self.discovery_fraction = discovery_fraction
+        self.minimum_management_requests = minimum_management_requests
         self._buckets = {
             RequestKind.HISTORICAL: _Bucket(
                 capacity=historical_per_window,
@@ -169,7 +176,20 @@ class PacedRequestBudget:
         # one-token bucket therefore has no effective reserve -- the honest
         # reading of an impossible configuration, stated here rather than
         # discovered as a frozen scanner.
-        return min(bucket.capacity * self.reserve_fraction, bucket.capacity - 1.0)
+        management_floor = max(
+            bucket.capacity * self.reserve_fraction,
+            float(self.minimum_management_requests),
+        )
+        if priority is Priority.DISCOVERY:
+            # ``discovery_fraction`` is a cap, not an extra pool: discovery
+            # may consume at most that share of the rolling window.  Candidate
+            # construction and authorization can use the remaining share,
+            # while the management floor always remains protected.
+            management_floor = max(
+                management_floor,
+                bucket.capacity * (1.0 - self.discovery_fraction),
+            )
+        return min(management_floor, bucket.capacity - 1.0)
 
     def acquire(
         self,
@@ -221,3 +241,70 @@ class PacedRequestBudget:
         self._discovery_paused_until = self.clock() + (
             bucket.window_seconds * bucket.penalty
         )
+
+
+class SharedPacingBudget:
+    """One connection budget with a durable reservation authority.
+
+    The token bucket remains the low-latency wait mechanism, but every broker
+    request also obtains and commits a row in the session's SQLite pacing
+    ledger.  That makes history, contract qualification, market data, and
+    restart recovery observe one budget instead of silently maintaining
+    module-local allowances.  A durable refusal is fail-closed: no caller is
+    permitted to send an unreserved request merely because its process-local
+    bucket still has a token.
+    """
+
+    def __init__(
+        self,
+        local: PacedRequestBudget,
+        ledger: object,
+        *,
+        owner_id: str,
+        clock: Callable[[], dt.datetime],
+    ) -> None:
+        if not owner_id.strip():
+            raise ValueError("shared pacing owner_id must be non-empty")
+        self.local = local
+        self.ledger = ledger
+        self.owner_id = owner_id
+        self.clock = clock
+        self._sequence = 0
+
+    @property
+    def waited_seconds(self) -> float:
+        return self.local.waited_seconds
+
+    def _request_key(self, kind: RequestKind) -> str:
+        self._sequence += 1
+        return f"{self.owner_id}:{kind.value.lower()}:{self._sequence}:{uuid4().hex}"
+
+    def acquire(
+        self,
+        kind: RequestKind,
+        *,
+        priority: Priority = Priority.CANDIDATE_CONSTRUCTION,
+    ) -> None:
+        now = self.clock()
+        reservation = self.ledger.reserve(
+            kind,
+            cost=1,
+            priority=priority,
+            owner_id=self.owner_id,
+            request_key=self._request_key(kind),
+            now=now,
+        )
+        if reservation is None:
+            raise DiscoveryPaced(
+                f"shared durable pacing ledger refused {kind.value} at {priority.name}"
+            )
+        try:
+            self.local.acquire(kind, priority=priority)
+        except Exception:
+            self.ledger.release(reservation.reservation_id)
+            raise
+        self.ledger.commit(reservation.reservation_id, actual_cost=1, now=self.clock())
+
+    def penalize(self, kind: RequestKind = RequestKind.HISTORICAL) -> None:
+        self.local.penalize(kind)
+        self.ledger.penalize(kind, now=self.clock())

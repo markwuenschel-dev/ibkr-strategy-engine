@@ -51,6 +51,7 @@ logical-entry integration, which claims CANDIDATE rows through
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 import tempfile
@@ -144,6 +145,11 @@ __all__ = [
 SCANBOOK_VERSION = "scanbook/1"
 RANK_VERSION = "universe-rank/1"
 UNIVERSE_SCAN_VERSION = "options-universe-scan/1"
+# Cold phase-two work spends one request on expirations, one on strikes, one
+# on qualification, then one underlying quote plus two option-leg quotes.
+# The quote fan-out is capped below so this estimate is a hard broker-load
+# bound rather than an optimistic accounting label.
+MIN_PHASE2_REQUEST_COST = 6
 
 ENV_PREFIX = "IBKR_OPTIONS_UNIVERSE_"
 
@@ -908,7 +914,7 @@ class UniverseScanConfig:
     #: integrated worker reserves this amount before it touches expirations,
     #: strikes, qualification, or live quotes.  A smaller actual request count
     #: releases the unused estimate at completion.
-    phase2_request_cost: int = 4
+    phase2_request_cost: int = MIN_PHASE2_REQUEST_COST
     version: str = UNIVERSE_SCAN_VERSION
 
     def __post_init__(self) -> None:
@@ -950,6 +956,30 @@ class UniverseScanConfig:
         if not isinstance(self.version, str) or not self.version.strip():
             _refuse("version must be a non-empty string")
 
+    @property
+    def effective_phase2_request_cost(self) -> int:
+        """The reservation floor for the actual phase-two request path.
+
+        A valid vertical probe can issue two chain requests and at least three
+        quote requests (the underlying plus the two legs).  Older callers may
+        still construct the compatibility value ``4``; the worker never
+        reserves below the actual minimum.
+        """
+
+        return max(self.phase2_request_cost, MIN_PHASE2_REQUEST_COST)
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "refresh_limit": self.refresh_limit,
+            "phase2_limit": self.phase2_limit,
+            "target_dte": self.target_dte,
+            "minimum_dte": self.minimum_dte,
+            "maximum_dte": self.maximum_dte,
+            "strike_window": self.strike_window,
+            "phase2_request_cost": self.effective_phase2_request_cost,
+        }
+
     @classmethod
     def from_env(
         cls, env: Mapping[str, str] | None = None, **overrides: object
@@ -962,7 +992,9 @@ class UniverseScanConfig:
             "minimum_dte": _env_int(source, "MINIMUM_DTE", 35),
             "maximum_dte": _env_int(source, "MAXIMUM_DTE", 55),
             "strike_window": _env_int(source, "STRIKE_WINDOW", 24),
-            "phase2_request_cost": _env_int(source, "PHASE2_REQUEST_COST", 4),
+            "phase2_request_cost": _env_int(
+                source, "PHASE2_REQUEST_COST", MIN_PHASE2_REQUEST_COST
+            ),
         }
         values.update({k: v for k, v in overrides.items() if v is not None})
         return cls(**values)  # type: ignore[arg-type]
@@ -1373,6 +1405,29 @@ def _manifest_hash(value: str, *, name: str) -> str:
     return normalized
 
 
+def _behavior_manifest_hash(
+    *,
+    catalog_version: str,
+    policy: RiskPolicy,
+    regime_policy: VolatilityRegimePolicy,
+    config: UniverseScanConfig,
+) -> str:
+    """Digest every scan/risk/regime input that can change a result."""
+
+    record = {
+        "manifest_version": "scan-behavior/1",
+        "catalog_version": catalog_version,
+        "scan": config.to_record(),
+        "risk": policy.to_record(),
+        "regime": regime_policy.to_record(),
+    }
+    payload = json.dumps(
+        record, ensure_ascii=False, allow_nan=False, sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _safe_scan_id(value: str) -> str:
     """Make the identity safe for both receipt ids and Windows filenames."""
     normalized = "".join(
@@ -1402,6 +1457,7 @@ def _catalog_universe(snapshot: CatalogSnapshot) -> tuple[UniverseEntry, ...]:
             correlation_group=entry.correlation_group,
         )
         for entry in snapshot.entries
+        if entry.active and entry.scan_eligible
     )
 
 
@@ -1448,6 +1504,7 @@ def _snapshot_from_book(
     policy_hash: str,
     calendar_hash: str,
     config_hash: str,
+    behavior_hash: str,
     budget: _DurablePacingBudget,
     adapter: ObservationCacheIVStore,
 ) -> ScanBookSnapshot:
@@ -1460,14 +1517,31 @@ def _snapshot_from_book(
             record["automated_entry_allowed"] = entry.automated_entry_allowed
         record["scan_id"] = scan_id
         rows.append(record)
-    expected = len(rows)
-    deferred = book.coverage.deferred
+    active_catalog = tuple(
+        entry for entry in catalog.entries if entry.active and entry.scan_eligible
+    )
+    catalog_symbols = {entry.symbol for entry in active_catalog}
+    row_symbols = {row.symbol for row in book.rows}
+    unexpected = sorted(row_symbols - catalog_symbols)
+    if unexpected:
+        raise ValueError(
+            "scan book contains symbols outside the active catalog: "
+            + ", ".join(unexpected)
+        )
+    missing = catalog_symbols - row_symbols
+    expected = len(active_catalog)
+    reported_deferred = book.coverage.deferred
+    deferred = reported_deferred
     unavailable = book.coverage.unavailable
+    # The legacy scanner reports coverage over the rows it happened to build.
+    # The durable manifest must report coverage over the pinned catalog, or a
+    # missing row could make ``len(rows)`` look complete by definition.
+    deferred += len(missing)
     # ``ScanBookRow.evaluated_at`` records that phase one had facts, but a
     # later deep-probe deferral/unavailability is still an incomplete breadth
     # outcome.  Snapshot counts must partition the expected universe rather
     # than double-count a row in both evaluated and deferred/unavailable.
-    evaluated = max(0, book.coverage.evaluated - deferred - unavailable)
+    evaluated = max(0, book.coverage.evaluated - reported_deferred - unavailable)
     phase2_expected = len(budget.phase2_considered)
     phase2_deferred = len(budget.phase2_deferred)
     by_symbol = {row.symbol: row for row in book.rows}
@@ -1484,9 +1558,11 @@ def _snapshot_from_book(
         session_date=book.session_date,
         generated_at=book.generated_at,
         catalog_hash=catalog.catalog_hash,
+        catalog_version=catalog.version,
         policy_hash=policy_hash,
         calendar_hash=calendar_hash,
         config_hash=config_hash,
+        behavior_hash=behavior_hash,
         expected_symbols=expected,
         evaluated_symbols=evaluated,
         deferred_symbols=deferred,
@@ -1535,6 +1611,7 @@ def _update_refresh_queue(
     now: dt.datetime,
     interval: dt.timedelta,
     ledger: PacingLedger,
+    phase2_symbols: Sequence[str] = (),
 ) -> None:
     general = ledger.snapshot(RequestKind.GENERAL, now=now)
     deferred_until = general.paused_until or now + interval
@@ -1555,6 +1632,18 @@ def _update_refresh_queue(
         reason = row.reason or REASON_REFRESH_FAILED
         until = deferred_until if row.state is ScanState.DEFERRED_PACING else now + interval
         queue.defer(row.symbol, until=until, reason=reason, now=now)
+    by_symbol = {row.symbol: row for row in book.rows}
+    for symbol in phase2_symbols:
+        row = by_symbol.get(symbol)
+        queue.mark_phase_two(
+            symbol,
+            observed_at=now,
+            previous_rank=(
+                float(row.rank_score)
+                if row is not None and row.rank_score is not None
+                else None
+            ),
+        )
 
 
 def run_catalog_universe_pass(
@@ -1583,6 +1672,8 @@ def run_catalog_universe_pass(
     tick_id: str | None = None,
     attempt_id: str | None = None,
     refresh_interval: dt.timedelta = dt.timedelta(minutes=30),
+    refresh_enabled: bool = True,
+    allow_stale_cache: bool = False,
 ) -> IntegratedScanResult:
     """Run one durable catalog-backed breadth/deep scan.
 
@@ -1602,6 +1693,12 @@ def run_catalog_universe_pass(
     config_hash = _manifest_hash(config_hash, name="config_hash")
     snapshot = _catalog_snapshot(catalog)
     catalog_hash = _manifest_hash(snapshot.catalog_hash, name="catalog_hash")
+    behavior_hash = _behavior_manifest_hash(
+        catalog_version=snapshot.version,
+        policy=policy,
+        regime_policy=regime_policy,
+        config=config,
+    )
     tick_id = tick_id or f"manual:{when.strftime('%Y%m%dT%H%M%S')}"
     attempt_id = attempt_id or uuid4().hex
     scan_id = _safe_scan_id(scan_id or f"{session_id}:{tick_id}:{attempt_id}")
@@ -1613,6 +1710,10 @@ def run_catalog_universe_pass(
         raise UniverseScanRecoveryRequired(
             f"scan {scan_id} already has receipts and cannot be replayed"
         )
+    if not isinstance(refresh_enabled, bool):
+        raise TypeError("refresh_enabled must be a bool")
+    if not isinstance(allow_stale_cache, bool):
+        raise TypeError("allow_stale_cache must be a bool")
     queue = refresh_queue or getattr(observation_cache, "refresh_queue", None)
     if queue is None:
         raise TypeError("refresh_queue must be supplied when the cache has no queue")
@@ -1633,6 +1734,8 @@ def run_catalog_universe_pass(
             "policy_hash": policy_hash,
             "calendar_hash": calendar_hash,
             "config_hash": config_hash,
+            "catalog_version": snapshot.version,
+            "behavior_hash": behavior_hash,
             "expected_symbols": len(universe),
         },
     )
@@ -1644,12 +1747,16 @@ def run_catalog_universe_pass(
         interval=refresh_interval,
         estimated_request_cost=2,
     )
-    selected_states = queue.select_due(
-        now=when,
-        limit=min(config.refresh_limit, len(universe)),
-        catalog_version=snapshot.version,
-        configuration_version=config.version,
-        claim_owner=scan_id,
+    selected_states = (
+        queue.select_due(
+            now=when,
+            limit=min(config.refresh_limit, len(universe)),
+            catalog_version=snapshot.version,
+            configuration_version=config.version,
+            claim_owner=scan_id,
+        )
+        if refresh_enabled
+        else ()
     )
     selected = frozenset(state.symbol for state in selected_states)
     adapter = ObservationCacheIVStore(
@@ -1659,8 +1766,13 @@ def run_catalog_universe_pass(
         configuration_version=config.version,
         now=when,
     )
-    adapter.prefetch(entry.symbol for entry in snapshot.entries)
+    adapter.prefetch(entry.symbol for entry in snapshot.entries if entry.active and entry.scan_eligible)
     budget = _DurablePacingBudget(pacing_ledger, owner_id=scan_id, now=when)
+    phase2_order = queue.phase_two_order(
+        symbols=(entry.symbol for entry in universe),
+        catalog_version=snapshot.version,
+        configuration_version=config.version,
+    )
     try:
         book = run_universe_pass(
             universe=universe,
@@ -1677,15 +1789,22 @@ def run_catalog_universe_pass(
             event_risk=event_risk,
             now=when,
             refresh_symbols=selected,
+            phase2_order=phase2_order,
+            allow_stale_cache=allow_stale_cache,
         )
         book = _apply_catalog_entry_gate(book, entries)
+        # Probe passes intentionally do not refresh the breadth ring, but
+        # their deep attempts still advance the fair deep-ring cursor. A
+        # conditional update here would let the ten-minute probe cadence
+        # repeatedly select the same ranked symbols forever.
         _update_refresh_queue(
             queue,
-            selected=selected,
+            selected=selected if refresh_enabled else frozenset(),
             book=book,
             now=when,
             interval=refresh_interval,
             ledger=pacing_ledger,
+            phase2_symbols=budget.phase2_considered,
         )
         immutable = _snapshot_from_book(
             book,
@@ -1698,6 +1817,7 @@ def run_catalog_universe_pass(
             policy_hash=policy_hash,
             calendar_hash=calendar_hash,
             config_hash=config_hash,
+            behavior_hash=behavior_hash,
             budget=budget,
             adapter=adapter,
         )
@@ -1722,6 +1842,8 @@ def run_catalog_universe_pass(
             attempt_id=attempt_id,
             payload={
                 "coverage": immutable.coverage.value,
+                "catalog_version": snapshot.version,
+                "behavior_hash": behavior_hash,
                 "published": True,
             },
         )
@@ -1772,6 +1894,8 @@ def run_universe_pass(
     event_risk: Callable[[str], str | None] | None = None,
     now: dt.datetime | None = None,
     refresh_symbols: frozenset[str] | None = None,
+    phase2_order: Sequence[str] | None = None,
+    allow_stale_cache: bool = False,
 ) -> ScanBook:
     """One read-only scheduling pass over the universe.
 
@@ -1847,6 +1971,23 @@ def run_universe_pass(
             if previous is not None
             else ObservationProvenance.NONE
         )
+        if allow_stale_cache and previous is not None:
+            # Candidate probing is allowed to rank the last known slow facts,
+            # but the resulting book remains diagnostic-only because the row is
+            # still marked OBSERVATION_STALE.  No refresh request is spent and
+            # no stale fact can reach entry admission as complete coverage.
+            rows[symbol] = replace(
+                rows[symbol],
+                state=ScanState.OBSERVATION_STALE,
+                reason=REASON_REFRESH_NOT_REACHED,
+                detail=(
+                    "candidate probe used stale cache facts; discovery must "
+                    "refresh this symbol before entry admission"
+                ),
+                observation=stale_provenance,
+                rank_inputs=previous_inputs,
+            )
+            continue
         if volatility_history is None:
             rows[symbol] = replace(
                 rows[symbol],
@@ -1981,15 +2122,30 @@ def run_universe_pass(
         if score is not None:
             ranked.append((score, symbol, decision))
 
-    # -- phase 2: the strongest bounded subset ------------------------------
+    # -- phase 2: fair deep-ring order, then current rank --------------------
     ranked.sort(key=lambda item: (-item[0], item[1]))
-    for score, symbol, decision in ranked[: config.phase2_limit]:
+    if phase2_order is not None:
+        rank_by_symbol = {symbol: item for item in ranked for symbol in (item[1],)}
+        ordered_symbols = [
+            symbol for symbol in phase2_order if symbol in rank_by_symbol
+        ]
+        ordered_set = set(ordered_symbols)
+        ordered_symbols.extend(
+            symbol for _, symbol, _ in ranked if symbol not in ordered_set
+        )
+        selected_ranked = [rank_by_symbol[symbol] for symbol in ordered_symbols]
+    else:
+        selected_ranked = ranked
+    for score, symbol, decision in selected_ranked[: config.phase2_limit]:
         prepared = True
         prepare = getattr(budget, "prepare_phase2", None)
         if callable(prepare):
             try:
                 prepared = bool(
-                    prepare(symbol, estimated_cost=config.phase2_request_cost)
+                    prepare(
+                        symbol,
+                        estimated_cost=config.effective_phase2_request_cost,
+                    )
                 )
             except DiscoveryPaced as exc:
                 prepared = False
@@ -2195,6 +2351,13 @@ def _phase_two(
             detail="no live market-data port was supplied, so depth and spread "
             "cannot be established (unmeasured counts as insufficient)",
         )
+    # Qualification may return a wide strike window. Never turn that into an
+    # unbounded quote fan-out: the phase-two reservation is a hard cap. Two
+    # option legs are sufficient for the v1 vertical selector; a future
+    # structure family must declare a larger cost explicitly.
+    if callable(getattr(budget, "prepare_phase2", None)):
+        max_quoted_legs = max(2, config.effective_phase2_request_cost - 4)
+        qualified = qualified[:max_quoted_legs]
     con_ids = [contract.con_id for contract in qualified]
     try:
         # Candidate-construction priority: this symbol has already earned its

@@ -121,4 +121,5 @@ class TestStopNeverKillsAStranger:
         report = h.controller.stop()
         assert stranger not in h.processes.terminated, report.render()
         assert h.processes.alive(stranger)
-        assert not h.paths.watcher_pid.exists(), "the stale record must still be discarded"
+        assert not report.clean, "foreign watcher ownership is an unproven shutdown"
+        assert h.paths.watcher_pid.exists(), "foreign watcher evidence must be retained"

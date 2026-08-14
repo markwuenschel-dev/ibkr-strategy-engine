@@ -64,6 +64,7 @@ __all__ = [
     "SchedulerIdentity",
     "SchedulerPaths",
     "TickReceipt",
+    "WORKER_NONZERO_EXIT_FAILURE_CODE",
     "SchedulerLoop",
     "SchedulerSpec",
     "adopt_or_spawn",
@@ -79,6 +80,12 @@ __all__ = [
     "read_terminal_receipt",
     "session_id_holding",
 ]
+
+
+# Stable across worker implementations and process exit numbers.  The exit
+# number remains evidence on the receipt; callers must not have to parse it to
+# decide that the scheduler did not complete a successful tick.
+WORKER_NONZERO_EXIT_FAILURE_CODE = "FAIL-WORKER-NONZERO-EXIT"
 
 
 class TickOutcome(Enum):
@@ -395,6 +402,16 @@ def _aware_utc(value: dt.datetime | None, label: str) -> dt.datetime:
     if not isinstance(value, dt.datetime) or value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{label} must be timezone-aware")
     return value.astimezone(dt.timezone.utc)
+
+
+def _result_exit_code(result: Any) -> int | None:
+    """Read the normalized or subprocess-shaped exit-code attribute."""
+
+    for name in ("code", "returncode"):
+        value = getattr(result, name, None)
+        if type(value) is int:
+            return value
+    return None
 
 
 def _parse_aware(value: Any, label: str) -> dt.datetime:
@@ -920,7 +937,13 @@ def _write_terminal_receipt(
             "tick_id": receipt.tick_id,
             "outcome": receipt.outcome.value,
             "at": receipt.at.isoformat(),
-            "clean_exit": receipt.outcome is not TickOutcome.UNRESOLVED_LEASE_LOST_MID_TICK,
+            "clean_exit": receipt.outcome
+            in {
+                TickOutcome.STOPPED_QUIESCED,
+                TickOutcome.STOPPED_LEASE_LOST,
+                TickOutcome.STOPPED_AUTHORITY_INVALID,
+                TickOutcome.STOPPED_TICK_BUDGET,
+            },
         },
     )
 
@@ -985,7 +1008,13 @@ def identity_from_record(record: dict[str, Any] | None) -> SchedulerIdentity | N
     return SchedulerIdentity(session_id=session_id, nonce=nonce)
 
 
-def request_quiesce(paths: SchedulerPaths, *, reason: str, now: dt.datetime) -> None:
+def request_quiesce(
+    paths: SchedulerPaths,
+    *,
+    reason: str,
+    now: dt.datetime,
+    identity: SchedulerIdentity | None = None,
+) -> None:
     """Publish the stop request as one durable, parseable state transition.
 
     The scheduler reads this file at the top of every tick.  A direct write can
@@ -993,10 +1022,10 @@ def request_quiesce(paths: SchedulerPaths, *, reason: str, now: dt.datetime) -> 
     to a lost stop request.  Use the same atomic publication discipline as the
     heartbeat, PID record, and terminal receipt.
     """
-    _atomic_write_json(
-        paths.quiesce,
-        {"v": 1, "reason": reason, "at": now.isoformat()},
-    )
+    payload: dict[str, Any] = {"v": 1, "reason": reason, "at": now.isoformat()}
+    if identity is not None:
+        payload.update({"session_id": identity.session_id, "nonce": identity.nonce})
+    _atomic_write_json(paths.quiesce, payload)
 
 
 def clear_quiesce(paths: SchedulerPaths) -> None:
@@ -1045,8 +1074,20 @@ def ready_for(paths: SchedulerPaths, identity: SchedulerIdentity) -> bool:
     )
 
 
-def quiesce_requested(paths: SchedulerPaths) -> bool:
-    return paths.quiesce.exists()
+def quiesce_requested(
+    paths: SchedulerPaths, *, identity: SchedulerIdentity | None = None
+) -> bool:
+    record = _read_json(paths.quiesce)
+    if record is None:
+        return False
+    if identity is None:
+        # Compatibility for direct legacy callers. Production scheduler loops
+        # always pass their identity and therefore ignore an unbound request.
+        return True
+    return (
+        record.get("session_id") == identity.session_id
+        and record.get("nonce") == identity.nonce
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1159,7 +1200,6 @@ class SchedulerLoop:
             return True, "lifecycle recovery disabled for legacy scheduler policy"
         unmatched = find_unmatched_ticks(
             self.paths,
-            session_id=self.identity.session_id,
         )
         if not unmatched:
             return True, "no unmatched tick starts"
@@ -1195,7 +1235,28 @@ class SchedulerLoop:
         return True, "unmatched ticks reconciled by caller"
 
     def _lease_held(self) -> bool:
-        return session_id_holding(self.lock) == self.identity.session_id
+        if session_id_holding(self.lock) != self.identity.session_id:
+            return False
+        # A session id is not the scheduler lease. During a same-session
+        # replacement, the nonce distinguishes the predecessor from the child.
+        # The claim exists before the child can run its first tick; the PID
+        # record covers adopted/running children after the handshake.
+        claim = _read_json(self.paths.claim)
+        if claim is not None:
+            return (
+                claim.get("session_id") == self.identity.session_id
+                and claim.get("nonce") == self.identity.nonce
+            )
+        record = read_scheduler_record(self.paths)
+        if record is not None:
+            return (
+                record.get("session_id") == self.identity.session_id
+                and record.get("nonce") == self.identity.nonce
+            )
+        # Legacy management-only tests/policies predate the nonce witness. The
+        # production autotrader enables lifecycle receipts and therefore fails
+        # closed when neither the startup claim nor the PID record is present.
+        return not self.lifecycle_receipts
 
     def tick(self, index: int, *, scheduled_for: dt.datetime | None = None) -> TickReceipt:
         """Run exactly one tick and return its receipt.
@@ -1226,7 +1287,7 @@ class SchedulerLoop:
                 )
             )
 
-        if quiesce_requested(self.paths):
+        if quiesce_requested(self.paths, identity=self.identity):
             return self._record(
                 TickReceipt(
                     tick_id=tick_id,
@@ -1286,16 +1347,13 @@ class SchedulerLoop:
             detail="authority and session lease validated before broker work",
         )
         try:
-            # The auto-trader command is itself the persistent, broker-owning
-            # worker. A scheduler-level timeout would kill a healthy worker
-            # after the first command window and leave the paper-day authority
-            # believing the session was supervised when it was not. Its own
-            # cycle/tick policy owns bounded work; legacy one-shot commands
-            # retain the scheduler command timeout.
-            command_timeout = (
-                None if self.command and self.command[0] == "options-cycle" else self.command_timeout
+            # Every command, including the persistent options-cycle worker, is
+            # bounded by the hash-pinned policy. A persistent worker that cannot
+            # return before this deadline is an unresolved tick, not a reason
+            # to bypass the supervisor's recovery boundary.
+            result = self.engine.run(
+                list(self.command), timeout=self.command_timeout
             )
-            result = self.engine.run(list(self.command), timeout=command_timeout)
         except Exception as exc:  # noqa: BLE001 - the terminal receipt is the recovery boundary
             elapsed = round(self.monotonic() - started, 3)
             self._emit_event(
@@ -1318,6 +1376,7 @@ class SchedulerLoop:
                 )
             )
         elapsed = round(self.monotonic() - started, 3)
+        exit_code = _result_exit_code(result)
 
         if not self._lease_held():
             self._emit_event(
@@ -1341,10 +1400,33 @@ class SchedulerLoop:
                         "broker before starting another session"
                     ),
                     command=tuple(self.command),
-                    exit_code=getattr(result, "code", None),
+                    exit_code=exit_code,
                     duration_seconds=elapsed,
                     context=context,
                     failure_code="FAIL-STALE-PAPERDAY-AUTHORITY",
+                )
+            )
+
+        if exit_code is not None and exit_code != 0:
+            detail = f"worker exited nonzero ({exit_code})"
+            self._emit_event(
+                TickEvent.TICK_ABORTED,
+                context,
+                at=self.clock(),
+                detail=detail,
+                failure_code=WORKER_NONZERO_EXIT_FAILURE_CODE,
+            )
+            return self._record(
+                TickReceipt(
+                    tick_id=tick_id,
+                    at=now,
+                    outcome=TickOutcome.STOPPED_TICK_ABORTED,
+                    detail=detail,
+                    command=tuple(self.command),
+                    exit_code=exit_code,
+                    duration_seconds=elapsed,
+                    context=context,
+                    failure_code=WORKER_NONZERO_EXIT_FAILURE_CODE,
                 )
             )
 
@@ -1352,7 +1434,7 @@ class SchedulerLoop:
             TickEvent.TICK_FINISHED,
             context,
             at=self.clock(),
-            detail=f"worker exited {getattr(result, 'code', None)}",
+            detail=f"worker exited {exit_code}",
         )
 
         return self._record(
@@ -1360,9 +1442,9 @@ class SchedulerLoop:
                 tick_id=tick_id,
                 at=now,
                 outcome=TickOutcome.RAN,
-                detail=f"pass exited {getattr(result, 'code', None)}",
+                detail=f"pass exited {exit_code}",
                 command=tuple(self.command),
-                exit_code=getattr(result, "code", None),
+                exit_code=exit_code,
                 duration_seconds=elapsed,
                 context=context,
             )
@@ -1600,7 +1682,7 @@ def drain_and_stop(
     recorded = read_scheduler_record(paths)
     if recorded is None:
         if paths.pid.exists():
-            request_quiesce(paths, reason="paper-day stop", now=now)
+            request_quiesce(paths, reason="paper-day stop", now=now, identity=identity)
             return False, (
                 "STOP_DIRTY: scheduler.pid exists but is unreadable or malformed; "
                 "the scheduler's final state is unaccounted for, so reconcile "
@@ -1609,7 +1691,7 @@ def drain_and_stop(
         return True, "no scheduler pid file -- nothing to stop"
 
     pid = recorded.get("pid")
-    request_quiesce(paths, reason="paper-day stop", now=now)
+    request_quiesce(paths, reason="paper-day stop", now=now, identity=identity)
 
     if type(pid) is not int or pid <= 0 or not processes.alive(pid):
         record_identity = identity_from_record(recorded)
@@ -1624,11 +1706,9 @@ def drain_and_stop(
         )
 
     if identity.needle not in processes.cmdline(pid):
-        with contextlib.suppress(OSError):
-            paths.pid.unlink()
         return False, (
             f"STOP_DIRTY: pid {pid} belongs to another process now -- not killed, "
-            "record discarded. This session's scheduler could not be located, so "
+            "record retained. This session's scheduler could not be located, so "
             "its shutdown is unproven; the quiesce flag is set and any live tick "
             "will stop at its next boundary, but reconcile before the next session"
         )
@@ -1651,13 +1731,12 @@ def drain_and_stop(
     # up to `drain_timeout` ago; in that window the scheduler may have exited
     # and the OS handed its number to something else. Terminating on the
     # strength of the earlier check is the stale-PID failure with a delay in it.
-    if identity.needle not in processes.cmdline(pid):
-        with contextlib.suppress(OSError):
-            paths.pid.unlink()
+    if not processes.alive(pid) or identity.needle not in processes.cmdline(pid):
         return False, (
             f"STOP_DIRTY: pid {pid} stopped matching this scheduler during the "
             f"{drain_timeout:g}s drain -- not terminated. It exited on its own or "
-            "the number was reused; either way its final tick is unaccounted for"
+            "the number was reused; either way its final tick is unaccounted for; "
+            "record retained"
         )
 
     processes.terminate(pid)

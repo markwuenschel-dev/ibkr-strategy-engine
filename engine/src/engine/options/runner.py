@@ -86,7 +86,7 @@ from .logical import (
 )
 from .marketdata import Liveness
 from .marking import closing_midpoint_debit, confirmed_remaining_quantity
-from .pacing import Priority
+from .pacing import Priority, RequestKind
 from .policy import RiskPolicy
 from .portfolio import PortfolioSnapshot, PositionExposure
 from .ports import LiveMarketDataPort, PortfolioStatePort, StrategyQuoteSnapshot
@@ -116,7 +116,18 @@ from .selection import (
     size_position,
     target_delta_for,
 )
-from .universe import ScanBook, ScanBookAdmission, ScanBookFileWriter
+from .universe import (
+    CoverageSummary,
+    ScanBook,
+    ScanBookAdmission,
+    ScanBookFileWriter,
+    ScanBookRow,
+)
+from .scanbook_store import (
+    ClaimLedger,
+    ImmutableScanBookClaimWriter,
+    ScanBookSnapshotStore,
+)
 from .approval import (
     ApprovalContext,
     AwaitingVerification,
@@ -324,6 +335,11 @@ class RunReport:
             "governor": self.governor.to_record() if self.governor else None,
             "reprice": self.reprice.to_record() if self.reprice else None,
             "entered": self.entered,
+            # One logical opening may produce several physical submissions
+            # while the bounded reprice ladder works it.  The cycle cap is a
+            # logical-entry cap; the transmission budget separately counts
+            # every physical rung.
+            "new_openings": int(bool(self.transmissions)),
             "blockers": list(self.blockers),
             "refusal_codes": list(self.refusal_codes),
             "entry_refusal_code": self.entry_refusal_code,
@@ -752,7 +768,23 @@ _RECONCILIATION_BLOCKERS: dict[ReconciliationOutcome, str] = {
 }
 
 
-def _open_orders(ib: Any, *, report: RunReport) -> Any:
+def _acquire_request(
+    budget: Any,
+    kind: RequestKind,
+    *,
+    priority: Priority,
+) -> None:
+    """Reserve one broker request when the caller owns a persistent budget."""
+    if budget is not None:
+        budget.acquire(kind, priority=priority)
+
+
+def _open_orders(
+    ib: Any,
+    *,
+    report: RunReport,
+    request_budget: Any = None,
+) -> Any:
     """:func:`~engine.options.adapters.read_open_orders`, with the failure named.
 
     A broker that raises is a broker that could not be asked, which is ``None``
@@ -760,7 +792,11 @@ def _open_orders(ib: Any, *, report: RunReport) -> Any:
     reconciler's ``broker_orders`` contract.
     """
     try:
-        return read_open_orders(ib)
+        return read_open_orders(
+            ib,
+            budget=request_budget,
+            budget_priority=Priority.WORKING_ORDERS,
+        )
     except Exception as exc:  # noqa: BLE001 - adapter boundary
         report.errors.append(
             f"the broker's open orders could not be read: {type(exc).__name__}: {exc}"
@@ -769,7 +805,12 @@ def _open_orders(ib: Any, *, report: RunReport) -> Any:
 
 
 def _reconcile(
-    broker: Any, store: PositionStore, *, now: dt.datetime, report: RunReport
+    broker: Any,
+    store: PositionStore,
+    *,
+    now: dt.datetime,
+    report: RunReport,
+    request_budget: Any = None,
 ) -> None:
     """Establish, explicitly, whether the book is understood.
 
@@ -809,6 +850,11 @@ def _reconcile(
         return
 
     try:
+        _acquire_request(
+            request_budget,
+            RequestKind.GENERAL,
+            priority=Priority.EXITS_MANAGEMENT,
+        )
         reported = holdings()
     except Exception as exc:  # noqa: BLE001 - adapter boundary
         report.errors.append(f"reconciliation failed: {type(exc).__name__}: {exc}")
@@ -835,7 +881,11 @@ def _reconcile(
         result = store.reconcile_against_broker(
             reported,
             checked_at=now,
-            broker_orders=_open_orders(getattr(broker, "ib", broker), report=report),
+            broker_orders=_open_orders(
+                getattr(broker, "ib", broker),
+                report=report,
+                request_budget=request_budget,
+            ),
         )
     except Exception as exc:  # noqa: BLE001 - adapter boundary
         report.errors.append(f"reconciliation failed: {type(exc).__name__}: {exc}")
@@ -846,7 +896,13 @@ def _reconcile(
     report.reconciliation_outcome = ReconciliationOutcome.for_report(result)
 
 
-def _underlying_reference_price(broker: Any, symbol: str) -> Decimal | None:
+def _underlying_reference_price(
+    broker: Any,
+    symbol: str,
+    *,
+    request_budget: Any = None,
+    budget_priority: Priority = Priority.CANDIDATE_CONSTRUCTION,
+) -> Decimal | None:
     """Spot, used only to centre the strike window.
 
     Deliberately forgiving: a broker without a ``quote`` method, a refused
@@ -859,6 +915,11 @@ def _underlying_reference_price(broker: Any, symbol: str) -> Decimal | None:
     if not callable(quote):
         return None
     try:
+        _acquire_request(
+            request_budget,
+            RequestKind.GENERAL,
+            priority=budget_priority,
+        )
         price = getattr(quote(symbol), "price", None)
     except Exception:  # noqa: BLE001 - a reference price is an optimisation
         return None
@@ -871,10 +932,22 @@ def _underlying_reference_price(broker: Any, symbol: str) -> Decimal | None:
     return value if value.is_finite() and value > ZERO else None
 
 
-def _qualify_underlying(ib: Any, symbol: str, report: RunReport) -> Any | None:
+def _qualify_underlying(
+    ib: Any,
+    symbol: str,
+    report: RunReport,
+    *,
+    request_budget: Any = None,
+    budget_priority: Priority = Priority.CANDIDATE_CONSTRUCTION,
+) -> Any | None:
     """Qualify the stock, or record the blocker and return ``None``."""
     from ib_async import Stock  # noqa: PLC0415 - optional dependency
 
+    _acquire_request(
+        request_budget,
+        RequestKind.GENERAL,
+        priority=budget_priority,
+    )
     qualified = ib.qualifyContracts(Stock(symbol, "SMART", "USD"))
     if not qualified:
         report.blockers.append(f"IBKR did not qualify the underlying {symbol}")
@@ -883,9 +956,20 @@ def _qualify_underlying(ib: Any, symbol: str, report: RunReport) -> Any | None:
 
 
 def _iv_metric_for(
-    ib: Any, underlying: Any, symbol: str, *, now: dt.datetime
+    ib: Any,
+    underlying: Any,
+    symbol: str,
+    *,
+    now: dt.datetime,
+    request_budget: Any = None,
+    budget_priority: Priority = Priority.CANDIDATE_CONSTRUCTION,
 ) -> IVRankMetric:
     """One year of daily implied volatility, reduced to the rank metric."""
+    _acquire_request(
+        request_budget,
+        RequestKind.HISTORICAL,
+        priority=budget_priority,
+    )
     bars = ib.reqHistoricalData(
         underlying,
         endDateTime="",
@@ -905,6 +989,8 @@ def _regime_for(
     resolved_regime: VolatilityRegimePolicy,
     now: dt.datetime,
     report: RunReport,
+    request_budget: Any = None,
+    budget_priority: Priority = Priority.CANDIDATE_CONSTRUCTION,
 ) -> tuple[Any | None, IVRankMetric | None]:
     """Qualify the underlying, pull its IV metric, classify the regime.
 
@@ -912,10 +998,23 @@ def _regime_for(
     and the packet evidence either way. Serviced pending entries re-run this
     per pass too, because the packet evidence states the tier (contract
     section 3)."""
-    underlying_contract = _qualify_underlying(ib, symbol, report)
+    underlying_contract = _qualify_underlying(
+        ib,
+        symbol,
+        report,
+        request_budget=request_budget,
+        budget_priority=budget_priority,
+    )
     if underlying_contract is None:
         return None, None
-    iv_metric = _iv_metric_for(ib, underlying_contract, symbol, now=now)
+    iv_metric = _iv_metric_for(
+        ib,
+        underlying_contract,
+        symbol,
+        now=now,
+        request_budget=request_budget,
+        budget_priority=budget_priority,
+    )
     report.iv_rank = iv_metric
     report.regime = classify(
         VolatilityAssessment(
@@ -1028,6 +1127,8 @@ def _quoted_window_for(
     expiration: dt.date,
     right: str,
     strike_window: int,
+    request_budget: Any = None,
+    budget_priority: Priority = Priority.CANDIDATE_CONSTRUCTION,
 ) -> int | None:
     """The discovery-scale chain density behind a pinned-leg rebuild.
 
@@ -1040,12 +1141,22 @@ def _quoted_window_for(
     enumerated, which fails closed downstream (the two-leg count trips the
     floor)."""
     try:
+        _acquire_request(
+            request_budget,
+            RequestKind.GENERAL,
+            priority=budget_priority,
+        )
         listed = enumerate_strikes(
             ib, symbol, expiration.strftime("%Y%m%d"), right
         )
         window = narrow_strikes(
             listed,
-            reference_price=_underlying_reference_price(broker, symbol),
+            reference_price=_underlying_reference_price(
+                broker,
+                symbol,
+                request_budget=request_budget,
+                budget_priority=budget_priority,
+            ),
             width=strike_window,
             right=right,
         )
@@ -1091,6 +1202,7 @@ def _build_candidate(
     report: RunReport,
     underlying: Any | None = None,
     iv_metric: IVRankMetric | None = None,
+    request_budget: Any = None,
 ) -> tuple[OptionStrategyIntent | None, StrategyQuoteSnapshot | None]:
     """Chain -> quotes -> delta selection -> a validated opening intent.
 
@@ -1101,14 +1213,32 @@ def _build_candidate(
     regime path gets the previous behaviour byte for byte.
     """
     if underlying is None:
-        underlying = _qualify_underlying(ib, symbol, report)
+        underlying = _qualify_underlying(
+            ib,
+            symbol,
+            report,
+            request_budget=request_budget,
+            budget_priority=Priority.CANDIDATE_CONSTRUCTION,
+        )
         if underlying is None:
             return None, None
 
     if iv_metric is None:
-        iv_metric = _iv_metric_for(ib, underlying, symbol, now=now)
+        iv_metric = _iv_metric_for(
+            ib,
+            underlying,
+            symbol,
+            now=now,
+            request_budget=request_budget,
+            budget_priority=Priority.CANDIDATE_CONSTRUCTION,
+        )
     report.iv_rank = iv_metric
 
+    _acquire_request(
+        request_budget,
+        RequestKind.GENERAL,
+        priority=Priority.CANDIDATE_CONSTRUCTION,
+    )
     expiry = select_expiration(
         discover_expirations(ib, symbol, underlying.conId),
         today=today,
@@ -1121,6 +1251,11 @@ def _build_candidate(
         return None, None
 
     right = rights_for(bias)[0]
+    _acquire_request(
+        request_budget,
+        RequestKind.GENERAL,
+        priority=Priority.CANDIDATE_CONSTRUCTION,
+    )
     listed = enumerate_strikes(ib, symbol, expiry.expiry, right.value)
     # The window must be centred on spot, not on the middle of the listed
     # ladder. Those coincide only by accident, and when they diverge the engine
@@ -1129,7 +1264,12 @@ def _build_candidate(
     # delta-based, so an approximate figure is fine and a missing one is
     # survivable -- but it is recorded, because a positional window is a
     # degraded window and a silent fallback would hide that.
-    reference_price = _underlying_reference_price(broker, symbol)
+    reference_price = _underlying_reference_price(
+        broker,
+        symbol,
+        request_budget=request_budget,
+        budget_priority=Priority.CANDIDATE_CONSTRUCTION,
+    )
     if reference_price is None:
         report.errors.append(
             f"no reference price for {symbol}; the strike window fell back to the "
@@ -1140,6 +1280,11 @@ def _build_candidate(
         reference_price=reference_price,
         width=strike_window,
         right=right.value,
+    )
+    _acquire_request(
+        request_budget,
+        RequestKind.GENERAL,
+        priority=Priority.CANDIDATE_CONSTRUCTION,
     )
     contracts: list[QualifiedOption] = list(
         qualify_strikes(ib, symbol, expiry.expiry, window, right.value)
@@ -1400,6 +1545,8 @@ def _authorize_and_transmit_entry(
     session_id: str | None = None,
     lease_nonce: str | None = None,
     tick_id: str | None = None,
+    packet_lifetime: dt.timedelta | None = None,
+    request_budget: Any = None,
 ) -> str:
     """THE one corridor from a built candidate to a transmitted opening order.
 
@@ -1523,7 +1670,11 @@ def _authorize_and_transmit_entry(
         )
         report.refusal_codes.append("OPTIONS_BINDING_UNQUOTABLE")
         return "binding_blocked"
-    margin = IBKRWhatIfAdapter(ib).what_if(candidate, observed_at=binding_now)
+    margin = IBKRWhatIfAdapter(
+        ib,
+        budget=request_budget,
+        budget_priority=Priority.AUTHORIZATION,
+    ).what_if(candidate, observed_at=binding_now)
     if portfolio is not None:
         try:
             fresh_state = portfolio.snapshot(as_of=binding_now)
@@ -1588,6 +1739,7 @@ def _authorize_and_transmit_entry(
         order_type=COMBO_ORDER_TYPE,
         time_in_force=COMBO_TIME_IN_FORCE,
         now=binding_now,
+        **({"lifetime": packet_lifetime} if packet_lifetime is not None else {}),
         evidence=_entry_evidence(
             report,
             margin=margin,
@@ -1778,7 +1930,10 @@ def _load_scanbook(
     now: dt.datetime,
     manager: Any,
     report: RunReport,
-) -> tuple[ScanBook | None, str]:
+    snapshot_store: ScanBookSnapshotStore | None = None,
+    snapshot_manifest: dict[str, str] | None = None,
+    max_age: dt.timedelta | None = None,
+) -> tuple[ScanBook | None, str, str | None]:
     """The session's ScanBook, or ``None`` with the named refusal recorded.
 
     The manager path is ScanBook-admitted. Missing, malformed, stale, future,
@@ -1787,12 +1942,54 @@ def _load_scanbook(
     ``max_nomination_age``: a book older than the oldest nomination the manager
     would accept cannot contain a claimable row.
     """
+    if snapshot_store is not None:
+        manifest = snapshot_manifest or {}
+        required = ("catalog_hash", "policy_hash", "calendar_hash", "config_hash")
+        if any(not isinstance(manifest.get(name), str) for name in required):
+            report.refusal_codes.append("SCANBOOK_MANIFEST_MISSING")
+            report.blockers.append(
+                "immutable ScanBook admission is missing one or more active "
+                "catalog/policy/calendar/config digests"
+            )
+            return None, "SCANBOOK_MANIFEST_MISSING", None
+        admission = snapshot_store.admit_latest(
+            session_date=today,
+            now=now,
+            max_age=max_age or manager.refusal_policy.max_nomination_age,
+            **{name: manifest[name] for name in required},
+            **{
+                name: manifest[name]
+                for name in ("catalog_version", "behavior_hash")
+                if name in manifest
+            },
+        )
+        if not admission.entry_admissible or admission.snapshot is None:
+            code = f"SCANBOOK_{admission.status.value}"
+            report.refusal_codes.append(code)
+            report.blockers.append(
+                f"the immutable ScanBook for {today.isoformat()} failed "
+                f"logical-entry admission ({admission.status.value}): "
+                f"{admission.detail}"
+            )
+            return None, code, None
+        rows = tuple(ScanBookRow.from_record(dict(row)) for row in admission.snapshot.rows)
+        return (
+            ScanBook(
+                session_date=admission.snapshot.session_date,
+                generated_at=admission.snapshot.generated_at,
+                rows=rows,
+                coverage=CoverageSummary.from_rows(rows),
+            ),
+            "OK",
+            admission.snapshot.scan_id,
+        )
+
     if scanbook_root is None:
         report.refusal_codes.append("SCANBOOK_MISSING")
         report.blockers.append(
             "no scanbook root is configured; logical-entry admission is refused"
         )
-        return None, "SCANBOOK_MISSING"
+        return None, "SCANBOOK_MISSING", None
     book = ScanBook.read(Path(scanbook_root), today)
     if book is None:
         report.refusal_codes.append("SCANBOOK_MISSING")
@@ -1800,11 +1997,11 @@ def _load_scanbook(
             f"no scanbook for {today.isoformat()} under {scanbook_root}; "
             "logical-entry admission is refused"
         )
-        return None, "SCANBOOK_MISSING"
+        return None, "SCANBOOK_MISSING", None
     admission = book.admit(
         session_date=today,
         now=now,
-        max_age=manager.refusal_policy.max_nomination_age,
+        max_age=max_age or manager.refusal_policy.max_nomination_age,
     )
     if admission is not ScanBookAdmission.ACCEPTED:
         report.refusal_codes.append(admission.value)
@@ -1812,8 +2009,8 @@ def _load_scanbook(
             f"the scanbook for {today.isoformat()} failed logical-entry "
             f"admission ({admission.value}); no legacy symbol input is admitted"
         )
-        return None, admission.value
-    return book, "OK"
+        return None, admission.value, None
+    return book, "OK", None
 
 
 def _logical_entry_pass(
@@ -1830,6 +2027,9 @@ def _logical_entry_pass(
     max_pending_entries: int,
     today: dt.date,
     corridor: dict[str, Any],
+    scanbook_snapshot_store: ScanBookSnapshotStore | None = None,
+    scanbook_manifest: dict[str, str] | None = None,
+    scanbook_max_age_seconds: float | None = None,
 ) -> bool:
     """One pass of the logical-entry workflow (contract section 3, as landed).
 
@@ -1853,14 +2053,16 @@ def _logical_entry_pass(
     gate: SafetyGate = corridor["gate"]
     now: dt.datetime = corridor["now"]
     minimum_iv_rank: Decimal = corridor["minimum_iv_rank"]
+    request_budget = corridor.get("request_budget")
+    active_scan_writer = scan_writer
 
     def mark_superseded(entry: Any, reason: str) -> None:
         """Retire the entry's claimed ScanBook row, when a writer is wired.
         Best-effort bookkeeping: the entry's own ledger is authoritative."""
-        if scan_writer is None:
+        if active_scan_writer is None:
             return
         try:
-            scan_writer.mark_superseded(
+            active_scan_writer.mark_superseded(
                 entry.normalized_underlying, reason=reason, at=now
             )
         except Exception as exc:  # noqa: BLE001 - bookkeeping, never the workflow
@@ -1879,7 +2081,13 @@ def _logical_entry_pass(
         # for a fresh claim. A refusal skips the entry for THIS pass only --
         # the market may re-admit it before the review expires.
         underlying_contract, _metric = _regime_for(
-            ib, symbol, resolved_regime=resolved_regime, now=now, report=report
+            ib,
+            symbol,
+            resolved_regime=resolved_regime,
+            now=now,
+            report=report,
+            request_budget=request_budget,
+            budget_priority=Priority.AUTHORIZATION,
         )
         if underlying_contract is None:
             return "blocked"
@@ -1924,6 +2132,8 @@ def _logical_entry_pass(
             expiration=entry.expiration,
             right=right,
             strike_window=strike_window,
+            request_budget=request_budget,
+            budget_priority=Priority.AUTHORIZATION,
         )
 
         def review(packet: VerificationPacket) -> bool:
@@ -2021,7 +2231,13 @@ def _logical_entry_pass(
                 continue
 
             underlying_contract, _metric = _regime_for(
-                ib, symbol, resolved_regime=resolved_regime, now=now, report=report
+                ib,
+                symbol,
+                resolved_regime=resolved_regime,
+                now=now,
+                report=report,
+                request_budget=request_budget,
+                budget_priority=Priority.CANDIDATE_CONSTRUCTION,
             )
             if underlying_contract is None:
                 continue
@@ -2066,6 +2282,11 @@ def _logical_entry_pass(
             # and multiplier/exchange/trading_class come from qualification,
             # never from assumption.
             right = nomination_row.legs[0].right.strip().upper()[:1]
+            _acquire_request(
+                request_budget,
+                RequestKind.GENERAL,
+                priority=Priority.CANDIDATE_CONSTRUCTION,
+            )
             qualified = {
                 q.con_id: q
                 for q in qualify_strikes(
@@ -2120,7 +2341,11 @@ def _logical_entry_pass(
             )
             if provisional is None:
                 continue
-            margin = IBKRWhatIfAdapter(ib).what_if(provisional, observed_at=now)
+            margin = IBKRWhatIfAdapter(
+                ib,
+                budget=request_budget,
+                budget_priority=Priority.CANDIDATE_CONSTRUCTION,
+            ).what_if(provisional, observed_at=now)
 
             # The cheap first risk/governor pass, claim path only: a refusal
             # here means no reservation is taken and no review is ever filed.
@@ -2165,6 +2390,8 @@ def _logical_entry_pass(
                     expiration=nomination_row.expiration,
                     right=right,
                     strike_window=strike_window,
+                    request_budget=request_budget,
+                    budget_priority=Priority.CANDIDATE_CONSTRUCTION,
                 ),
             )
             report.governor = PortfolioGovernor(policy).evaluate(
@@ -2201,7 +2428,7 @@ def _logical_entry_pass(
                         nominated_at=row.evaluated_at,
                     ),
                     now=now,
-                    claim_writer=scan_writer,
+                    claim_writer=active_scan_writer,
                 )
             except StaleNominationError as exc:
                 report.blockers.append(f"claim {symbol}: {exc.message}")
@@ -2232,10 +2459,26 @@ def _logical_entry_pass(
     # -- (b) then claim at most one new nomination -------------------------
     book_status = "OK"
     if not transmitted:
-        book, book_status = _load_scanbook(
-            scanbook_root, today=today, now=now, manager=manager, report=report
+        book, book_status, admitted_scan_id = _load_scanbook(
+            scanbook_root,
+            today=today,
+            now=now,
+            manager=manager,
+            report=report,
+            snapshot_store=scanbook_snapshot_store,
+            snapshot_manifest=scanbook_manifest,
+            max_age=(
+                dt.timedelta(seconds=float(scanbook_max_age_seconds))
+                if scanbook_max_age_seconds is not None
+                else None
+            ),
         )
         if book is not None:
+            if (
+                admitted_scan_id is not None
+                and isinstance(scan_writer, ImmutableScanBookClaimWriter)
+            ):
+                active_scan_writer = scan_writer.for_snapshot(admitted_scan_id)
             claimed = claim_one(book)
             if claimed is not None:
                 service_entry(claimed)
@@ -2299,11 +2542,16 @@ def run_once(
     #: At most this many logical entries may sit pending verification before
     #: the pass stops claiming new nominations (contract section 3(b)).
     max_pending_entries: int = 3,
+    packet_ttl_seconds: float | None = None,
     execution_outbox: ExecutionOutbox | None = None,
     transmission_budget: TransmissionBudget | None = None,
     session_id: str | None = None,
     lease_nonce: str | None = None,
     tick_id: str | None = None,
+    scanbook_snapshot_store: ScanBookSnapshotStore | None = None,
+    scanbook_manifest: dict[str, str] | None = None,
+    scanbook_max_age_seconds: float | None = None,
+    request_budget: Any = None,
 ) -> RunReport:
     """Reconcile and manage positions, optionally running the entry pipeline.
 
@@ -2394,7 +2642,13 @@ def run_once(
 
     try:
         # -- 1. reconcile -------------------------------------------------
-        _reconcile(broker, store, now=now, report=report)
+        _reconcile(
+            broker,
+            store,
+            now=now,
+            report=report,
+            request_budget=request_budget,
+        )
 
         # -- 2. manage what is already open --------------------------------
         # Runs under EVERY reconciliation outcome, not just the good one: the
@@ -2496,6 +2750,29 @@ def run_once(
             report.refusal_codes.append(f"RUNNER_RECONCILIATION_{outcome.value}")
             return report
 
+        # A persistent worker is identified by the session/cycle seams below
+        # (or by the logical-entry/immutable-ScanBook composition).  It must
+        # never fall through to the legacy ``--symbol`` corridor when its
+        # reviewer dependencies are incomplete: that path constructs and
+        # prices a candidate before reaching its older verifier guard.  Keep
+        # reconciliation and management above this refusal so missing review
+        # infrastructure cannot trap an existing position, but stop before
+        # any opening candidate, claim, handoff, or transmission work.
+        production_entry = (
+            session_id is not None
+            or manager is not None
+            or scanbook_snapshot_store is not None
+        )
+        if production_entry and (verifier is None or approval_context is None):
+            report.blockers.append(
+                "entry refused: production FULL entry requires an independent "
+                "verifier gate and approval context; legacy candidate construction "
+                "is disabled"
+            )
+            report.refusal_codes.append("OPTIONS_VERIFIER_NOT_CONFIGURED")
+            report.entry_refusal_code = "OPTIONS_VERIFIER_NOT_CONFIGURED"
+            return report
+
         # -- 3. regime first, because its allocation scales the build --------
         # The IV metric is hoisted ahead of the candidate build so the tier
         # can be placed before sizing. Always classified, even in shadow: the
@@ -2510,6 +2787,30 @@ def run_once(
         # Everything the corridor needs that is common to every caller in
         # this pass. One dict, so the manager path and the --symbol path
         # cannot drift apart one keyword at a time.
+        packet_lifetime = (
+            dt.timedelta(seconds=float(packet_ttl_seconds))
+            if packet_ttl_seconds is not None
+            else None
+        )
+        if packet_lifetime is not None and packet_lifetime <= dt.timedelta(0):
+            report.blockers.append("entry refused: packet TTL must be positive")
+            report.refusal_codes.append("FAIL-APPROVAL-TTL")
+            report.entry_refusal_code = "FAIL-APPROVAL-TTL"
+            return report
+        if scanbook_max_age_seconds is not None and scanbook_max_age_seconds <= 0:
+            report.blockers.append("entry refused: ScanBook coverage SLA must be positive")
+            report.refusal_codes.append("FAIL-INCOMPLETE-COVERAGE")
+            report.entry_refusal_code = "FAIL-INCOMPLETE-COVERAGE"
+            return report
+
+        if scanbook_snapshot_store is not None and scanbook_writer is None:
+            scanbook_writer = ImmutableScanBookClaimWriter(
+                scanbook_snapshot_store,
+                ClaimLedger(scanbook_snapshot_store.root),
+                session_date=today,
+                owner_id=session_id or "runner",
+            )
+
         corridor_common: dict[str, Any] = dict(
             ib=ib,
             market_data=market_data,
@@ -2533,8 +2834,10 @@ def run_once(
             session_id=session_id,
             lease_nonce=lease_nonce,
             tick_id=tick_id,
+            packet_lifetime=packet_lifetime,
             reprice=reprice,
             report=report,
+            request_budget=request_budget,
         )
 
         # The session fence applies before both the logical-entry manager and
@@ -2571,6 +2874,9 @@ def run_once(
                     )
                 ),
                 scanbook_root=scanbook_root,
+                scanbook_snapshot_store=scanbook_snapshot_store,
+                scanbook_manifest=scanbook_manifest,
+                scanbook_max_age_seconds=scanbook_max_age_seconds,
                 broker=broker,
                 live_regime=live_regime,
                 resolved_regime=resolved_regime,
@@ -2585,7 +2891,13 @@ def run_once(
                 return report
 
         underlying_contract, iv_metric = _regime_for(
-            ib, symbol, resolved_regime=resolved_regime, now=now, report=report
+            ib,
+            symbol,
+            resolved_regime=resolved_regime,
+            now=now,
+            report=report,
+            request_budget=request_budget,
+            budget_priority=Priority.CANDIDATE_CONSTRUCTION,
         )
         if underlying_contract is None:
             return report
@@ -2623,6 +2935,7 @@ def run_once(
             report=report,
             underlying=underlying_contract,
             iv_metric=iv_metric,
+            request_budget=request_budget,
         )
         report.candidate = candidate
         if candidate is None:
@@ -2648,7 +2961,11 @@ def run_once(
             else:
                 report.refusal_codes.append("OPTIONS_IV_RANK_FILTER_BYPASSED")
 
-        margin = IBKRWhatIfAdapter(ib).what_if(candidate, observed_at=now)
+        margin = IBKRWhatIfAdapter(
+            ib,
+            budget=request_budget,
+            budget_priority=Priority.CANDIDATE_CONSTRUCTION,
+        ).what_if(candidate, observed_at=now)
 
         snapshot_state: PortfolioSnapshot | None = None
         if portfolio is not None:

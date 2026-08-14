@@ -19,6 +19,7 @@ from pathlib import Path
 
 from engine.paperday import (
     EXIT_STOP_DIRTY,
+    DEGRADED,
     EngineCommandResult,
     GATE_CLOSED,
     GATE_OPEN,
@@ -97,6 +98,23 @@ class TestRepeatedStop:
         assert gate is not None
         assert gate["entry_gate"] == GATE_CLOSED
         assert gate["state"] == STOPPED
+
+    def test_without_an_owned_lock_stop_does_not_cancel_working_orders(
+        self, tmp_path: Path
+    ) -> None:
+        h = harness(tmp_path)
+        write_gate(
+            h.paths,
+            entry_gate=GATE_OPEN,
+            state=READY,
+            session_id="orphaned-session",
+            now=NOW,
+        )
+
+        report = h.controller.stop()
+
+        assert not report.clean, report.render()
+        assert not any(call[0] == "options-cancel" for call in h.engine.calls)
 
 
 class TestPendingReviewDuringShutdown:
@@ -294,6 +312,8 @@ class TestReviewerSilentAtStop:
         self, tmp_path: Path
     ) -> None:
         h = harness(tmp_path, reviewer_answers=False, liveness_timeout=0.05)
+        start = h.controller.start()
+        assert start.state in {READY, DEGRADED}, start.render()
 
         report = h.controller.stop()
 
@@ -323,6 +343,8 @@ class TestWorkingEntryOrderAtStop:
 
     def test_working_entry_is_cancelled_armed(self, tmp_path: Path) -> None:
         h = harness(tmp_path)
+        start = h.controller.start()
+        assert start.state == READY, start.render()
         strategy_id = "123e4567-e89b-12d3-a456-426614174000"
         h.engine.results["options-positions"] = EngineCommandResult(
             0,

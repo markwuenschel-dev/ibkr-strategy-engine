@@ -155,6 +155,48 @@ class TestStaleLockRecovery:
         gate = read_gate(h.paths)
         assert gate is not None and gate["entry_gate"] == GATE_OPEN
 
+    def test_live_watcher_does_not_make_yesterday_lock_current(
+        self, tmp_path: Path
+    ) -> None:
+        h = harness(tmp_path)
+        old_session = "paperday-yesterday"
+        old_fence = "fence-yesterday"
+        watcher = h.processes.add(WATCHER_CMD)
+        _write_json_by_hand(
+            h.paths.lock,
+            {
+                "session_id": old_session,
+                "fencing_token": old_fence,
+                "session_date": "2026-07-31",
+                "started_at": "2026-07-31T09:30:00+00:00",
+            },
+        )
+        _write_json_by_hand(
+            h.paths.watcher_pid,
+            {
+                "pid": watcher,
+                "session_id": old_session,
+                "fencing_token": old_fence,
+            },
+        )
+        from engine.paperday import write_gate
+
+        write_gate(
+            h.paths,
+            entry_gate=GATE_OPEN,
+            state=READY,
+            session_id=old_session,
+            now=NOW.replace(day=31),
+            fencing_token=old_fence,
+        )
+
+        report = h.controller.start()
+
+        assert report.session_id != old_session, report.render()
+        assert report.already_running is False, report.render()
+        assert h.processes.alive(watcher), "the stale watcher must not be killed"
+        assert len(h.processes.spawned) == 1, report.render()
+
 
 class TestGrokUnavailable:
     """No verifier means no new opening risk -- and nothing else lost.

@@ -263,6 +263,7 @@ class TestStoppingDrainsBeforeAnythingTransmits:
     def _planted(self, h, tmp_path: Path, *, alive: bool) -> int:
         paths = SchedulerPaths(root=h.paths.root)
         paths.root.mkdir(parents=True, exist_ok=True)
+        _write_lock(h, "paperday-x", "fence-x")
         identity = SchedulerIdentity(session_id="paperday-x", nonce=NONCE)
         pid = h.processes.add(f"python run_scheduler.py {identity.needle}")
         if not alive:

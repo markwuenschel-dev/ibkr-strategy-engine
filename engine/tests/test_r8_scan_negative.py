@@ -11,7 +11,10 @@ from pathlib import Path
 
 import pytest
 
+from engine.options.catalog import CatalogEntry, CatalogSnapshot, UniverseCatalog
+from engine.options.observation_cache import FairRefreshQueue
 from engine.options.pacing import PacedRequestBudget, Priority, RequestKind
+from engine.options.pacing_ledger import PacingLedger
 from engine.options.universe import (
     CoverageSummary,
     NominatedLeg,
@@ -21,6 +24,7 @@ from engine.options.universe import (
     ScanBookRow,
     ScanState,
     StructureNomination,
+    _DurablePacingBudget,
 )
 
 
@@ -196,22 +200,71 @@ class TestPacingReserveControl:
 
 class TestScanScaleContractSkips:
     def test_catalog_mutation_mid_cycle_is_rejected(self) -> None:
-        _missing_contract(
-            ("engine.options.catalog", "engine.options.universe_data"),
-            ("CatalogSnapshot",),
+        entry = CatalogEntry(
+            symbol="AAA",
+            optionability=True,
+            sector="TEST",
+            correlation_group="TEST",
+            entry_eligible=True,
         )
-        pytest.fail("the catalog snapshot fixture adapter is not wired")
+        catalog = UniverseCatalog((entry,), version="catalog-v1")
+        snapshot = catalog.snapshot()
 
-    def test_refresh_queue_prevents_symbol_starvation(self) -> None:
-        _missing_contract(
-            ("engine.options.refresh", "engine.options.universe"),
-            ("RefreshLedger",),
-        )
-        pytest.fail("the refresh fairness fixture adapter is not wired")
+        assert isinstance(snapshot, CatalogSnapshot)
+        assert isinstance(snapshot.entries, tuple)
+        with pytest.raises(AttributeError):
+            snapshot.version = "catalog-v2"  # type: ignore[misc]
 
-    def test_deep_probe_reserves_estimated_request_cost(self) -> None:
-        _missing_contract(
-            ("engine.options.planner", "engine.options.universe"),
-            ("reserve_probe_cost",),
+        replacement = CatalogSnapshot(
+            version="catalog-v2",
+            source="test",
+            entries=(entry,),
         )
-        pytest.fail("the cost-bounded probe fixture adapter is not wired")
+        assert snapshot.catalog_hash != replacement.catalog_hash
+        assert catalog.snapshot() is snapshot
+
+    def test_refresh_queue_prevents_symbol_starvation(self, tmp_path: Path) -> None:
+        queue = FairRefreshQueue(tmp_path / "refresh.sqlite3")
+        symbols = ("AAA", "BBB", "CCC", "DDD", "EEE", "FFF", "GGG", "HHH")
+        queue.seed(
+            symbols,
+            catalog_version="catalog-v1",
+            configuration_version="config-v1",
+            now=NOW,
+            interval=dt.timedelta(minutes=30),
+        )
+
+        first = queue.select_due(
+            now=NOW,
+            limit=4,
+            catalog_version="catalog-v1",
+            configuration_version="config-v1",
+        )
+        assert {state.symbol for state in first} == set(symbols[:4])
+        for state in first:
+            queue.mark_phase_one(
+                state.symbol,
+                observed_at=NOW,
+                next_due_at=NOW + dt.timedelta(minutes=30),
+                previous_rank=100.0,
+            )
+
+        second = queue.select_due(
+            now=NOW,
+            limit=4,
+            catalog_version="catalog-v1",
+            configuration_version="config-v1",
+        )
+        assert {state.symbol for state in second} == set(symbols[4:])
+
+    def test_deep_probe_reserves_estimated_request_cost(self, tmp_path: Path) -> None:
+        ledger = PacingLedger(
+            tmp_path / "pacing.sqlite3",
+            general_per_window=5,
+            management_reserve_fraction=0.20,
+        )
+        budget = _DurablePacingBudget(ledger, owner_id="scan", now=NOW)
+
+        assert budget.prepare_phase2("AAA", estimated_cost=4)
+        assert not budget.prepare_phase2("BBB", estimated_cost=1)
+        assert ledger.snapshot(RequestKind.GENERAL, now=NOW).outstanding == 4

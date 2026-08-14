@@ -42,7 +42,19 @@ FAILURE_CODES = (
     "FAIL-STALE-PAPERDAY-AUTHORITY",
     "FAIL-UNMATCHED-TICK",
     "FAIL-RECOVERY-BLOCKED",
+    "FAIL-EXECUTION-OUTBOX",
+    "FAIL-BROKER-AMBIGUOUS",
+    "FAIL-APPROVAL-REVISION-STALE",
+    "FAIL-APPROVAL-TTL",
     "FAIL-LEASE-MISSING",
+    "FAIL-DUPLICATE-SAGA",
+    "FAIL-REPRICE-BUDGET",
+    "FAIL-CATALOG-HASH",
+    "FAIL-INCOMPLETE-COVERAGE",
+    "FAIL-SCAN-CLAIM-RACE",
+    "FAIL-REFRESH-STARVATION",
+    "FAIL-UNSHARED-PACING",
+    "FAIL-UNBOUNDED-BROKER-LOAD",
     "FAIL-CADENCE-DRIFT",
     "FAIL-MISSED-TICK-CATCHUP",
     "FAIL-UNAUTHORIZED-ENTRY",
@@ -273,7 +285,30 @@ def parse_autotrader_policy(
             hint="the unattended path is one persistent broker-owning worker",
         )
     for token in command:
-        if token in {"--mode", "--mandate", "--enable-entry", "--policy-hash"}:
+        if token in {
+            "--mode",
+            "--mandate",
+            "--enable-entry",
+            "--policy-hash",
+            # The scheduler supplies these from the bytes it verified.  A
+            # policy-owned copy would create two authorities and, for a
+            # self-referential policy hash, an impossible artifact.
+            "--schedule-config",
+            "--schedule-config-sha256",
+            "--state-dir",
+            # Scheduler identity is runtime authority, not policy input.  If
+            # a policy could pin it, a copied command could impersonate a
+            # different paper-day lease while keeping the same policy hash.
+            "--scheduler-session",
+        } or any(
+            token.startswith(prefix)
+            for prefix in (
+                "--schedule-config=",
+                "--schedule-config-sha256=",
+                "--state-dir=",
+                "--scheduler-session=",
+            )
+        ):
             raise ConfigError(
                 f"worker_command cannot override policy through {token}",
                 hint="mode and mandate belong to the hash-pinned policy artifact",
@@ -293,6 +328,11 @@ def parse_autotrader_policy(
     catalog = _catalog_from(record["catalog"])
     discovery = _discovery_from(record["discovery"])
     entry = _entry_from(record["entry"])
+    if entry.max_new_openings_per_pass != 1:
+        raise ConfigError(
+            "entry.max_new_openings_per_pass must be exactly 1",
+            hint="the unattended worker has one-opening-per-eligible-pass policy",
+        )
     pacing = _pacing_from(record["pacing_reserve"])
     if policy_hash is not None:
         _digest(policy_hash, "policy_hash")

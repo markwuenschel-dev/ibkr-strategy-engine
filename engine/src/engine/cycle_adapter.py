@@ -11,14 +11,14 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .autocycle import (
     AutoCycleConfig,
-    CycleError,
     CycleMode,
     CyclePhases,
     FixedRateSchedule,
@@ -46,19 +46,45 @@ from .options.adapters import (
     IBKRLiveMarketDataAdapter,
     IBKRPortfolioStateAdapter,
     IBKRVolatilityHistoryAdapter,
+    read_open_orders,
 )
 from .options.catalog import UniverseCatalog
 from .options.execution_outbox import ExecutionOutbox
-from .options.ivstore import IVStore
 from .options.freshness import SessionMetadataStore
-from .options.logical import LogicalEntryManager, LogicalEntryStore
+from .options.logical import (
+    DEFAULT_REFUSAL_POLICY,
+    LogicalEntryManager,
+    LogicalEntryStore,
+)
 from .options.order_outbox import TransmissionBudget
-from .options.pacing import PacedRequestBudget, Priority
+from .options.pacing import (
+    PacedRequestBudget,
+    Priority,
+    RequestKind,
+    SharedPacingBudget,
+)
 from .options.pacing_ledger import PacingLedger
+from .options.observation_cache import SQLiteObservationCache
 from .options.policy import RiskPolicy
 from .options.regime import VolatilityRegimePolicy
-from .options.runner import EntryMode, EntryPricing, run_once
-from .options.universe import UniverseScanConfig, penalize_on_broker_error, run_universe_pass
+from .options.runner import EntryMode, run_once
+from .options.scan_receipts import ScanReceiptStore
+from .options.scanbook_store import ScanBookSnapshotStore
+from .options.universe import (
+    UniverseScanConfig,
+    penalize_on_broker_error,
+    run_catalog_universe_pass,
+)
+from .paperday import effective_configuration_fingerprint
+from .scheduler import SchedulerIdentity, SchedulerPaths, announce_ready
+
+
+def _sha256_json(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode(
+            "utf-8"
+        )
+    ).hexdigest()
 
 
 def _json(path: Path) -> dict[str, Any] | None:
@@ -95,11 +121,6 @@ def _entry_bounds(policy: AutotraderPolicy) -> tuple[dt.time, dt.time]:
 def _identity(state_dir: Path, args: Any) -> tuple[str, str]:
     lock = _json(state_dir / "paperday" / "session.lock") or {}
     record = _json(state_dir / "paperday" / "scheduler.pid") or {}
-    raw = getattr(args, "scheduler_session", None)
-    if raw:
-        session_id, separator, nonce = str(raw).partition(":")
-        if separator and session_id and nonce:
-            return session_id, nonce
     session_id = str(lock.get("session_id") or record.get("session_id") or "").strip()
     nonce = str(record.get("nonce") or lock.get("fencing_token") or "").strip()
     if not session_id or not nonce:
@@ -107,6 +128,29 @@ def _identity(state_dir: Path, args: Any) -> tuple[str, str]:
             "options-cycle cannot establish a paper-day session identity",
             hint="start it under PaperDayController so session lock and scheduler nonce exist",
         )
+    raw = getattr(args, "scheduler_session", None)
+    if raw:
+        raw_session, separator, raw_nonce = str(raw).partition(":")
+        if (
+            not separator
+            or not raw_session.strip()
+            or not raw_nonce.strip()
+            or ":" in raw_nonce
+        ):
+            raise ConfigError(
+                "FAIL-STALE-PAPERDAY-AUTHORITY: malformed --scheduler-session",
+                hint="the scheduler identity must be '<session>:<lease nonce>'",
+            )
+        supplied = (raw_session.strip(), raw_nonce.strip())
+        live = (
+            str(lock.get("session_id") or record.get("session_id") or "").strip(),
+            str(record.get("nonce") or lock.get("fencing_token") or "").strip(),
+        )
+        if supplied != live:
+            raise ConfigError(
+                "FAIL-STALE-PAPERDAY-AUTHORITY: scheduler identity does not match live paper-day lease",
+                hint="do not override the session identity; restart under the current controller lease",
+            )
     return session_id, nonce
 
 
@@ -150,7 +194,7 @@ class _CycleRuntime:
     strategy_policy: RiskPolicy
     regime_policy: VolatilityRegimePolicy
     catalog: UniverseCatalog
-    budget: PacedRequestBudget
+    budget: Any
     pacing_ledger: PacingLedger
     manager: LogicalEntryManager | None
     verifier: Any
@@ -159,22 +203,34 @@ class _CycleRuntime:
     session_lease: Callable[[], str | None]
     execution_outbox: ExecutionOutbox
     transmission_budget: TransmissionBudget
+    observation_cache: SQLiteObservationCache
+    scanbook_store: ScanBookSnapshotStore
+    scan_receipts: ScanReceiptStore
 
     def _adapters(self, broker: Any, *, priority: Priority) -> tuple[Any, Any, Any]:
-        contract_data = IBKRContractDataAdapter(broker.ib)
+        active_budget = self.budget
+        contract_data = IBKRContractDataAdapter(
+            broker.ib,
+            budget=active_budget,
+            budget_priority=priority,
+        )
         history = IBKRVolatilityHistoryAdapter(
             broker.ib,
             contract_data,
-            budget=self.budget,
+            budget=active_budget,
             budget_priority=Priority.DISCOVERY,
         )
         market = IBKRLiveMarketDataAdapter(
             broker.ib,
             requested_type=1,
-            budget=self.budget,
+            budget=active_budget,
             budget_priority=priority,
         )
-        portfolio = IBKRPortfolioStateAdapter(broker)
+        portfolio = IBKRPortfolioStateAdapter(
+            broker,
+            budget=active_budget,
+            budget_priority=priority,
+        )
         return history, market, portfolio
 
     @staticmethod
@@ -210,79 +266,213 @@ class _CycleRuntime:
             session_id=context.cycle.session_id,
             lease_nonce=context.cycle.lease_nonce,
             tick_id=context.cycle.tick_id,
+            request_budget=self.budget,
         )
         return self._report(report)
 
-    def discovery(self, context: PhaseContext) -> Mapping[str, Any]:
-        # Reserve a coarse discovery floor in the durable ledger before the
-        # scanner can spend the in-memory socket budget.  The scanner itself
-        # records exact per-request pacing; this reservation is the crash-safe
-        # cross-process guard used by future shards.
-        reservation = self.pacing_ledger.reserve(
-            __import__("engine.options.pacing", fromlist=["RequestKind"]).RequestKind.HISTORICAL,
-            cost=min(self.policy.discovery.refresh_limit, 1),
-            priority=Priority.DISCOVERY,
-            owner_id=context.cycle.session_id,
-            request_key=f"{context.cycle.tick_id}:discovery",
-        )
-        if reservation is None:
-            return {"outcome": "DEFERRED_PACING", "failure_code": "FAIL-UNSHARED-PACING"}
-        try:
-            scan_config = UniverseScanConfig.from_env(
-                refresh_limit=self.policy.discovery.refresh_limit,
-                phase2_limit=self.policy.discovery.phase2_limit,
-            )
-            extras = self.catalog.entries
-            def on_error(req_id: int, code: int, message: str, *_: Any) -> None:
-                penalize_on_broker_error(self.budget, code)
+    def reconcile(self, context: PhaseContext) -> Mapping[str, Any]:
+        """Resolve startup ambiguity before the worker can open risk.
 
-            ib = context.broker.ib
-            ib.errorEvent += on_error
-            try:
-                history, market, _portfolio = self._adapters(
-                    context.broker, priority=Priority.DISCOVERY
-                )
-                book = run_universe_pass(
-                    universe=extras,
-                    session_date=context.cycle.session_date,
-                    iv_store=IVStore(self.config.state_dir / "universe" / "iv"),
-                    metadata_store=SessionMetadataStore(
-                        self.config.state_dir / "universe" / "metadata"
-                    ),
-                    budget=self.budget,
-                    policy=self.strategy_policy,
-                    regime_policy=self.regime_policy,
-                    config=scan_config,
-                    volatility_history=history,
-                    contract_data=IBKRContractDataAdapter(ib),
-                    market_data=market,
-                )
-            finally:
-                with contextlib.suppress(Exception):
-                    ib.errorEvent -= on_error
-            path = book.write(self.config.state_dir)
-            self.pacing_ledger.commit(reservation.reservation_id)
+        This path is read-only with respect to the broker.  It proves the
+        position journal agrees with a complete broker positions/open-orders
+        observation, quarantines any unfinished read-only scan, and refuses to
+        clear the worker's tick fence while an execution outbox intent remains
+        unresolved.
+        """
+
+        unresolved = self.execution_outbox.unresolved()
+        if unresolved:
             return {
-                "outcome": "SCAN_COMPLETED",
-                "scanbook": str(path),
-                "symbols": len(book.rows),
-                "candidates": [row.symbol for row in book.candidates()],
-                "catalog_hash": self.catalog.catalog_hash,
+                "outcome": "RECOVERY_REQUIRED",
+                "failure_code": "FAIL-BROKER-AMBIGUOUS",
+                "unresolved_execution_sagas": [item.saga_id for item in unresolved],
             }
-        except Exception:
-            with contextlib.suppress(Exception):
-                self.pacing_ledger.mark_unknown(reservation.reservation_id)
-            raise
+        try:
+            from .options.positions import PositionStore, ReconciliationOutcome
+
+            positions = PositionStore(self.config.state_dir / "positions.jsonl")
+            self.budget.acquire(
+                RequestKind.GENERAL,
+                priority=Priority.EXITS_MANAGEMENT,
+            )
+            broker_positions = context.broker.positions()
+            broker_orders = read_open_orders(
+                context.broker.ib,
+                budget=self.budget,
+                budget_priority=Priority.WORKING_ORDERS,
+            )
+            if broker_orders is None:
+                return {
+                    "outcome": "RECOVERY_REQUIRED",
+                    "failure_code": "FAIL-BROKER-AMBIGUOUS",
+                    "detail": "broker did not provide a complete open-order observation",
+                }
+            report = positions.reconcile_against_broker(
+                broker_positions,
+                checked_at=context.cycle.started_at,
+                broker_orders=broker_orders,
+            )
+        except Exception as exc:  # noqa: BLE001 - recovery must fail closed
+            return {
+                "outcome": "RECOVERY_REQUIRED",
+                "failure_code": "FAIL-BROKER-AMBIGUOUS",
+                "detail": f"reconciliation raised {type(exc).__name__}: {exc}",
+            }
+        outcome = ReconciliationOutcome.for_report(report)
+        if outcome is not ReconciliationOutcome.RECONCILED:
+            return {
+                "outcome": "RECOVERY_REQUIRED",
+                "failure_code": "FAIL-RECOVERY-BLOCKED",
+                "reconciliation": report.to_record(),
+            }
+
+        unmatched_scans = self.scan_receipts.unmatched()
+        foreign_scans = [
+            state
+            for state in unmatched_scans
+            if state.session_id != context.cycle.session_id
+        ]
+        if foreign_scans:
+            return {
+                "outcome": "RECOVERY_REQUIRED",
+                "failure_code": "FAIL-RECOVERY-BLOCKED",
+                "detail": (
+                    "unmatched scan receipts belong to a prior session authority; "
+                    "operator reconciliation is required before this session can clear recovery"
+                ),
+                "foreign_scans": [state.scan_id for state in foreign_scans],
+            }
+
+        scans_reconciled: list[str] = []
+        for state in unmatched_scans:
+            receipts = self.scan_receipts.read(state.scan_id)
+            first = receipts[0] if receipts else None
+            self.scan_receipts.abort(
+                session_id=state.session_id,
+                scan_id=state.scan_id,
+                recorded_at=context.cycle.started_at,
+                reason="startup recovery: read-only scan had no terminal receipt",
+                reconciled=True,
+                tick_id=first.tick_id if first else None,
+                attempt_id=first.attempt_id if first else None,
+            )
+            scans_reconciled.append(state.scan_id)
+        return {
+            "outcome": "RECOVERY_CLEARED",
+            "recovery_cleared": True,
+            "reason": "broker journal/order/position reconciliation agreed",
+            "reconciliation": report.to_record(),
+            "scans_reconciled": scans_reconciled,
+        }
+
+    def discovery(self, context: PhaseContext) -> Mapping[str, Any]:
+        return self._scan(context, refresh_enabled=True)
 
     def probe(self, context: PhaseContext) -> Mapping[str, Any]:
-        # The legacy scanner combines chain probing with discovery.  I2 may
-        # expose a split probe function; until then this explicit receipt keeps
-        # the 10-minute job visible without pretending a second full-universe
-        # scan is bounded.
+        # A probe reuses the indexed breadth cache and performs only the
+        # bounded phase-two shortlist.  No stale cache is promoted: if the
+        # discovery ring has not produced fresh slow observations, this
+        # publication remains diagnostic-only and entry admission refuses it.
+        return self._scan(context, refresh_enabled=False)
+
+    def _scan_manifest(self, scan_config: UniverseScanConfig) -> dict[str, str]:
+        behavior_hash = _sha256_json(
+            {
+                "manifest_version": "scan-behavior/1",
+                "catalog_version": self.catalog.version,
+                "scan": scan_config.to_record(),
+                "risk": self.strategy_policy.to_record(),
+                "regime": self.regime_policy.to_record(),
+            }
+        )
         return {
-            "outcome": "PROBE_DEFERRED_TO_DISCOVERY",
-            "phase2_limit": self.policy.discovery.phase2_limit,
-            "detail": "legacy scanner has no independent candidate-probe seam yet",
+            "catalog_hash": self.catalog.catalog_hash,
+            "catalog_version": self.catalog.version,
+            "policy_hash": self.policy.policy_hash or "",
+            "calendar_hash": _sha256_json(
+                self.policy.fingerprint_record()["calendar"]
+            ),
+            "config_hash": _sha256_json(
+                {
+                    "scan": scan_config.to_record(),
+                    "coverage_sla_seconds": self.policy.discovery.coverage_sla_seconds,
+                }
+            ),
+            "behavior_hash": behavior_hash,
+        }
+
+    def _scan(
+        self, context: PhaseContext, *, refresh_enabled: bool
+    ) -> Mapping[str, Any]:
+        scan_config = UniverseScanConfig.from_env(
+            refresh_limit=self.policy.discovery.refresh_limit,
+            phase2_limit=self.policy.discovery.phase2_limit,
+            phase2_request_cost=6,
+        )
+
+        def on_error(req_id: int, code: int, message: str, *_: Any) -> None:
+            kind = penalize_on_broker_error(self.budget, code)
+            if kind is not None and not hasattr(self.budget, "ledger"):
+                # The in-memory bucket controls this connection immediately;
+                # the durable ledger carries the broker's penalty across a
+                # restart and is the authority used by the discovery ring.
+                self.pacing_ledger.penalize(kind, now=context.cycle.started_at)
+
+        ib = context.broker.ib
+        ib.errorEvent += on_error
+        try:
+            history, market, _portfolio = self._adapters(
+                context.broker, priority=Priority.DISCOVERY
+            )
+            manifest = self._scan_manifest(scan_config)
+            result = run_catalog_universe_pass(
+                catalog=self.catalog,
+                observation_cache=self.observation_cache,
+                refresh_queue=self.observation_cache.refresh_queue,
+                pacing_ledger=self.pacing_ledger,
+                snapshot_store=self.scanbook_store,
+                receipt_store=self.scan_receipts,
+                session_id=context.cycle.session_id,
+                session_date=context.cycle.session_date,
+                policy_hash=manifest["policy_hash"],
+                calendar_hash=manifest["calendar_hash"],
+                config_hash=manifest["config_hash"],
+                policy=self.strategy_policy,
+                regime_policy=self.regime_policy,
+                config=scan_config,
+                metadata_store=SessionMetadataStore(
+                    self.config.state_dir / "universe" / "metadata"
+                ),
+                volatility_history=history,
+                contract_data=IBKRContractDataAdapter(
+                    ib,
+                    budget=self.budget,
+                    budget_priority=Priority.DISCOVERY,
+                ),
+                market_data=market,
+                now=context.cycle.started_at,
+                scan_id=f"{context.cycle.session_id}:{context.cycle.tick_id}:{context.cycle.attempt_id}",
+                tick_id=context.cycle.tick_id,
+                attempt_id=context.cycle.attempt_id,
+                refresh_interval=dt.timedelta(
+                    seconds=self.policy.cadences.discovery_seconds
+                ),
+                refresh_enabled=refresh_enabled,
+            )
+        finally:
+            with contextlib.suppress(Exception):
+                ib.errorEvent -= on_error
+        return {
+            "outcome": "SCAN_COMPLETED" if result.complete else "SCAN_DIAGNOSTIC_ONLY",
+            "scan_id": result.scan_id,
+            "symbols": result.snapshot.expected_symbols,
+            "evaluated": result.snapshot.evaluated_symbols,
+            "deferred": result.snapshot.deferred_symbols,
+            "unavailable": result.snapshot.unavailable_symbols,
+            "candidates": [row.symbol for row in result.book.candidates()],
+            "catalog_hash": result.catalog_hash,
+            "coverage": result.snapshot.coverage.value,
+            "refresh_enabled": refresh_enabled,
         }
 
     def entry(self, context: PhaseContext) -> Mapping[str, Any]:
@@ -292,6 +482,22 @@ class _CycleRuntime:
                 "claims": 0,
                 "review_requests": 0,
                 "transmissions": 0,
+                "new_openings": 0,
+            }
+        # FULL is never allowed to fall through to the legacy candidate
+        # corridor when the reviewer/verifier composition is incomplete.  A
+        # persistent worker must fail before construction, broker quotes, or
+        # claims; otherwise a missing reviewer looks like a harmless setup
+        # omission while still doing entry work.
+        if self.manager is None or self.verifier is None or self.approval_context is None:
+            return {
+                "outcome": "ENTRY_BLOCKED",
+                "failure_code": "FAIL-UNAUTHORIZED-ENTRY",
+                "detail": "FULL entry requires a live verifier, approval context, and logical-entry manager",
+                "claims": 0,
+                "review_requests": 0,
+                "transmissions": 0,
+                "new_openings": 0,
             }
         _history, market, portfolio = self._adapters(
             context.broker, priority=Priority.AUTHORIZATION
@@ -318,9 +524,20 @@ class _CycleRuntime:
             max_pending_entries=self.policy.entry.max_pending_entries,
             execution_outbox=self.execution_outbox,
             transmission_budget=self.transmission_budget,
+            packet_ttl_seconds=self.policy.entry.packet_ttl_seconds,
+            scanbook_max_age_seconds=self.policy.discovery.coverage_sla_seconds,
+            scanbook_snapshot_store=self.scanbook_store,
+            scanbook_manifest=self._scan_manifest(
+                UniverseScanConfig.from_env(
+                    refresh_limit=self.policy.discovery.refresh_limit,
+                    phase2_limit=self.policy.discovery.phase2_limit,
+                    phase2_request_cost=6,
+                )
+            ),
             session_id=context.cycle.session_id,
             lease_nonce=context.cycle.lease_nonce,
             tick_id=context.cycle.tick_id,
+            request_budget=self.budget,
         )
         return self._report(report)
 
@@ -384,16 +601,25 @@ def run_options_cycle(
     regime_policy = VolatilityRegimePolicy.from_env()
 
     with broker_factory(config, journal) as broker:
-        budget = PacedRequestBudget(
-            sleeper=broker.ib.sleep,
-            management_reserve_fraction=policy.pacing_reserve.management_fraction,
-        )
-        setattr(broker, "pacing", budget)
         pacing_ledger = PacingLedger(
             config.state_dir / "pacing.sqlite3",
             management_reserve_fraction=policy.pacing_reserve.management_fraction,
+            discovery_fraction=policy.pacing_reserve.discovery_fraction,
+            minimum_management_requests=policy.pacing_reserve.minimum_management_requests,
             clock=clock,
         )
+        budget = SharedPacingBudget(
+            PacedRequestBudget(
+                sleeper=broker.ib.sleep,
+                management_reserve_fraction=policy.pacing_reserve.management_fraction,
+                discovery_fraction=policy.pacing_reserve.discovery_fraction,
+                minimum_management_requests=policy.pacing_reserve.minimum_management_requests,
+            ),
+            pacing_ledger,
+            owner_id=f"{session_id}:{lease_nonce}",
+            clock=pacing_ledger.clock,
+        )
+        setattr(broker, "pacing", budget)
         from .cli import _paper_day_preflight, _verifier_for
 
         verifier, approval_context = _verifier_for(config, strategy_policy)
@@ -402,6 +628,34 @@ def run_options_cycle(
             manager = LogicalEntryManager(
                 store=LogicalEntryStore(config.state_dir / "logical_entries.jsonl"),
                 gate=verifier,
+                clock=clock,
+                refusal_policy=replace(
+                    DEFAULT_REFUSAL_POLICY,
+                    claimed_max_age=dt.timedelta(
+                        seconds=policy.entry.review_ttl_seconds
+                    ),
+                ),
+            )
+        if approval_context is not None:
+            # The legacy ApprovalContext already binds engine/risk config. Add
+            # the two operator artifacts that only this worker can know so a
+            # handoff cannot survive a policy or catalog replacement.
+            approval_context = replace(
+                approval_context,
+                configuration_fingerprint=effective_configuration_fingerprint(
+                    approval_context.configuration_fingerprint,
+                    policy_sha256=(
+                        policy.policy_hash or args.schedule_config_sha256.lower()
+                    ),
+                    catalog_sha256=policy.catalog.sha256,
+                    config_sha256=str(
+                        (
+                            _json(config.state_dir / "paperday" / "gate.json")
+                            or {}
+                        ).get("config_sha256")
+                        or ""
+                    ),
+                ),
             )
         expected_fingerprint = (
             approval_context.configuration_fingerprint if approval_context is not None else None
@@ -414,15 +668,31 @@ def run_options_cycle(
             lock = _json(config.state_dir / "paperday" / "session.lock") or {}
             if lock.get("session_id") != session_id:
                 return "FAIL-STALE-PAPERDAY-AUTHORITY: session lock identity changed"
+            scheduler_record = _json(config.state_dir / "paperday" / "scheduler.pid") or {}
+            if (
+                scheduler_record.get("session_id") != session_id
+                or scheduler_record.get("nonce") != lease_nonce
+            ):
+                return (
+                    "FAIL-STALE-PAPERDAY-AUTHORITY: scheduler lease nonce or "
+                    "session identity changed"
+                )
             gate_record = _json(config.state_dir / "paperday" / "gate.json") or {}
-            if gate_record.get("policy_sha256") not in {
-                policy.policy_hash,
-                args.schedule_config_sha256.lower(),
-            }:
+            if gate_record.get("policy_sha256") != args.schedule_config_sha256.lower():
                 return "FAIL-STALE-PAPERDAY-AUTHORITY: policy hash changed"
             if gate_record.get("catalog_sha256") != policy.catalog.sha256:
                 return "FAIL-CATALOG-HASH: paper-day catalog authority changed"
-            return entry_preflight(armed=True)
+            authority = entry_preflight(armed=True)
+            if authority:
+                return authority
+            return None
+
+        def heartbeat() -> None:
+            announce_ready(
+                SchedulerPaths(root=config.state_dir / "paperday"),
+                SchedulerIdentity(session_id=session_id, nonce=lease_nonce),
+                now=(clock or (lambda: dt.datetime.now(dt.timezone.utc)))(),
+            )
 
         runtime = _CycleRuntime(
             config=config,
@@ -446,6 +716,11 @@ def run_options_cycle(
                 journal=journal,
                 now=now,
             ),
+            observation_cache=SQLiteObservationCache(
+                config.state_dir / "universe" / "observations.sqlite3"
+            ),
+            scanbook_store=ScanBookSnapshotStore(config.state_dir / "universe"),
+            scan_receipts=ScanReceiptStore(config.state_dir / "universe"),
         )
         receipts = ReceiptStore(config.state_dir / "autocycle")
         schedule = FixedRateSchedule(
@@ -457,7 +732,28 @@ def run_options_cycle(
                 JobKind.PROBE: int(policy.cadences.probe_seconds),
                 JobKind.ENTRY: int(policy.cadences.entry_seconds),
             },
+            session_id=session_id,
+            lease_nonce=lease_nonce,
+            policy_hash=policy.policy_hash or args.schedule_config_sha256.lower(),
+            catalog_hash=policy.catalog.sha256,
         )
+        def stop_requested() -> bool:
+            if (config.state_dir / "paperday" / "quiesce").exists():
+                return True
+            lock = _json(config.state_dir / "paperday" / "session.lock") or {}
+            if lock.get("session_id") != session_id:
+                return True
+            scheduler_record = _json(config.state_dir / "paperday" / "scheduler.pid")
+            if scheduler_record is None:
+                return True
+            return bool(
+                scheduler_record is not None
+                and (
+                    scheduler_record.get("session_id") != session_id
+                    or scheduler_record.get("nonce") != lease_nonce
+                )
+            )
+
         worker = OptionsCycleWorker(
             config=cycle_config,
             session_id=session_id,
@@ -468,17 +764,18 @@ def run_options_cycle(
                 discovery=runtime.discovery,
                 probe=runtime.probe,
                 entry=runtime.entry,
+                reconcile=runtime.reconcile,
             ),
             receipts=receipts,
             schedule=schedule,
             clock=clock,
             sleeper=getattr(broker.ib, "sleep", None) or __import__("time").sleep,
-            stop_requested=lambda: (
-                (config.state_dir / "paperday" / "quiesce").exists()
-                or (_json(config.state_dir / "paperday" / "session.lock") or {}).get("session_id")
-                != session_id
-            ),
+            stop_requested=stop_requested,
             job_allowed=lambda job, moment: _window_allowed(policy, job, moment),
+            heartbeat=heartbeat,
+            recovery_required=lambda: bool(runtime.scan_receipts.unmatched())
+            or bool(runtime.execution_outbox.unresolved())
+            or schedule.unresolved(),
         )
         worker.run_forever(
             arm=bool(getattr(args, "arm", False) and policy.mode == ARMED),

@@ -10,7 +10,12 @@ import pytest
 
 from engine.errors import EXIT_OK, ConfigError
 from engine.runtime import EngineCommandRunner
-from engine.scheduler import SchedulerIdentity, SchedulerPaths, TickOutcome
+from engine.scheduler import (
+    SchedulerIdentity,
+    SchedulerPaths,
+    TickOutcome,
+    adopt_or_spawn,
+)
 from engine.scheduler_bootstrap import (
     MISSED_TICK_POLICY,
     POLICY_SCHEMA,
@@ -19,7 +24,14 @@ from engine.scheduler_bootstrap import (
     load_scheduler_policy,
 )
 import engine.scheduler_main as scheduler_main
-from scheduler_support import FakeClock, FakeEngine, NOW, read_receipts, write_lock
+from scheduler_support import (
+    FakeClock,
+    FakeEngine,
+    FakeProcesses,
+    NOW,
+    read_receipts,
+    write_lock,
+)
 
 
 SESSION_ID = "paperday-20260813-bootstrap"
@@ -221,6 +233,28 @@ class TestSchedulerPolicyLoading:
 
 
 class TestSchedulerLoopFromBootstrap:
+    def test_controller_spec_normalizes_relative_entry_paths_to_absolute(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config, digest = write_policy(tmp_path, policy_record())
+        entrypoint = tmp_path / "scheduler_main.py"
+        entrypoint.write_text("# test entrypoint\n", encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+
+        spec = build_scheduler_spec(
+            schedule_config=Path(config.name),
+            schedule_config_sha256=digest,
+            state_dir=Path("state"),
+            entry_script=Path(entrypoint.name),
+        )
+
+        assert spec.entry_script == entrypoint.resolve()
+        assert spec.entry_args == (
+            f"--schedule-config={config.resolve()}",
+            f"--schedule-config-sha256={digest}",
+            f"--state-dir={(tmp_path / 'state').resolve()}",
+        )
+
     def test_controller_spec_uses_the_pinned_policy_and_real_entrypoint(
         self, tmp_path: Path
     ) -> None:
@@ -318,3 +352,63 @@ class TestSchedulerMain:
         assert seen["schedule_config"] == config
         assert seen["schedule_config_sha256"] == digest
         assert seen["state_dir"] == state_dir
+
+    def test_main_accepts_the_exact_supervisor_envelope(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config, digest = write_policy(tmp_path, policy_record())
+        state_dir = tmp_path / "state"
+        entrypoint = tmp_path / "scheduler_main.py"
+        entrypoint.write_text("# fixture\n", encoding="utf-8")
+        spec = build_scheduler_spec(
+            schedule_config=config,
+            schedule_config_sha256=digest,
+            state_dir=state_dir,
+            entry_script=entrypoint,
+        )
+        ran: list[bool] = []
+
+        class FakeLoop:
+            cadence_seconds = spec.cadence_seconds
+            command = spec.command
+
+            def run(self) -> None:
+                ran.append(True)
+
+        monkeypatch.setattr(
+            scheduler_main,
+            "build_scheduler_loop",
+            lambda **_kwargs: FakeLoop(),
+        )
+        scheduler_paths = SchedulerPaths(root=state_dir / "paperday")
+        write_lock(scheduler_paths)
+        clock = FakeClock()
+        processes = FakeProcesses(announce_paths=scheduler_paths)
+        pid, _detail = adopt_or_spawn(
+            processes=processes,
+            paths=scheduler_paths,
+            identity=identity(),
+            spec=spec,
+            cwd=tmp_path,
+            env={},
+            clock=clock,
+            sleep=clock.sleep,
+            python="python",
+            monotonic=clock.monotonic,
+            ready_timeout=2.0,
+            ready_poll=0.5,
+        )
+        assert pid is not None
+        spawned = processes.spawned[0]
+        assert spawned[:2] == ["python", str(spec.entry_script)]
+        # This is the exact suffix assembled by adopt_or_spawn, including the
+        # supervisor envelope separator and policy-derived worker command.
+        argv = spawned[2:]
+
+        assert scheduler_main.main(argv) == EXIT_OK
+        assert ran == [True]
+
+        ran.clear()
+        monkeypatch.setattr(scheduler_main.sys, "argv", ["engine-scheduler", *argv])
+        assert scheduler_main.main() == EXIT_OK
+        assert ran == [True]

@@ -36,6 +36,7 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import errno
+import hashlib
 import json
 import os
 import platform
@@ -66,6 +67,7 @@ __all__ = [
     "StatusReport",
     "PaperDayController",
     "entry_gate_preflight",
+    "effective_configuration_fingerprint",
     "READY",
     "DEGRADED",
     "BLOCKED",
@@ -219,6 +221,31 @@ def _read_json(path: Path) -> dict[str, Any] | None:
     except (OSError, ValueError):
         return None
     return loaded if isinstance(loaded, dict) else None
+
+
+def effective_configuration_fingerprint(
+    base: str,
+    *,
+    policy_sha256: str,
+    catalog_sha256: str,
+    config_sha256: str,
+) -> str:
+    """Bind the operator's base fingerprint to FULL authority artifacts."""
+
+    if not isinstance(base, str) or not base.strip():
+        raise ValueError("base configuration fingerprint must be non-empty")
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "base": base,
+                "autotrader_policy_sha256": policy_sha256,
+                "catalog_sha256": catalog_sha256,
+                "config_sha256": config_sha256,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -505,6 +532,14 @@ def entry_gate_preflight(
                     f"FAIL-{label.upper()}-HASH: controller authority has no valid "
                     f"{label} SHA-256 digest"
                 )
+        configuration_fingerprint = gate.get(GATE_CONFIGURATION_FINGERPRINT)
+        if not isinstance(configuration_fingerprint, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", configuration_fingerprint
+        ):
+            return (
+                "FAIL-CONFIGURATION-FINGERPRINT: controller authority has no valid "
+                "configuration fingerprint"
+            )
 
         scheduler_identity = gate.get(GATE_SCHEDULER_IDENTITY)
         if not isinstance(scheduler_identity, dict):
@@ -775,9 +810,21 @@ class PaperDayController:
         return self.mandate == MANDATE_FULL
 
     def _authority_hashes_complete(self) -> bool:
-        return all(
+        artifact_hashes_complete = all(
             isinstance(value, str) and bool(value)
             for value in (self.policy_sha256, self.catalog_sha256, self.config_sha256)
+        )
+        if not artifact_hashes_complete:
+            return False
+        # The three artifact hashes identify the inputs, but FULL also needs
+        # the reviewed base configuration fingerprint that binds those inputs
+        # to the broker/risk configuration.  Requiring it here closes the
+        # direct-controller path; the CLI wrapper already requires the same
+        # value, and a healthy broker or OPEN gate must not make up for its
+        # absence.
+        return self.mandate != MANDATE_FULL or bool(
+            isinstance(self.configuration_fingerprint, str)
+            and self.configuration_fingerprint.strip()
         )
 
     def _reviewer_epoch_for_session(self, session_id: str) -> str:
@@ -851,7 +898,8 @@ class PaperDayController:
                 "authority inputs",
                 False,
                 "FULL/scheduled paper days require policy_sha256, catalog_sha256, "
-                "and config_sha256 before any worker can be licensed",
+                "config_sha256, and configuration_fingerprint before any worker "
+                "can be licensed",
             )
             report.decide()
             self._write_gate_for(report, now)
@@ -1010,7 +1058,7 @@ class PaperDayController:
             catalog_sha256=self.catalog_sha256,
             config_sha256=self.config_sha256,
             authority_required=self._authority_required(),
-            recovery_required=False,
+            recovery_required=self._recovery_required_on_disk(),
             controller_pid=os.getpid(),
             scheduler_identity=self._scheduler_identity_payload(report.session_id),
             reviewer_liveness_epoch=self._reviewer_epoch_for_session(report.session_id),
@@ -1020,6 +1068,17 @@ class PaperDayController:
                 else None
             ),
         )
+
+    def _recovery_required_on_disk(self) -> bool:
+        gate = read_gate(self.paths) or {}
+        if gate.get(GATE_RECOVERY_REQUIRED) is True:
+            return True
+        try:
+            from .scheduler import SchedulerPaths, find_unmatched_ticks
+
+            return bool(find_unmatched_ticks(SchedulerPaths(root=self.paths.root)))
+        except (OSError, ValueError):
+            return True
 
     def _scheduler_identity_payload(self, session_id: str) -> dict[str, Any] | None:
         if self.scheduler is None:
@@ -1093,6 +1152,19 @@ class PaperDayController:
             and existing_fingerprint.strip()
         ):
             return existing_fingerprint
+        if (
+            self.mandate == MANDATE_FULL
+            and self.configuration_fingerprint
+            and self.policy_sha256
+            and self.catalog_sha256
+            and self.config_sha256
+        ):
+            return effective_configuration_fingerprint(
+                self.configuration_fingerprint,
+                policy_sha256=self.policy_sha256,
+                catalog_sha256=self.catalog_sha256,
+                config_sha256=self.config_sha256,
+            )
         return self.configuration_fingerprint
 
     def _session_id_from_lock(self) -> str | None:
@@ -1104,6 +1176,21 @@ class PaperDayController:
         lock = _read_json(self.paths.lock)
         token = lock.get("fencing_token") if lock else None
         return token if isinstance(token, str) and token else None
+
+    @staticmethod
+    def _watcher_record_matches_lock(
+        record: dict[str, Any], lock: dict[str, Any]
+    ) -> bool:
+        session_id = lock.get("session_id")
+        fencing_token = lock.get("fencing_token")
+        return (
+            isinstance(session_id, str)
+            and bool(session_id)
+            and isinstance(fencing_token, str)
+            and bool(fencing_token)
+            and record.get("session_id") == session_id
+            and record.get("fencing_token") == fencing_token
+        )
 
     def _acquire_lock(self, report: StartReport, now: dt.datetime) -> str | None:
         """Returns "fresh", "already", or None (blocked)."""
@@ -1117,6 +1204,12 @@ class PaperDayController:
                 isinstance(pid, int)
                 and self.processes.alive(pid)
                 and _WATCHER_NEEDLE in self.processes.cmdline(pid)
+                and self._watcher_record_matches_lock(recorded, existing)
+                and existing.get(GATE_SESSION_DATE)
+                == now.astimezone(dt.timezone.utc).date().isoformat()
+                and isinstance(existing_gate, dict)
+                and existing_gate.get("session_id") == existing.get("session_id")
+                and existing_gate.get("fencing_token") == existing.get("fencing_token")
             )
             if watcher_alive:
                 if (
@@ -1198,9 +1291,13 @@ class PaperDayController:
 
     def _ensure_watcher(self, report: StartReport) -> None:
         recorded = _read_json(self.paths.watcher_pid) or {}
+        lock = _read_json(self.paths.lock) or {}
         pid = recorded.get("pid")
         if isinstance(pid, int) and self.processes.alive(pid):
-            if _WATCHER_NEEDLE in self.processes.cmdline(pid):
+            if (
+                _WATCHER_NEEDLE in self.processes.cmdline(pid)
+                and self._watcher_record_matches_lock(recorded, lock)
+            ):
                 report.watcher_pid = pid
                 report.add("builder watcher", True, f"already running, pid {pid}")
                 return
@@ -1242,7 +1339,13 @@ class PaperDayController:
             return
         _write_json(
             self.paths.watcher_pid,
-            {"pid": new_pid, "started_at": self.clock().isoformat(), "needle": _WATCHER_NEEDLE},
+            {
+                "pid": new_pid,
+                "started_at": self.clock().isoformat(),
+                "needle": _WATCHER_NEEDLE,
+                "session_id": lock.get("session_id"),
+                "fencing_token": lock.get("fencing_token"),
+            },
         )
         report.watcher_pid = new_pid
         report.add("builder watcher", True, f"started, pid {new_pid}")
@@ -1481,7 +1584,13 @@ class PaperDayController:
                     )
                     return
             if paths.pid.exists():
-                request_quiesce(paths, reason="paper-day stop", now=now)
+                if scheduler_identity is not None:
+                    request_quiesce(
+                        paths,
+                        reason="paper-day stop",
+                        now=now,
+                        identity=scheduler_identity,
+                    )
             report.add(
                 "scheduler",
                 False,
@@ -1490,19 +1599,17 @@ class PaperDayController:
             )
             return
 
-        # Fail closed. The quiesce flag goes down BEFORE any identity reasoning
-        # that could bail out, because every later branch here can return
-        # without stopping anything -- and stop then goes on to cancel working
-        # orders with --arm and release the session lock. A scheduler we could
-        # not identify is exactly the one we most need to have asked to stop:
-        # the flag is read at the top of every tick, so even an unidentifiable
-        # child halts at its next boundary.
         if not self._require_stop_ownership(report, expected, "scheduler quiesce"):
             return
-        request_quiesce(paths, reason="paper-day stop", now=now)
 
         identity = identity_from_record(record)
         if identity is None:
+            # Quiesce must precede identity interpretation. A malformed record
+            # is exactly the case where the supervisor cannot name the child,
+            # but a durable stop request still gives a live child a chance to
+            # halt at its next boundary. No termination or cleanup is attempted
+            # because ownership remains unproven.
+            request_quiesce(paths, reason="paper-day stop", now=now)
             report.add(
                 "scheduler",
                 False,
@@ -1512,6 +1619,13 @@ class PaperDayController:
                 "remove the record by hand once you know what it was",
             )
             return
+
+        request_quiesce(
+            paths,
+            reason="paper-day stop",
+            now=now,
+            identity=identity,
+        )
 
         gate_identity = (read_gate(self.paths) or {}).get(GATE_SCHEDULER_IDENTITY)
         if isinstance(gate_identity, dict) and (
@@ -1731,8 +1845,52 @@ class PaperDayController:
             reviewer_liveness_at=prior_gate.get(GATE_REVIEWER_LIVENESS_AT),
         )
         report.add("entry gate", True, "CLOSED before anything else")
+        if not self._stop_owns(expected_owner):
+            current_gate = read_gate(self.paths) or {}
+            if (
+                not self.paths.lock.exists()
+                and
+                current_gate.get("session_id") == session_id
+                and current_gate.get("fencing_token")
+                == (lock or {}).get("fencing_token")
+            ):
+                with contextlib.suppress(OSError):
+                    self.paths.gate.unlink()
+            report.add(
+                "session ownership",
+                False,
+                "replacement session acquired the lock during gate publication; "
+                "old stop did not proceed",
+            )
+            return report
         if lock is None:
             report.add("session lock", True, "no active session -- verifying stopped state")
+            from .scheduler import SchedulerPaths
+
+            scheduler_paths = SchedulerPaths(root=self.paths.root)
+            scheduler_evidence = bool(
+                self.paths.lock.exists()
+                or scheduler_paths.pid.exists()
+                or self.paths.watcher_pid.exists()
+                or self.scheduler is not None
+                or prior_gate.get(GATE_AUTHORITY_REQUIRED)
+                or isinstance(prior_gate.get(GATE_SCHEDULER_IDENTITY), dict)
+                or prior_gate.get("entry_gate") == GATE_OPEN
+                or prior_gate.get("state") not in (None, STOPPED)
+            )
+            if scheduler_evidence:
+                # A session lock that disappeared does not grant permission to
+                # cancel orders or unlink state. We can still ask a surviving
+                # scheduler to quiesce and record whether its exit is proven;
+                # all destructive teardown remains refused without ownership.
+                self._stop_scheduler(report, now, expected_owner)
+                report.add(
+                    "session ownership",
+                    False,
+                    "no owned session lock; destructive order cancellation and teardown "
+                    "were refused",
+                )
+            return report
 
         # -- 1b. drain the scheduler, before anything transmits --------------
         #
@@ -1845,6 +2003,14 @@ class PaperDayController:
         gate["as_of"] = self.clock().isoformat()
         _atomic_write_json(self.paths.gate, gate)
         if not self._stop_owns(expected):
+            current = read_gate(self.paths) or {}
+            if (
+                expected[0] == "session"
+                and current.get("session_id") == expected[1]
+                and current.get("fencing_token") == expected[2]
+            ):
+                with contextlib.suppress(OSError):
+                    self.paths.gate.unlink()
             report.add(
                 "session ownership",
                 False,
@@ -2053,9 +2219,24 @@ class PaperDayController:
         elif _WATCHER_NEEDLE not in self.processes.cmdline(pid):
             report.add(
                 "builder watcher",
-                True,
-                f"pid {pid} belongs to another process now -- not killed, record discarded",
+                False,
+                f"pid {pid} belongs to another process now -- not killed, record retained",
             )
+            return
+        elif not self._watcher_record_matches_lock(
+            recorded,
+            {
+                "session_id": expected[1] if expected[0] == "session" else None,
+                "fencing_token": expected[2] if expected[0] == "session" else None,
+            },
+        ):
+            report.add(
+                "builder watcher",
+                False,
+                "live watcher record is not bound to this session/fencing token; "
+                "not killed, record retained",
+            )
+            return
         else:
             if not self._require_stop_ownership(report, expected, "watcher termination"):
                 return
@@ -2150,9 +2331,16 @@ class PaperDayController:
                 record = json.loads(line)
             except ValueError:
                 return "UNREADABLE: malformed tick receipt"
+            failure_code = record.get("failure_code")
+            details = []
+            if record.get("exit_code") is not None:
+                details.append(f"exit={record.get('exit_code')}")
+            if failure_code:
+                details.append(str(failure_code))
+            suffix = f" [{', '.join(details)}]" if details else ""
             return (
                 f"{record.get('outcome', 'UNKNOWN')} tick {record.get('tick_id', '?')} "
-                f"at {record.get('at', '?')}"
+                f"at {record.get('at', '?')}{suffix}"
             )
         return "none recorded"
 
@@ -2340,6 +2528,7 @@ def _consumption_mechanics_proof() -> tuple[bool, str]:
 
             def __init__(self) -> None:
                 self.spec = spec
+                self.proposed_at = now
                 self.expires_at = now + dt.timedelta(hours=1)
 
             def title(self) -> str:
@@ -2439,6 +2628,12 @@ def _controller_from_args(argv: list[str]) -> tuple[PaperDayController, list[str
         raise ValueError(
             "--schedule-config and --schedule-config-sha256 must be supplied together"
         )
+    if schedule_config is not None:
+        # The scheduler child runs from the engine directory, not from the
+        # operator's shell cwd. Pin the exact absolute artifact before putting
+        # it into the supervisor argv so relative wrapper inputs cannot resolve
+        # to a different file (or disappear) in the child.
+        schedule_config = schedule_config.expanduser().resolve()
     if schedule_config is not None and schedule_config_sha256 is not None:
         from .scheduler_bootstrap import build_scheduler_spec
 

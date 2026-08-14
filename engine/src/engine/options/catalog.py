@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -35,6 +36,130 @@ __all__ = [
 ]
 
 CATALOG_SCHEMA = "ibkr.universe-catalog/1"
+
+_CATALOG_KEYS = frozenset(
+    {"schema", "version", "source", "entries", "artifact_sha256"}
+)
+_CATALOG_REQUIRED_KEYS = frozenset({"schema", "version", "source", "entries"})
+_CATALOG_ENTRY_KEYS = frozenset(
+    {
+        "symbol",
+        "security_type",
+        "listing_venue",
+        "currency",
+        "active",
+        "optionability",
+        "sector",
+        "correlation_group",
+        "scan_eligible",
+        "entry_eligible",
+        "entitlement",
+        "broker_contract",
+    }
+)
+_CATALOG_ENTRY_REQUIRED_KEYS = frozenset(
+    {
+        "symbol",
+        "security_type",
+        "listing_venue",
+        "currency",
+        "active",
+        "optionability",
+        "sector",
+        "correlation_group",
+        "scan_eligible",
+        "entry_eligible",
+        "entitlement",
+    }
+)
+_BROKER_CONTRACT_KEYS = frozenset(
+    {
+        "symbol",
+        "con_id",
+        "exchange",
+        "primary_exchange",
+        "local_symbol",
+        "trading_class",
+    }
+)
+_BROKER_CONTRACT_REQUIRED_KEYS = frozenset({"symbol"})
+
+
+def _format_keys(keys: Iterable[Any]) -> str:
+    return ", ".join(repr(key) for key in sorted(keys, key=repr))
+
+
+def _require_mapping(value: Any, label: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be an object")
+    return value
+
+
+def _validate_keys(
+    record: Mapping[str, Any],
+    *,
+    allowed: frozenset[str],
+    required: frozenset[str],
+    label: str,
+) -> None:
+    keys = set(record)
+    missing = required - keys
+    unknown = keys - allowed
+    if missing:
+        raise ValueError(f"{label} missing required keys: {_format_keys(missing)}")
+    if unknown:
+        raise ValueError(f"{label} contains unknown keys: {_format_keys(unknown)}")
+
+
+def _require_string(value: Any, label: str, *, non_empty: bool = True) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{label} must be a string")
+    if non_empty and not value.strip():
+        raise ValueError(f"{label} must be a non-empty string")
+    return value
+
+
+def _require_optional_string(value: Any, label: str) -> str | None:
+    if value is None:
+        return None
+    return _require_string(value, label)
+
+
+def _require_bool(value: Any, label: str) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{label} must be a boolean")
+    return value
+
+
+def _require_optional_bool(value: Any, label: str) -> bool | None:
+    if value is None:
+        return None
+    return _require_bool(value, label)
+
+
+def _validate_json_value(value: Any, label: str) -> None:
+    """Reject non-JSON metadata instead of normalizing it into the artifact."""
+
+    if value is None or type(value) in {bool, int, str}:
+        return
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError(f"{label} must not contain non-finite numbers")
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_json_value(item, f"{label}[{index}]")
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            _require_string(key, f"{label} metadata key")
+            _validate_json_value(item, f"{label}.{key}")
+        return
+    raise ValueError(f"{label} contains an unsupported value type")
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"catalog artifact contains non-standard JSON constant {value}")
 
 
 def _freeze_value(value: Any) -> Any:
@@ -108,23 +233,32 @@ class BrokerContractIdentity:
 
     @classmethod
     def from_record(cls, record: Mapping[str, Any]) -> "BrokerContractIdentity":
+        record = _require_mapping(record, "broker_contract")
+        _validate_keys(
+            record,
+            allowed=_BROKER_CONTRACT_KEYS,
+            required=_BROKER_CONTRACT_REQUIRED_KEYS,
+            label="broker_contract",
+        )
         raw_con_id = record.get("con_id")
+        if raw_con_id is not None and (
+            type(raw_con_id) is not int or raw_con_id <= 0
+        ):
+            raise ValueError("broker_contract.con_id must be a positive integer or null")
         return cls(
-            symbol=str(record["symbol"]),
-            con_id=int(raw_con_id) if raw_con_id is not None else None,
-            exchange=str(record["exchange"]) if record.get("exchange") else None,
-            primary_exchange=(
-                str(record["primary_exchange"])
-                if record.get("primary_exchange")
-                else None
+            symbol=_require_string(record["symbol"], "broker_contract.symbol"),
+            con_id=raw_con_id,
+            exchange=_require_optional_string(
+                record.get("exchange"), "broker_contract.exchange"
             ),
-            local_symbol=(
-                str(record["local_symbol"]) if record.get("local_symbol") else None
+            primary_exchange=_require_optional_string(
+                record.get("primary_exchange"), "broker_contract.primary_exchange"
             ),
-            trading_class=(
-                str(record["trading_class"])
-                if record.get("trading_class")
-                else None
+            local_symbol=_require_optional_string(
+                record.get("local_symbol"), "broker_contract.local_symbol"
+            ),
+            trading_class=_require_optional_string(
+                record.get("trading_class"), "broker_contract.trading_class"
             ),
         )
 
@@ -191,7 +325,38 @@ class CatalogEntry:
             and self.entry_eligible
             and self.optionability is True
             and self.classified
+            and self.venue_verified
+            and self.entitlement_allows_entry
         )
+
+    @property
+    def venue_verified(self) -> bool:
+        """Whether the catalog identifies a usable listing venue.
+
+        Venue-unknown rows remain in the scan catalog, but an automated entry
+        cannot safely choose an entitlement or broker contract path for them.
+        """
+
+        return self.listing_venue not in {"", "UNKNOWN", "UNCLASSIFIED"}
+
+    @property
+    def entitlement_allows_entry(self) -> bool:
+        """Honor explicit entitlement denials without inventing readiness.
+
+        The seed catalog predates venue-level entitlement evidence and uses
+        ``UNVERIFIED``.  That value remains visible and does not silently claim
+        live readiness.  An importer or operator artifact can nevertheless
+        make a hard negative authoritative with either ``entry_allowed: false``
+        or a named denial status.  Runtime entitlement probes and the broker
+        gate remain independent checks.
+        """
+
+        if self.entitlement.get("entry_allowed") is False:
+            return False
+        if self.entitlement.get("entry_allowed") is True:
+            return True
+        readiness = str(self.entitlement.get("readiness", "")).strip().upper()
+        return readiness in {"VERIFIED", "LIVE", "READY", "ENTITLED", "SUBSCRIBED"}
 
     @property
     def entitlement_metadata(self) -> Mapping[str, Any]:
@@ -218,34 +383,48 @@ class CatalogEntry:
 
     @classmethod
     def from_record(cls, record: Mapping[str, Any]) -> "CatalogEntry":
-        raw_contract = record.get("broker_contract", record.get("broker_contract_identity"))
+        record = _require_mapping(record, "catalog entry")
+        _validate_keys(
+            record,
+            allowed=_CATALOG_ENTRY_KEYS,
+            required=_CATALOG_ENTRY_REQUIRED_KEYS,
+            label="catalog entry",
+        )
+        raw_contract = record.get("broker_contract")
+        if raw_contract is not None and not isinstance(raw_contract, Mapping):
+            raise ValueError("catalog entry broker_contract must be an object or null")
         contract = (
             BrokerContractIdentity.from_record(raw_contract)
-            if isinstance(raw_contract, Mapping)
+            if raw_contract is not None
             else None
         )
-        raw_entitlement = record.get("entitlement", record.get("entitlement_metadata", {}))
-        if not isinstance(raw_entitlement, Mapping):
-            raise ValueError("catalog entitlement metadata must be an object")
+        raw_entitlement = _require_mapping(
+            record["entitlement"], "catalog entry entitlement"
+        )
+        _validate_json_value(raw_entitlement, "catalog entry entitlement")
         return cls(
-            symbol=str(record["symbol"]),
-            security_type=str(record.get("security_type", "STK")),
-            listing_venue=str(record.get("listing_venue", "UNKNOWN")),
-            currency=str(record.get("currency", "USD")),
-            active=bool(record.get("active", True)),
-            optionability=(
-                bool(record["optionability"])
-                if record.get("optionability") is not None
-                else None
+            symbol=_require_string(record["symbol"], "catalog entry symbol"),
+            security_type=_require_string(
+                record["security_type"], "catalog entry security_type"
             ),
-            sector=(str(record["sector"]) if record.get("sector") is not None else None),
-            correlation_group=(
-                str(record["correlation_group"])
-                if record.get("correlation_group") is not None
-                else None
+            listing_venue=_require_string(
+                record["listing_venue"], "catalog entry listing_venue"
             ),
-            scan_eligible=bool(record.get("scan_eligible", True)),
-            entry_eligible=bool(record.get("entry_eligible", False)),
+            currency=_require_string(record["currency"], "catalog entry currency"),
+            active=_require_bool(record["active"], "catalog entry active"),
+            optionability=_require_optional_bool(
+                record["optionability"], "catalog entry optionability"
+            ),
+            sector=_require_optional_string(record["sector"], "catalog entry sector"),
+            correlation_group=_require_optional_string(
+                record["correlation_group"], "catalog entry correlation_group"
+            ),
+            scan_eligible=_require_bool(
+                record["scan_eligible"], "catalog entry scan_eligible"
+            ),
+            entry_eligible=_require_bool(
+                record["entry_eligible"], "catalog entry entry_eligible"
+            ),
             entitlement=raw_entitlement,
             broker_contract=contract,
         )
@@ -324,23 +503,38 @@ class CatalogSnapshot:
 
     @classmethod
     def from_record(cls, record: Mapping[str, Any]) -> "CatalogSnapshot":
-        entries = record.get("entries")
-        if not isinstance(entries, list):
+        record = _require_mapping(record, "catalog artifact")
+        _validate_keys(
+            record,
+            allowed=_CATALOG_KEYS,
+            required=_CATALOG_REQUIRED_KEYS,
+            label="catalog artifact",
+        )
+        schema = _require_string(record["schema"], "catalog artifact schema")
+        version = _require_string(record["version"], "catalog artifact version")
+        source = _require_string(record["source"], "catalog artifact source")
+        entries = record["entries"]
+        if type(entries) is not list:
             raise ValueError("catalog artifact entries must be a list")
+        artifact_sha256 = None
+        if "artifact_sha256" in record:
+            artifact_sha256 = _require_string(
+                record["artifact_sha256"], "catalog artifact artifact_sha256"
+            )
+        parsed_entries: list[CatalogEntry] = []
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, Mapping):
+                raise ValueError(f"catalog entry at index {index} must be an object")
+            try:
+                parsed_entries.append(CatalogEntry.from_record(entry))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"catalog entry at index {index}: {exc}") from exc
         return cls(
-            schema=str(record.get("schema", CATALOG_SCHEMA)),
-            version=str(record["version"]),
-            source=str(record.get("source", "artifact")),
-            artifact_sha256=(
-                str(record["artifact_sha256"])
-                if record.get("artifact_sha256")
-                else None
-            ),
-            entries=tuple(
-                CatalogEntry.from_record(entry)
-                for entry in entries
-                if isinstance(entry, Mapping)
-            ),
+            schema=schema,
+            version=version,
+            source=source,
+            artifact_sha256=artifact_sha256,
+            entries=tuple(parsed_entries),
         )
 
 
@@ -427,14 +621,25 @@ class UniverseCatalog:
         """Load an operator artifact and verify its byte hash before parsing."""
         raw = Path(path).read_bytes()
         actual = _sha256_bytes(raw)
-        if expected_sha256 is not None and actual != expected_sha256.lower().strip():
+        expected_sha256 = (
+            _require_string(expected_sha256, "expected_sha256").lower().strip()
+            if expected_sha256 is not None
+            else None
+        )
+        if expected_sha256 is not None and actual != expected_sha256:
             raise ValueError(
                 f"catalog hash mismatch: expected {expected_sha256}, got {actual}"
             )
-        decoded = json.loads(raw.decode("utf-8"))
+        decoded = json.loads(
+            raw.decode("utf-8"), parse_constant=_reject_json_constant
+        )
         if not isinstance(decoded, Mapping):
             raise ValueError("catalog artifact must contain a JSON object")
         snapshot = CatalogSnapshot.from_record(decoded)
+        if snapshot.artifact_sha256 is not None and snapshot.artifact_sha256 != actual:
+            raise ValueError(
+                "catalog artifact artifact_sha256 does not match the artifact bytes"
+            )
         if expected_version is not None and snapshot.version != expected_version:
             raise ValueError(
                 f"catalog version mismatch: expected {expected_version}, got {snapshot.version}"

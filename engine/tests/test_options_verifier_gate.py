@@ -780,7 +780,7 @@ class TestTheControl:
                     return offset + 1
             raise AssertionError(f"{needle!r} is not in run_once")
 
-        reconcile = line_of("_reconcile(broker, store")
+        reconcile = line_of("_reconcile(")
         manage = line_of("_manage_one(")
         refusal = line_of("OPTIONS_VERIFIER_NOT_CONFIGURED")
         assert reconcile < refusal, (

@@ -6,11 +6,17 @@ relative paths are rejected.
 
 `MANAGE_ONLY` remains the compatibility mode. It permits reconciliation,
 management, exits, and cancels without licensing unattended opening risk.
-`FULL` is an explicit authority boundary and requires all three SHA-256 inputs:
+`FULL` is an explicit authority boundary and requires the scheduler policy
+artifact plus all authority inputs:
 
 - `PolicySha256` — the reviewed scheduler/auto-trader policy artifact;
+- `ScheduleConfig` and `ScheduleConfigSha256` — the exact policy artifact
+  passed to the persistent scheduler;
 - `CatalogSha256` — the catalog snapshot used by the worker;
 - `ConfigSha256` — the broker/risk/configuration artifact.
+- `ConfigurationFingerprint` — the operator-supplied base configuration
+  digest. FULL authority deterministically binds it to the policy, catalog,
+  and config hashes before writing the effective gate fingerprint.
 
 The hashes, session date, lock fencing token, scheduler session/nonce/PID,
 reviewer liveness epoch, and absolute state root are published in `gate.json`.
@@ -24,9 +30,12 @@ authority TTL.
 .\bin\start-paper-day.ps1 `
   -StateDir 'C:\paperday\engine-state' `
   -Mandate FULL `
+  -ScheduleConfig 'C:\paperday\policy\autotrader-policy.json' `
+  -ScheduleConfigSha256 '<64 hex characters>' `
   -PolicySha256 '<64 hex characters>' `
   -CatalogSha256 '<64 hex characters>' `
-  -ConfigSha256 '<64 hex characters>'
+  -ConfigSha256 '<64 hex characters>' `
+  -ConfigurationFingerprint '<64 hex characters>'
 
 .\bin\paper-day-status.ps1 -StateDir 'C:\paperday\engine-state'
 .\bin\restart-paper-day.ps1 -StateDir 'C:\paperday\engine-state' ...
