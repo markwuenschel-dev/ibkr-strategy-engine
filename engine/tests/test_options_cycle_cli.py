@@ -7,8 +7,60 @@ from types import SimpleNamespace
 import pytest
 
 from engine.cli import build_parser, cmd_options_cycle
-from engine.cycle_adapter import _identity
+from engine.cycle_adapter import _CycleRuntime, _identity
 from engine.errors import ConfigError
+from engine.options import order_outbox
+
+
+def test_cycle_adapter_execution_outbox_is_the_order_outbox_class():
+    """Pin the class the corridor actually writes to, not the unwired saga tracker.
+
+    ``engine.options.execution_outbox.ExecutionOutbox`` has a different method
+    surface (``record_approval_consumed``, ``unresolved``, no ``assert_clear``)
+    from ``engine.options.order_outbox.ExecutionOutbox`` (``assert_clear``,
+    ``prepare``, ``approval_consumed``, ``blocking_records``) -- the one
+    ``authorize_open``/``run_once`` actually call. Importing the wrong one made
+    every real ``options-cycle`` entry pass crash with ``AttributeError`` the
+    moment it reached a real candidate.
+    """
+    import engine.cycle_adapter as adapter
+
+    assert adapter.ExecutionOutbox is order_outbox.ExecutionOutbox
+    for method in ("assert_clear", "prepare", "approval_consumed", "blocking_records"):
+        assert hasattr(adapter.ExecutionOutbox, method), method
+
+
+def test_cycle_runtime_reconcile_blocks_on_a_real_blocking_outbox_record(
+    tmp_path: Path,
+):
+    """``reconcile()`` must see the same outbox ``entry()`` writes to.
+
+    Before the fix, ``reconcile()`` checked an ``ExecutionOutbox`` instance
+    that nothing ever wrote to, so this recovery gate was silently a no-op.
+    """
+    outbox = order_outbox.ExecutionOutbox(tmp_path / "execution-outbox")
+    intent = SimpleNamespace(
+        strategy_id="11111111-1111-1111-1111-111111111111",
+        strategy_action=SimpleNamespace(value="OPEN"),
+        quantity=1,
+        underlying="SPY",
+        legs=[],
+    )
+    attempt_id = outbox.prepare(
+        intent,
+        structure_digest="d" * 64,
+        spec_digest="e" * 64,
+        account="DU123",
+    )
+
+    runtime = _CycleRuntime.__new__(_CycleRuntime)
+    runtime.execution_outbox = outbox
+
+    result = _CycleRuntime.reconcile(runtime, None)
+
+    assert result["outcome"] == "RECOVERY_REQUIRED"
+    assert result["failure_code"] == "FAIL-BROKER-AMBIGUOUS"
+    assert result["unresolved_execution_sagas"] == [attempt_id]
 
 
 def test_options_cycle_is_a_registered_persistent_command():
