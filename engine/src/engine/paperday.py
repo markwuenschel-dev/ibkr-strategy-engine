@@ -222,6 +222,42 @@ def _read_json(path: Path) -> dict[str, Any] | None:
     return loaded if isinstance(loaded, dict) else None
 
 
+def _read_json_or_corrupt(path: Path) -> tuple[dict[str, Any] | None, bool]:
+    """Read a JSON object at *path*, distinguishing missing from corrupt.
+
+    ``_read_json`` above collapses two different situations to the same
+    ``None``: a path that does not exist at all, and one that exists but
+    failed to parse as a JSON object (torn write, garbage bytes, truncated
+    file, or valid JSON of the wrong shape). Every caller built on that
+    collapse cannot tell "nothing here yet" from "something is here and it
+    is broken" -- and for ``session.lock`` specifically, conflating them is
+    BLOCKER-1 (``docs/paper-day-recovery/open-questions.md``): a corrupt lock
+    read as genuinely absent skips the one unlink path meant for a truly
+    absent lock, the atomic acquire then raises on the file that is still
+    there, and the caller reports a false "another start acquired the lock
+    concurrently" with no path forward -- re-running hits the identical
+    corrupt file every time.
+
+    Returns ``(value, corrupt)``. ``value`` is the parsed dict, or ``None``
+    when the path is missing OR unreadable/invalid -- exactly what
+    ``_read_json`` would return. ``corrupt`` is ``True`` only in the second
+    case: the path exists but is not a valid JSON object. Callers that must
+    refuse fail-closed on a broken identity (D5, ``decisions.md``: "missing
+    or corrupt identity => refuse") use ``corrupt`` to do that instead of
+    silently treating a broken file as an absent one, or as somebody else's
+    lock.
+    """
+    if not path.exists():
+        return None, False
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, True
+    if not isinstance(loaded, dict):
+        return None, True
+    return loaded, False
+
+
 def effective_configuration_fingerprint(
     base: str,
     *,
@@ -1239,8 +1275,32 @@ class PaperDayController:
     def _acquire_lock(self, report: StartReport, now: dt.datetime) -> str | None:
         """Returns "fresh", "already", or None (blocked)."""
         self.paths.root.mkdir(parents=True, exist_ok=True)
-        existing = _read_json(self.paths.lock)
+        existing, lock_corrupt = _read_json_or_corrupt(self.paths.lock)
         existing_gate = read_gate(self.paths)
+        if lock_corrupt:
+            # D5: missing or corrupt identity => refuse. Collapsing this into
+            # the "no lock" branch below (BLOCKER-1) would unlink a file we
+            # cannot prove is safe to unlink, then the atomic acquire would
+            # raise on the still-present corrupt file and report the false
+            # "another start acquired the lock concurrently" -- a diagnostic
+            # with no path forward, because re-running hits the identical
+            # corrupt file every time. Refuse plainly instead, and leave the
+            # file untouched -- this path only reads, and per
+            # TestStopFailsClosedOnAnUnreadableLock (test_paperday_scheduler.py)
+            # stop does not unlink an unprovable lock either, so nothing in
+            # this module invents permission to delete it.
+            report.add(
+                "session lock",
+                False,
+                f"session lock at {self.paths.lock} exists but is not valid JSON "
+                "-- refusing to start; a torn or corrupt lock cannot be told "
+                "apart from a live session's and must not be silently treated "
+                "as absent or overwritten. Run stop to close the entry gate and "
+                "mark recovery required -- it will not delete the file either -- "
+                "then resolve the corrupt lock by hand once you have confirmed "
+                "no session it could represent is still live.",
+            )
+            return None
         if existing is not None:
             recorded = _read_json(self.paths.watcher_pid) or {}
             pid = recorded.get("pid")
@@ -1838,8 +1898,16 @@ class PaperDayController:
     def stop(self) -> StopReport:
         report = StopReport()
         now = self.clock()
-        lock = _read_json(self.paths.lock)
-        expected_owner = self._stop_lock_identity(lock)
+        lock, lock_corrupt = _read_json_or_corrupt(self.paths.lock)
+        # Mirror _current_stop_lock_identity's own exists()-based distinction
+        # (BLOCKER-1): _stop_lock_identity(None) always returns ("no-session",)
+        # regardless of *why* the read came back None, so a corrupt lock and a
+        # genuinely absent one were computing the same expected identity here
+        # while _stop_owns (below) recomputes from disk and correctly says
+        # ("invalid-lock",) for the corrupt file -- the mismatch made a corrupt
+        # lock look like "someone else took over" and stop returned before it
+        # ever reached the lock-is-None branch or the unlink at the end.
+        expected_owner = ("invalid-lock",) if lock_corrupt else self._stop_lock_identity(lock)
         self._active_stop_owner = expected_owner
         expected_watcher = _read_json(self.paths.watcher_pid)
         session_id = str((lock or {}).get("session_id", "unknown-session"))
@@ -1899,6 +1967,34 @@ class PaperDayController:
                 False,
                 "replacement session acquired the lock during gate publication; "
                 "old stop did not proceed",
+            )
+            return report
+        if lock_corrupt:
+            # Reachable now (expected_owner == the current on-disk identity
+            # == ("invalid-lock",), so _stop_owns matched above and this is
+            # not mistaken for a takeover), unlike the pre-fix behaviour
+            # where stop returned before ever getting here. Reaching it does
+            # NOT mean unlinking it: per TestStopFailsClosedOnAnUnreadableLock
+            # (test_paperday_scheduler.py), "we cannot prove who owns this"
+            # must not be treated as licence to act on it either, the same
+            # way it must not be treated as absent (D5). Ownership of
+            # whatever broker-affecting work this session did is unprovable,
+            # so cancellation, reconciliation and marking stay refused, the
+            # file itself is left exactly as found for a human or the
+            # recovery verb to resolve, and recovery is marked required
+            # rather than silently left for the next start to paper over.
+            report.add(
+                "session lock",
+                False,
+                f"session lock at {self.paths.lock} exists but is not valid JSON "
+                "-- ownership of the broker-affecting work it represents cannot "
+                "be proven, so working-order cancellation, reconciliation, "
+                "marking, and lock release are all refused; recovery is marked "
+                "required and the unreadable file is left untouched for a human "
+                "or the recovery verb to resolve",
+            )
+            self._mark_recovery_required(
+                report, expected_owner, reason="session lock was corrupt at stop"
             )
             return report
         if lock is None:
@@ -2451,7 +2547,15 @@ class PaperDayController:
         )
         report.add("scheduler authority", self._scheduler_status(now))
         report.add("latest tick", self._tick_status(now))
-        report.add("session lock", "held" if self.paths.lock.exists() else "none")
+        lock_value, lock_corrupt = _read_json_or_corrupt(self.paths.lock)
+        if lock_corrupt:
+            report.add(
+                "session lock",
+                f"CORRUPT -- {self.paths.lock} exists but is not valid JSON; "
+                "ownership cannot be proven",
+            )
+        else:
+            report.add("session lock", "held" if lock_value is not None else "none")
 
         report.add("open positions", self._positions_line())
         report.add("orders today", str(self._orders_today(now)))
