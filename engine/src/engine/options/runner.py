@@ -71,6 +71,14 @@ from .domain import (
 )
 from .governor import GovernorVerdict, PortfolioGovernor
 from .ivrank import IVRankMetric, build_iv_rank, observations_from_bars
+from .realized_vol import (
+    METHODOLOGY_VERSION as REALIZED_VOL_METHODOLOGY_VERSION,
+    RATIO_WINDOW,
+    SOURCE_IBKR_TRADES,
+    RealizedVolMetric,
+    build_realized_vol,
+    observations_from_price_bars,
+)
 from .lifecycle import (
     ManagementAction,
     ManagementDecision,
@@ -237,6 +245,9 @@ class RunReport:
     #: "the pass died before reconciling" refuse instead of authorise.
     reconciliation_outcome: ReconciliationOutcome = ReconciliationOutcome.UNAVAILABLE
     iv_rank: IVRankMetric | None = None
+    #: The realized-vol / iv_rv_ratio metric for this pass, always computed
+    #: alongside ``iv_rank`` once an IV reading exists (cheap and pure).
+    realized_vol: RealizedVolMetric | None = None
     #: The volatility-regime classification for this pass, always computed
     #: (cheap and pure once the IV metric exists). Whether it *gates* is the
     #: runner's ``regime_live`` decision; in shadow it is a recorded opinion.
@@ -982,6 +993,60 @@ def _iv_metric_for(
     return build_iv_rank(symbol, observations_from_bars(bars or []), calculated_at=now)
 
 
+def _realized_vol_for(
+    ib: Any,
+    underlying: Any,
+    symbol: str,
+    *,
+    current_iv: Decimal | None,
+    now: dt.datetime,
+    request_budget: Any = None,
+    budget_priority: Priority = Priority.CANDIDATE_CONSTRUCTION,
+) -> RealizedVolMetric:
+    """Four months of daily underlying closes, reduced to realized vol and
+    the iv_rv_ratio edge. Mirrors :func:`_iv_metric_for`; a failure here
+    degrades the metric, it does not raise -- a candidate that already has a
+    live IV reading must not be lost because the second, separate historical
+    pull failed."""
+    _acquire_request(
+        request_budget,
+        RequestKind.HISTORICAL,
+        priority=budget_priority,
+    )
+    try:
+        bars = ib.reqHistoricalData(
+            underlying,
+            endDateTime="",
+            durationStr="4 M",
+            barSizeSetting="1 day",
+            whatToShow="TRADES",
+            useRTH=True,
+            formatDate=1,
+        )
+    except Exception as exc:  # noqa: BLE001 - adapter boundary
+        return RealizedVolMetric(
+            symbol=symbol,
+            realized_vol_20=None,
+            realized_vol_60=None,
+            current_iv=current_iv,
+            iv_rv_ratio=None,
+            ratio_window=RATIO_WINDOW,
+            observation_count=0,
+            first_observation=None,
+            last_observation=None,
+            source=SOURCE_IBKR_TRADES,
+            methodology_version=REALIZED_VOL_METHODOLOGY_VERSION,
+            calculated_at=now,
+            degraded_reason=f"historical price pull failed: {type(exc).__name__}: {exc}",
+        )
+    return build_realized_vol(
+        symbol,
+        observations_from_price_bars(bars or []),
+        current_iv=current_iv,
+        calculated_at=now,
+    )
+
+
 def _regime_for(
     ib: Any,
     symbol: str,
@@ -1016,16 +1081,62 @@ def _regime_for(
         budget_priority=budget_priority,
     )
     report.iv_rank = iv_metric
+    rv_metric = _realized_vol_for(
+        ib,
+        underlying_contract,
+        symbol,
+        current_iv=iv_metric.current_iv,
+        now=now,
+        request_budget=request_budget,
+        budget_priority=budget_priority,
+    )
+    report.realized_vol = rv_metric
     report.regime = classify(
         VolatilityAssessment(
             symbol=symbol,
             iv_rank=iv_metric.iv_rank if iv_metric.is_usable else None,
             iv_percentile=iv_metric.iv_percentile,
             current_iv=iv_metric.current_iv,
+            realized_vol_20=rv_metric.realized_vol_20,
+            realized_vol_60=rv_metric.realized_vol_60,
+            iv_rv_ratio=rv_metric.iv_rv_ratio,
         ),
         resolved_regime,
     )
     return underlying_contract, iv_metric
+
+
+def _effective_risk_budget(
+    policy: RiskPolicy,
+    *,
+    portfolio: Any,
+    now: dt.datetime,
+) -> Decimal:
+    """The dollar amount that actually sizes one position this pass.
+
+    Live NetLiquidation * ``risk_budget_fraction_of_equity`` when both a
+    fraction is configured and a live account snapshot is reachable; the flat
+    ``risk_budget_per_position`` fallback otherwise. Sizing runs before the
+    governor's own (later, separately-fetched) portfolio snapshot, so this
+    takes its own -- a second account query, not a reuse of one that does not
+    exist yet at this point in the pass.
+
+    Never raises: a broker hiccup here degrades to the flat fallback rather
+    than blocking a candidate that has not even been priced yet. Equity-
+    fraction sizing is an enhancement over the constant, not a safety gate --
+    the governor's concentration checks are the safety gate, and they still
+    run, unaffected, on whatever quantity this budget produces.
+    """
+    if policy.risk_budget_fraction_of_equity is None or portfolio is None:
+        return policy.risk_budget_per_position
+    try:
+        snapshot = portfolio.snapshot(as_of=now)
+    except Exception:  # noqa: BLE001 - adapter boundary; degrade, do not raise
+        return policy.risk_budget_per_position
+    net_liquidation = getattr(snapshot, "net_liquidation", None)
+    if not isinstance(net_liquidation, Decimal) or net_liquidation <= 0:
+        return policy.risk_budget_per_position
+    return net_liquidation * policy.risk_budget_fraction_of_equity
 
 
 def _intent_from_pinned_legs(
@@ -2103,7 +2214,8 @@ def _logical_entry_pass(
                 effective_policy = dataclasses.replace(
                     policy,
                     risk_budget_per_position=(
-                        policy.risk_budget_per_position * report.regime.allocation
+                        _effective_risk_budget(policy, portfolio=portfolio, now=now)
+                        * report.regime.allocation
                     ),
                 )
 
@@ -2254,7 +2366,7 @@ def _logical_entry_pass(
                     effective_policy = dataclasses.replace(
                         policy,
                         risk_budget_per_position=(
-                            policy.risk_budget_per_position
+                            _effective_risk_budget(policy, portfolio=portfolio, now=now)
                             * report.regime.allocation
                         ),
                     )
@@ -2913,7 +3025,8 @@ def run_once(
             effective_policy = dataclasses.replace(
                 policy,
                 risk_budget_per_position=(
-                    policy.risk_budget_per_position * report.regime.allocation
+                    _effective_risk_budget(policy, portfolio=portfolio, now=now)
+                    * report.regime.allocation
                 ),
             )
 

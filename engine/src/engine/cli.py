@@ -170,6 +170,30 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    measure = subs.add_parser(
+        "options-measure-entitlement",
+        help=(
+            "bulk, read-only market-data entitlement measurement across every "
+            "catalog symbol; writes a new catalog artifact. Transmits nothing."
+        ),
+    )
+    measure.add_argument(
+        "--catalog",
+        default=None,
+        help="catalog JSON to read (default: docs/autotrader-catalog-operator-v1.json)",
+    )
+    measure.add_argument(
+        "--out",
+        default=None,
+        help="path for the updated catalog artifact (default: alongside --catalog, version bumped)",
+    )
+    measure.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=6.0,
+        help="how long to wait for a marketDataType callback per symbol",
+    )
+
     cycle = subs.add_parser(
         "options-cycle",
         help=(
@@ -608,6 +632,114 @@ def cmd_options_scan(args: argparse.Namespace, broker_factory: Any = Broker) -> 
     return EXIT_OK
 
 
+def cmd_options_measure_entitlement(
+    args: argparse.Namespace, broker_factory: Any = Broker
+) -> int:
+    """Bulk, read-only market-data entitlement measurement across the catalog.
+
+    Replaces the manual, one-symbol-at-a-time process that left 70 of the
+    catalog's 80 symbols never measured. Writes a new catalog artifact;
+    never touches the pinned one in place, and never transmits an order --
+    this command has no import of and no reference to any order-placement
+    call.
+    """
+    import datetime as _dt
+    import hashlib
+    import json as _json
+    from dataclasses import replace
+    from pathlib import Path
+
+    from .options.catalog import UniverseCatalog
+    from .options.entitlement_probe import METHOD, measure_catalog_entitlement
+
+    config = config_from(args)
+    journal = OrderJournal(config.journal_path)
+    journal.preflight()
+
+    gate = SafetyGate(config, journal)
+    gate.assert_not_halted()
+
+    catalog_path = Path(args.catalog) if args.catalog else (
+        Path(__file__).resolve().parents[3] / "docs" / "autotrader-catalog-operator-v1.json"
+    )
+    catalog = UniverseCatalog.from_artifact(catalog_path)
+    today = _dt.datetime.now(_dt.timezone.utc).date()
+
+    with broker_factory(config, journal) as broker:
+        measurements = measure_catalog_entitlement(
+            broker.ib,
+            [entry.symbol for entry in catalog.entries],
+            timeout_seconds=args.timeout_seconds,
+            now=today,
+        )
+
+    by_symbol = {m.symbol: m for m in measurements}
+    updated_entries = []
+    changed = 0
+    now_entitled = 0
+    for entry in catalog.entries:
+        measurement = by_symbol.get(entry.symbol)
+        if measurement is None or measurement.entry_allowed is None:
+            # Inconclusive: leave the row exactly as it was. Silence is not
+            # a finding.
+            updated_entries.append(entry)
+            if entry.automated_entry_allowed:
+                now_entitled += 1
+            continue
+        new_entitlement = {
+            "entry_allowed": measurement.entry_allowed,
+            "readiness": measurement.readiness,
+            "measured_at": measurement.measured_at.isoformat(),
+            "method": METHOD,
+            "reason": measurement.reason,
+        }
+        new_venue = measurement.listing_venue or entry.listing_venue
+        if new_entitlement != dict(entry.entitlement) or new_venue != entry.listing_venue:
+            changed += 1
+        updated = replace(entry, entitlement=new_entitlement, listing_venue=new_venue)
+        updated_entries.append(updated)
+        if updated.automated_entry_allowed:
+            now_entitled += 1
+
+    out_path = (
+        Path(args.out)
+        if args.out
+        else catalog_path.with_name(
+            catalog_path.stem.replace("-v1", "") + f"-measured-{today.isoformat()}.json"
+        )
+    )
+    payload = {
+        "schema": catalog.snapshot().schema,
+        "version": f"{catalog.version}+measured-{today.isoformat()}",
+        "source": (
+            f"{catalog.snapshot().source} + options-measure-entitlement bulk pass "
+            f"({today.isoformat()})"
+        ),
+        "entries": [entry.to_record() for entry in updated_entries],
+    }
+    raw = _json.dumps(payload, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(raw)
+    digest = hashlib.sha256(raw).hexdigest()
+
+    out(f"measured {len(measurements)} symbols, updated {changed}")
+    out(f"automated_entry_allowed now true for {now_entitled} of {len(updated_entries)}")
+    for m in measurements:
+        verdict = (
+            "ALLOWED" if m.entry_allowed is True
+            else "DENIED" if m.entry_allowed is False
+            else "inconclusive"
+        )
+        out(f"  {m.symbol:<6} {verdict:<12} {m.reason}")
+    out(f"\nwrote {out_path}")
+    out(f"sha256 {digest}")
+    note(
+        "this artifact is not pinned anywhere -- update the policy JSON's "
+        "catalog.path/catalog.sha256 deliberately to put it in use"
+    )
+    return EXIT_OK
+
+
 def cmd_options_universe_scan(
     args: argparse.Namespace, broker_factory: Any = Broker
 ) -> int:
@@ -627,10 +759,12 @@ def cmd_options_universe_scan(
     from .options.adapters import (
         IBKRContractDataAdapter,
         IBKRLiveMarketDataAdapter,
+        IBKRPriceHistoryAdapter,
         IBKRVolatilityHistoryAdapter,
     )
     from .options.freshness import SessionMetadataStore
     from .options.ivstore import IVStore
+    from .options.rvstore import RVStore
     from .options.pacing import PacedRequestBudget
     from .options.policy import RiskPolicy
     from .options.regime import VolatilityRegimePolicy
@@ -690,6 +824,7 @@ def cmd_options_universe_scan(
                 universe=universe,
                 session_date=_dt.date.today(),
                 iv_store=IVStore(config.state_dir / "universe" / "iv"),
+                rv_store=RVStore(config.state_dir / "universe" / "rv"),
                 metadata_store=SessionMetadataStore(
                     config.state_dir / "universe" / "metadata"
                 ),
@@ -701,6 +836,7 @@ def cmd_options_universe_scan(
                 # purpose: the scanner owns every acquire for this pass, and an
                 # adapter that also acquired would double-spend each request.
                 volatility_history=IBKRVolatilityHistoryAdapter(ib, contract_data),
+                price_history=IBKRPriceHistoryAdapter(ib, contract_data),
                 contract_data=contract_data,
                 market_data=IBKRLiveMarketDataAdapter(ib),
             )
@@ -1780,6 +1916,7 @@ COMMANDS = {
     "probe-options-data": cmd_probe_options_data,
     "options-scan": cmd_options_scan,
     "options-universe-scan": cmd_options_universe_scan,
+    "options-measure-entitlement": cmd_options_measure_entitlement,
     "options-cycle": cmd_options_cycle,
     "options-run": cmd_options_run,
     "options-positions": cmd_options_positions,

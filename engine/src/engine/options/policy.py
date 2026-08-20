@@ -92,6 +92,16 @@ DEFAULT_NEUTRAL_TARGET_DELTA = Decimal("0.16")
 DEFAULT_DIRECTIONAL_TARGET_DELTA = Decimal("0.30")
 DEFAULT_TARGET_WIDTH = Decimal("5")
 DEFAULT_RISK_BUDGET_PER_POSITION = Decimal("500")
+# A fraction of live NetLiquidation, not a dollar amount -- see
+# risk_budget_fraction_of_equity below for what this actually governs.
+# Picked below the 5% incremental-BPR governor cap (DEFAULT_MAX_INCREMENTAL_
+# BPR_FRACTION) with headroom to spare, so sizing is the thing that decides
+# position size in the common case and the governor's cap is a backstop, not
+# the thing sizing routinely collides with. Also chosen so several positions
+# fit inside the 35% total-BPR cap at once (0.35 / 0.02 = 17 concurrent
+# positions before the total cap binds) -- the stated goal is many trades,
+# not one large one.
+DEFAULT_RISK_BUDGET_FRACTION_OF_EQUITY = Decimal("0.02")
 
 # -- portfolio-level defaults ------------------------------------------------
 
@@ -265,7 +275,20 @@ class RiskPolicy:
     neutral_target_delta: Decimal = DEFAULT_NEUTRAL_TARGET_DELTA
     directional_target_delta: Decimal = DEFAULT_DIRECTIONAL_TARGET_DELTA
     target_width: Decimal = DEFAULT_TARGET_WIDTH
+    #: The flat-dollar fallback: what sizes a position when no live account
+    #: snapshot is available (a standalone pass, a proof profile, a test).
+    #: In the ordinary production path this value is never what governs --
+    #: see risk_budget_fraction_of_equity.
     risk_budget_per_position: Decimal = DEFAULT_RISK_BUDGET_PER_POSITION
+    #: Live NetLiquidation * this fraction REPLACES risk_budget_per_position
+    #: for any pass that has a live portfolio snapshot (the governor already
+    #: fetches one for its own concentration checks -- this is the same
+    #: value, just finally reaching sizing too). None means no live account
+    #: data reaches sizing and the flat dollar constant above governs
+    #: instead -- the pre-2026-08-18 behavior, kept as an explicit opt-out
+    #: rather than removed, so a standalone/test run is not forced to fake
+    #: a portfolio snapshot just to size a candidate.
+    risk_budget_fraction_of_equity: Decimal | None = DEFAULT_RISK_BUDGET_FRACTION_OF_EQUITY
 
     # -- position management ---------------------------------------------
     profit_target_fraction: Decimal = DEFAULT_PROFIT_TARGET_FRACTION
@@ -310,6 +333,20 @@ class RiskPolicy:
             "max_crossing_cost_fraction",
         ):
             _check_fraction(getattr(self, label), label)
+
+        if self.risk_budget_fraction_of_equity is not None:
+            _check_fraction(
+                self.risk_budget_fraction_of_equity, "risk_budget_fraction_of_equity"
+            )
+            if self.risk_budget_fraction_of_equity > self.max_incremental_bpr_fraction:
+                _refuse(
+                    "risk_budget_fraction_of_equity "
+                    f"{self.risk_budget_fraction_of_equity} exceeds "
+                    f"max_incremental_bpr_fraction {self.max_incremental_bpr_fraction}",
+                    hint="sizing would routinely produce candidates the governor's "
+                    "own incremental-BPR cap refuses; lower the fraction or raise "
+                    "the cap deliberately, together",
+                )
 
         _check_amount(self.max_leg_spread_dollars, "max_leg_spread_dollars")
         for label in (
@@ -568,6 +605,11 @@ class RiskPolicy:
                 f"{ENV_PREFIX}RISK_BUDGET_PER_POSITION",
                 DEFAULT_RISK_BUDGET_PER_POSITION,
             ),
+            "risk_budget_fraction_of_equity": _optional_decimal(
+                source,
+                f"{ENV_PREFIX}RISK_BUDGET_FRACTION_OF_EQUITY",
+                DEFAULT_RISK_BUDGET_FRACTION_OF_EQUITY,
+            ),
             "profit_target_fraction": _decimal(
                 source,
                 f"{ENV_PREFIX}PROFIT_TARGET_FRACTION",
@@ -614,8 +656,12 @@ class RiskPolicy:
                 f"  strikes        {self.neutral_target_delta} delta neutral, "
                 f"{self.directional_target_delta} delta directional, "
                 f"{self.target_width} wide",
-                f"  sizing         {self.risk_budget_per_position} risk budget "
-                f"per position",
+                f"  sizing         {self.risk_budget_per_position} flat fallback"
+                + (
+                    f", {self.risk_budget_fraction_of_equity} of net liq when live"
+                    if self.risk_budget_fraction_of_equity is not None
+                    else " (equity-fraction sizing off)"
+                ),
                 f"  management     take {self.profit_target_fraction} of max profit, "
                 f"{'roll' if self.roll_at_management_dte else 'exit'} at "
                 f"{self.management_dte} DTE",
@@ -626,7 +672,7 @@ class RiskPolicy:
             ]
         )
 
-    def to_record(self) -> dict[str, str]:
+    def to_record(self) -> dict[str, str | None]:
         """What the journal stores so a past decision can be re-derived.
 
         The classification maps are included, not just the numeric caps. A
@@ -659,6 +705,11 @@ class RiskPolicy:
             "directional_target_delta": str(self.directional_target_delta),
             "target_width": str(self.target_width),
             "risk_budget_per_position": str(self.risk_budget_per_position),
+            "risk_budget_fraction_of_equity": (
+                str(self.risk_budget_fraction_of_equity)
+                if self.risk_budget_fraction_of_equity is not None
+                else None
+            ),
             "profit_target_fraction": str(self.profit_target_fraction),
             "management_dte": str(self.management_dte),
             "roll_at_management_dte": str(self.roll_at_management_dte),
@@ -688,6 +739,29 @@ def _decimal(
             f"{key}={raw!r} is not a decimal number",
             hint="thresholds are parsed as Decimal so a rounding artefact cannot "
             "move a risk cap",
+        ) from None
+
+
+def _optional_decimal(
+    source: "dict[str, str] | os._Environ[str]", key: str, default: Decimal | None
+) -> Decimal | None:
+    """Like :func:`_decimal`, but the literal ``"off"``/``"none"`` opts out to
+    ``None`` explicitly rather than through an absent/empty variable -- an
+    unset variable falls through to ``default`` exactly as it does anywhere
+    else in this module, so a blank ``.env`` line cannot be mistaken for a
+    deliberate opt-out."""
+    raw = (source.get(key) or "").strip()
+    if not raw:
+        return default
+    if raw.lower() in ("off", "none"):
+        return None
+    try:
+        return Decimal(raw)
+    except InvalidOperation:
+        raise ConfigError(
+            f"{key}={raw!r} is not a decimal number",
+            hint="thresholds are parsed as Decimal so a rounding artefact cannot "
+            "move a risk cap; use 'off' to disable equity-fraction sizing",
         ) from None
 
 

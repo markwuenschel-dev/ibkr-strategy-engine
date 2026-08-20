@@ -433,6 +433,84 @@ class TestWidthAndRiskBudget:
             RiskPolicy(risk_budget_per_position=500.0)  # type: ignore[arg-type]
 
 
+class TestRiskBudgetFractionOfEquity:
+    def test_default_is_two_percent(self) -> None:
+        assert RiskPolicy().risk_budget_fraction_of_equity == D("0.02")
+
+    def test_none_is_an_explicit_opt_out(self) -> None:
+        """Flat-dollar sizing, unconditionally -- the pre-2026-08-18 behavior,
+        kept reachable rather than removed."""
+        policy = RiskPolicy(risk_budget_fraction_of_equity=None)
+        assert policy.risk_budget_fraction_of_equity is None
+
+    def test_zero_refused(self) -> None:
+        with pytest.raises(ConfigError) as exc:
+            RiskPolicy(risk_budget_fraction_of_equity=D("0"))
+        assert "risk_budget_fraction_of_equity" in str(exc.value)
+
+    def test_negative_refused(self) -> None:
+        with pytest.raises(ConfigError):
+            RiskPolicy(risk_budget_fraction_of_equity=D("-0.02"))
+
+    def test_above_one_refused(self) -> None:
+        """This is a fraction of net liquidation, not a percentage -- the same
+        typo guard every other fraction field on this policy has."""
+        with pytest.raises(ConfigError):
+            RiskPolicy(risk_budget_fraction_of_equity=D("15"))
+
+    def test_exceeding_the_incremental_bpr_cap_is_refused(self) -> None:
+        """Sizing that routinely produces a candidate the governor's own
+        incremental-BPR cap refuses is a misconfiguration, not a slow day."""
+        with pytest.raises(ConfigError) as exc:
+            RiskPolicy(
+                risk_budget_fraction_of_equity=D("0.10"),
+                max_incremental_bpr_fraction=D("0.05"),
+            )
+        assert "max_incremental_bpr_fraction" in str(exc.value)
+
+    def test_exactly_at_the_incremental_bpr_cap_is_accepted(self) -> None:
+        policy = RiskPolicy(
+            risk_budget_fraction_of_equity=D("0.05"),
+            max_incremental_bpr_fraction=D("0.05"),
+        )
+        assert policy.risk_budget_fraction_of_equity == D("0.05")
+
+    def test_nan_and_infinite_refused(self) -> None:
+        for value in (D("NaN"), D("Infinity")):
+            with pytest.raises(ConfigError):
+                RiskPolicy(risk_budget_fraction_of_equity=value)
+
+    def test_records_and_describes_when_set(self) -> None:
+        policy = RiskPolicy(risk_budget_fraction_of_equity=D("0.03"))
+        assert policy.to_record()["risk_budget_fraction_of_equity"] == "0.03"
+        assert "0.03" in policy.describe()
+
+    def test_records_and_describes_when_off(self) -> None:
+        policy = RiskPolicy(risk_budget_fraction_of_equity=None)
+        assert policy.to_record()["risk_budget_fraction_of_equity"] is None
+        assert "off" in policy.describe()
+
+    def test_from_env_parses_a_decimal(self) -> None:
+        env = {"IBKR_OPTIONS_RISK_BUDGET_FRACTION_OF_EQUITY": "0.04"}
+        assert RiskPolicy.from_env(env=env).risk_budget_fraction_of_equity == D("0.04")
+
+    def test_from_env_off_disables_it(self) -> None:
+        env = {"IBKR_OPTIONS_RISK_BUDGET_FRACTION_OF_EQUITY": "off"}
+        assert RiskPolicy.from_env(env=env).risk_budget_fraction_of_equity is None
+
+    def test_from_env_none_disables_it_too(self) -> None:
+        env = {"IBKR_OPTIONS_RISK_BUDGET_FRACTION_OF_EQUITY": "NONE"}
+        assert RiskPolicy.from_env(env=env).risk_budget_fraction_of_equity is None
+
+    def test_from_env_default_is_unset_variable(self) -> None:
+        assert RiskPolicy.from_env(env={}).risk_budget_fraction_of_equity == D("0.02")
+
+    def test_from_env_garbage_is_refused_not_silently_dropped(self) -> None:
+        env = {"IBKR_OPTIONS_RISK_BUDGET_FRACTION_OF_EQUITY": "five percent"}
+        with pytest.raises(ConfigError):
+            RiskPolicy.from_env(env=env)
+
+
 # ===========================================================================
 # Maximum ages
 # ===========================================================================
