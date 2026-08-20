@@ -987,7 +987,7 @@ class PaperDayController:
             bool(reviewer_pids),
             f"pids {sorted(set(reviewer_pids))}" if reviewer_pids
             else "no reviewer-side watcher process found -- verifier will be unavailable",
-            severity="info",
+            severity="degrading",
         )
 
         # -- 7. recover incomplete handoffs --------------------------------
@@ -1036,7 +1036,7 @@ class PaperDayController:
                 "verifier liveness",
                 False,
                 "skipped -- no reviewer watcher to answer",
-                severity="info",
+                severity="degrading",
             )
 
         # -- 12. approval-consumption mechanics proof ----------------------
