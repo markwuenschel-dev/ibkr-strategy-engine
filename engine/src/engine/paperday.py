@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
-import errno
 import hashlib
 import json
 import os
@@ -282,6 +281,51 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
+
+
+def _acquire_lock_atomically(path: Path, payload: str) -> bool:
+    """Create ``path`` exclusively, with no torn-file window.
+
+    (BLOCKER-1, ``docs/paper-day-recovery/open-questions.md``: the previous
+    writer was a bare ``os.open(O_CREAT|O_EXCL) + write`` with no fsync and
+    no atomic publish -- a crash between create and flush left a zero-byte or
+    partial lock on disk, which ``_read_json`` cannot tell apart from a
+    deliberately corrupted one, and which every recovery path then refuses
+    with no way forward. This writes the full payload to a private, fsynced
+    temp file first -- a crash there orphans an unreferenced temp file, never
+    ``path`` itself -- then publishes with ``os.link``, which is atomic *and*
+    preserves the exact mutual-exclusion contract ``O_CREAT|O_EXCL`` gave:
+    it raises when ``path`` already exists, so two concurrent starts still
+    cannot both win.
+
+    Returns ``False`` (does not raise) when another process already holds
+    the lock -- the caller's existing "another start acquired the lock
+    concurrently" branch is unchanged.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            return False
+        return True
     finally:
         if temporary is not None:
             with contextlib.suppress(FileNotFoundError):
@@ -1273,19 +1317,13 @@ class PaperDayController:
         if self.config_sha256 is not None:
             lock_payload[GATE_CONFIG_SHA256] = self.config_sha256
         payload = json.dumps(lock_payload, indent=2)
-        try:
-            handle = os.open(self.paths.lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except OSError as exc:
-            if exc.errno == errno.EEXIST:
-                report.add(
-                    "session lock",
-                    False,
-                    "another start acquired the lock concurrently; re-run to verify",
-                )
-                return None
-            raise
-        with os.fdopen(handle, "w", encoding="utf-8") as stream:
-            stream.write(payload)
+        if not _acquire_lock_atomically(self.paths.lock, payload):
+            report.add(
+                "session lock",
+                False,
+                "another start acquired the lock concurrently; re-run to verify",
+            )
+            return None
         report.add("session lock", True, f"acquired for {report.session_id}")
         return "fresh"
 
