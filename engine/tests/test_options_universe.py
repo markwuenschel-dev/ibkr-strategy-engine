@@ -537,7 +537,7 @@ class TestPhaseTwo:
         nomination = row.nomination
         assert nomination is not None
         assert nomination.underlying == "AAA"
-        assert nomination.family == "SHORT_PREMIUM"
+        assert nomination.family == "PUT_CREDIT_SPREAD"
         assert nomination.direction == "BULLISH"
         # delta -(strike-75)/100 against a 0.30 target: short 105, long 100.
         assert [(leg.con_id, str(leg.strike), leg.action) for leg in nomination.legs] == [

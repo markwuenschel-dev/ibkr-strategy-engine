@@ -570,6 +570,82 @@ def event_names(store: PositionStore) -> list[str]:
 
 
 # ===========================================================================
+# _effective_risk_budget -- capital-aware sizing, degrading to the flat
+# fallback rather than blocking a candidate that has not even been priced yet
+# ===========================================================================
+
+
+class _FakePortfolioPort:
+    def __init__(self, net_liquidation: Decimal | None, *, raises: bool = False) -> None:
+        self._net_liquidation = net_liquidation
+        self._raises = raises
+        self.calls = 0
+
+    def snapshot(self, *, as_of: dt.datetime) -> PortfolioSnapshot:
+        self.calls += 1
+        if self._raises:
+            raise ConnectionError("broker unreachable")
+        return PortfolioSnapshot(as_of=as_of, net_liquidation=self._net_liquidation)
+
+
+class TestEffectiveRiskBudget:
+    NOW = dt.datetime(2026, 8, 18, tzinfo=dt.timezone.utc)
+
+    def test_scales_by_live_net_liquidation(self) -> None:
+        from engine.options.runner import _effective_risk_budget
+
+        policy = RiskPolicy(risk_budget_fraction_of_equity=Decimal("0.02"))
+        port = _FakePortfolioPort(Decimal("1000000"))
+
+        budget = _effective_risk_budget(policy, portfolio=port, now=self.NOW)
+
+        assert budget == Decimal("20000")
+        assert port.calls == 1
+
+    def test_falls_back_to_flat_when_the_fraction_is_off(self) -> None:
+        from engine.options.runner import _effective_risk_budget
+
+        policy = RiskPolicy(risk_budget_fraction_of_equity=None)
+        port = _FakePortfolioPort(Decimal("1000000"))
+
+        budget = _effective_risk_budget(policy, portfolio=port, now=self.NOW)
+
+        assert budget == policy.risk_budget_per_position
+        assert port.calls == 0  # no need to spend a broker query at all
+
+    def test_falls_back_to_flat_when_there_is_no_portfolio_port(self) -> None:
+        from engine.options.runner import _effective_risk_budget
+
+        policy = RiskPolicy(risk_budget_fraction_of_equity=Decimal("0.02"))
+
+        budget = _effective_risk_budget(policy, portfolio=None, now=self.NOW)
+
+        assert budget == policy.risk_budget_per_position
+
+    def test_falls_back_to_flat_when_the_broker_query_fails(self) -> None:
+        """A hiccup here degrades to the constant; it does not block a
+        candidate that has not even been priced yet."""
+        from engine.options.runner import _effective_risk_budget
+
+        policy = RiskPolicy(risk_budget_fraction_of_equity=Decimal("0.02"))
+        port = _FakePortfolioPort(None, raises=True)
+
+        budget = _effective_risk_budget(policy, portfolio=port, now=self.NOW)
+
+        assert budget == policy.risk_budget_per_position
+
+    def test_falls_back_to_flat_on_nonpositive_net_liquidation(self) -> None:
+        from engine.options.runner import _effective_risk_budget
+
+        policy = RiskPolicy(risk_budget_fraction_of_equity=Decimal("0.02"))
+        port = _FakePortfolioPort(Decimal("0"))
+
+        budget = _effective_risk_budget(policy, portfolio=port, now=self.NOW)
+
+        assert budget == policy.risk_budget_per_position
+
+
+# ===========================================================================
 # The fakes are good enough to reach the transmission decision
 # ===========================================================================
 

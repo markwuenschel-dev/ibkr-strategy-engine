@@ -78,7 +78,14 @@ from .liquidity import check_liquidity
 from .pacing import DiscoveryPaced, PacedRequestBudget, Priority, RequestKind
 from .pacing_ledger import PacingLedger
 from .policy import RiskPolicy
-from .ports import ContractDataPort, LiveMarketDataPort, VolatilityHistoryPort
+from .ports import (
+    ContractDataPort,
+    LiveMarketDataPort,
+    PriceHistoryPort,
+    VolatilityHistoryPort,
+)
+from .realized_vol import PriceObservation, RealizedVolMetric, build_realized_vol
+from .rvstore import CachedPriceSeries, RVStore
 from .regime import (
     RegimeDecision,
     VolatilityAssessment,
@@ -1119,18 +1126,28 @@ class ObservationCacheIVStore:
         self.ttl = ttl
         self._records: dict[str, tuple[RawObservation, ...]] = {}
 
-    def prefetch(self, symbols: Iterable[str]) -> None:
+    def prefetch(
+        self,
+        symbols: Iterable[str],
+        *,
+        records: Mapping[str, Sequence[RawObservation]] | None = None,
+    ) -> None:
+        """``records``, when supplied, is an already-fetched batch (typically
+        shared with :class:`ObservationCacheRVStore` so the two adapters
+        spend one ``read_many`` between them, not one each) -- this reuses it
+        instead of hitting the cache again."""
         wanted = tuple(dict.fromkeys(str(symbol).strip().upper() for symbol in symbols))
         if not wanted:
             return
-        records = self.cache.read_many(
-            wanted,
-            now=self.now,
-            session_date=self.session_date,
-            catalog_version=self.catalog_version,
-            configuration_version=self.configuration_version,
-            include_expired=True,
-        )
+        if records is None:
+            records = self.cache.read_many(
+                wanted,
+                now=self.now,
+                session_date=self.session_date,
+                catalog_version=self.catalog_version,
+                configuration_version=self.configuration_version,
+                include_expired=True,
+            )
         self._records.update(
             {
                 symbol: tuple(
@@ -1232,6 +1249,177 @@ class ObservationCacheIVStore:
             payload={
                 "observations": [
                     {"on": item.on.isoformat(), "iv": str(item.implied_volatility)}
+                    for item in observations
+                ]
+            },
+            envelope=envelope,
+            catalog_version=catalog_version or self.catalog_version,
+        )
+        self.cache.write_batch((update,))
+        self._records[update.symbol] = (update,)
+
+    @property
+    def observation_times(self) -> tuple[dt.datetime, ...]:
+        return tuple(
+            observation.observed_at
+            for records in self._records.values()
+            for observation in records
+        )
+
+
+class ObservationCacheRVStore:
+    """RVStore-shaped adapter over the durable raw-observation cache.
+
+    :class:`ObservationCacheIVStore`'s counterpart for realized-vol input:
+    same durable, batch/indexed cache, same raw-input-not-derived-conclusion
+    contract. The ``"realized-volatility"`` key was already reserved in
+    :meth:`ObservationCacheIVStore.prefetch`'s filter (line ~1146) before any
+    writer existed for it -- this class is that writer.
+    """
+
+    def __init__(
+        self,
+        cache: ObservationCache,
+        *,
+        session_date: dt.date,
+        catalog_version: str,
+        configuration_version: str,
+        now: dt.datetime,
+        ttl: dt.timedelta = dt.timedelta(hours=20),
+    ) -> None:
+        if now.tzinfo is None:
+            raise ValueError("cache adapter now must be timezone-aware")
+        if ttl <= dt.timedelta(0):
+            raise ValueError("cache adapter ttl must be positive")
+        self.cache = cache
+        self.session_date = session_date
+        self.catalog_version = catalog_version
+        self.configuration_version = configuration_version
+        self.now = now.astimezone(dt.timezone.utc)
+        self.ttl = ttl
+        self._records: dict[str, tuple[RawObservation, ...]] = {}
+
+    def prefetch(
+        self,
+        symbols: Iterable[str],
+        *,
+        records: Mapping[str, Sequence[RawObservation]] | None = None,
+    ) -> None:
+        """``records``, when supplied, is a batch already fetched elsewhere
+        (typically :class:`ObservationCacheIVStore`'s prefetch, since that
+        adapter's own filter already includes the ``"realized-volatility"``
+        key) -- reused here so the pair spends one ``read_many`` between
+        them, not one each."""
+        wanted = tuple(dict.fromkeys(str(symbol).strip().upper() for symbol in symbols))
+        if not wanted:
+            return
+        if records is None:
+            records = self.cache.read_many(
+                wanted,
+                now=self.now,
+                session_date=self.session_date,
+                catalog_version=self.catalog_version,
+                configuration_version=self.configuration_version,
+                include_expired=True,
+            )
+        self._records.update(
+            {
+                symbol: tuple(
+                    observation
+                    for observation in records.get(symbol, ())
+                    if observation.key == "realized-volatility"
+                )
+                for symbol in wanted
+            }
+        )
+
+    @staticmethod
+    def _decode(observations: Iterable[RawObservation]) -> tuple[PriceObservation, ...]:
+        decoded: list[PriceObservation] = []
+        for observation in observations:
+            payload = observation.payload
+            raw_series: Any = payload.get("observations", payload.get("series"))
+            if raw_series is None and "on" in payload and "close" in payload:
+                raw_series = [payload]
+            if not isinstance(raw_series, (list, tuple)):
+                continue
+            for raw in raw_series:
+                if not isinstance(raw, Mapping):
+                    continue
+                try:
+                    on = dt.date.fromisoformat(str(raw["on"]))
+                    close = Decimal(str(raw["close"]))
+                except (KeyError, TypeError, ValueError, InvalidOperation):
+                    continue
+                if close.is_finite() and close > ZERO:
+                    decoded.append(PriceObservation(on=on, close=close))
+        return tuple(sorted(decoded, key=lambda item: item.on))
+
+    def _records_for(self, symbol: str) -> tuple[RawObservation, ...]:
+        wanted = symbol.strip().upper()
+        if wanted not in self._records:
+            self.prefetch((wanted,))
+        return self._records.get(wanted, ())
+
+    def read(self, symbol: str) -> CachedPriceSeries:
+        wanted = symbol.strip().upper()
+        records = self._records_for(wanted)
+        observations = self._decode(records)
+        newest = max(records, key=lambda item: item.observed_at, default=None)
+        return CachedPriceSeries(
+            symbol=wanted,
+            observations=observations,
+            fetched_at=newest.observed_at if newest is not None else None,
+            source=newest.envelope.source if newest is not None else "cache",
+            envelope=newest.envelope if newest is not None else None,
+        )
+
+    def fresh(
+        self,
+        symbol: str,
+        *,
+        today: dt.date,
+        now: dt.datetime,
+        previous_session: dt.date | None = None,
+    ) -> bool:
+        cached = self.read(symbol)
+        if cached.envelope is None or not cached.observations:
+            return False
+        if not cached.envelope.fresh(now=now, session_date=today):
+            return False
+        if cached.envelope.session_date != today:
+            return False
+        previous = previous_session or _previous_weekday(today)
+        return cached.last_observation is not None and cached.last_observation >= previous
+
+    def write(
+        self,
+        symbol: str,
+        observations: list[PriceObservation] | tuple[PriceObservation, ...],
+        *,
+        fetched_at: dt.datetime,
+        source: str = "IBKR:reqHistoricalData:trades",
+        ttl: dt.timedelta = dt.timedelta(hours=20),
+        configuration_version: str | None = None,
+        catalog_version: str | None = None,
+    ) -> None:
+        fetched_at = fetched_at.astimezone(dt.timezone.utc)
+        envelope = ObservationEnvelope(
+            symbol=symbol.strip().upper(),
+            session_date=fetched_at.date(),
+            observed_at=fetched_at,
+            expires_at=fetched_at + ttl,
+            source=source,
+            freshness_class=FreshnessClass.SLOW_OBSERVATION,
+            configuration_version=configuration_version or self.configuration_version,
+            subscription_generation=uuid4(),
+        )
+        update = RawObservation(
+            symbol=symbol,
+            key="realized-volatility",
+            payload={
+                "observations": [
+                    {"on": item.on.isoformat(), "close": str(item.close)}
                     for item in observations
                 ]
             },
@@ -1663,6 +1851,7 @@ def run_catalog_universe_pass(
     config: UniverseScanConfig,
     metadata_store: SessionMetadataStore | None = None,
     volatility_history: VolatilityHistoryPort | None = None,
+    price_history: PriceHistoryPort | None = None,
     contract_data: ContractDataPort | None = None,
     market_data: LiveMarketDataPort | None = None,
     event_risk: Callable[[str], str | None] | None = None,
@@ -1766,7 +1955,30 @@ def run_catalog_universe_pass(
         configuration_version=config.version,
         now=when,
     )
-    adapter.prefetch(entry.symbol for entry in snapshot.entries if entry.active and entry.scan_eligible)
+    rv_adapter = ObservationCacheRVStore(
+        observation_cache,
+        session_date=session_date,
+        catalog_version=snapshot.version,
+        configuration_version=config.version,
+        now=when,
+    )
+    # One batch read shared by both adapters -- IVStore's own key filter
+    # already includes "realized-volatility" (line ~1146), so a second
+    # read_many for the RV adapter would be pure duplication.
+    prefetch_symbols = tuple(
+        entry.symbol for entry in snapshot.entries if entry.active and entry.scan_eligible
+    )
+    if prefetch_symbols:
+        prefetched = observation_cache.read_many(
+            tuple(dict.fromkeys(s.strip().upper() for s in prefetch_symbols)),
+            now=adapter.now,
+            session_date=session_date,
+            catalog_version=snapshot.version,
+            configuration_version=config.version,
+            include_expired=True,
+        )
+        adapter.prefetch(prefetch_symbols, records=prefetched)
+        rv_adapter.prefetch(prefetch_symbols, records=prefetched)
     budget = _DurablePacingBudget(pacing_ledger, owner_id=scan_id, now=when)
     phase2_order = queue.phase_two_order(
         symbols=(entry.symbol for entry in universe),
@@ -1784,6 +1996,8 @@ def run_catalog_universe_pass(
             regime_policy=regime_policy,
             config=config,
             volatility_history=volatility_history,
+            rv_store=rv_adapter,  # type: ignore[arg-type]
+            price_history=price_history,
             contract_data=contract_data,
             market_data=market_data,
             event_risk=event_risk,
@@ -1889,6 +2103,8 @@ def run_universe_pass(
     regime_policy: VolatilityRegimePolicy,
     config: UniverseScanConfig,
     volatility_history: VolatilityHistoryPort | None = None,
+    rv_store: RVStore | None = None,
+    price_history: PriceHistoryPort | None = None,
     contract_data: ContractDataPort | None = None,
     market_data: LiveMarketDataPort | None = None,
     event_risk: Callable[[str], str | None] | None = None,
@@ -1922,6 +2138,14 @@ def run_universe_pass(
         )
 
     # -- phase 1a: partition by cache freshness -----------------------------
+    # Staleness is decided by the IV series alone -- the "IV cache warm means
+    # zero broker requests" contract several callers and tests depend on.
+    # Realized vol does NOT gate this partition: it rides along for free
+    # whenever a symbol is already being refreshed for IV (phase 1c) or reads
+    # from its own cache when one exists (phase 1b), but a symbol with a warm
+    # IV cache and a cold RV cache is still served fresh -- RV catches up the
+    # next time that symbol's IV naturally goes stale, rather than forcing an
+    # extra historical pull the IV cache says is unnecessary.
     fresh: list[str] = []
     stale: list[tuple[str, IVRankMetric | None]] = []
     for symbol in by_symbol:
@@ -1951,12 +2175,20 @@ def run_universe_pass(
 
     # -- phase 1b: serve fresh from cache (zero broker requests) ------------
     metrics: dict[str, tuple[IVRankMetric, ObservationProvenance]] = {}
+    rv_metrics: dict[str, RealizedVolMetric] = {}
     for symbol in fresh:
         cached = iv_store.read(symbol)
-        metrics[symbol] = (
-            build_iv_rank(symbol, cached.observations, calculated_at=when),
-            ObservationProvenance.CACHE,
-        )
+        iv_metric = build_iv_rank(symbol, cached.observations, calculated_at=when)
+        metrics[symbol] = (iv_metric, ObservationProvenance.CACHE)
+        if rv_store is not None:
+            cached_rv = rv_store.read(symbol)
+            if cached_rv.observations:
+                rv_metrics[symbol] = build_realized_vol(
+                    symbol,
+                    cached_rv.observations,
+                    current_iv=iv_metric.current_iv,
+                    calculated_at=when,
+                )
 
     # -- phase 1c: bounded, budget-paced refresh of the stale ---------------
     refresh_attempts = 0
@@ -2064,10 +2296,37 @@ def run_universe_pass(
                 iv_store.write(symbol, list(observations), fetched_at=when)
             except Exception:  # noqa: BLE001 - a cache write failure degrades, never aborts
                 pass
-        metrics[symbol] = (
-            build_iv_rank(symbol, observations, calculated_at=when),
-            ObservationProvenance.REFRESHED,
-        )
+        iv_metric = build_iv_rank(symbol, observations, calculated_at=when)
+        metrics[symbol] = (iv_metric, ObservationProvenance.REFRESHED)
+
+        # Realized vol rides the same slot: the symbol already cleared every
+        # gate above (not paced, budget available, port configured), so this
+        # is the one place a second historical pull is spent per symbol per
+        # pass rather than a whole parallel bookkeeping system. A failure or
+        # absence here degrades iv_rv_ratio to None -- it does not touch the
+        # IV refresh this loop already committed.
+        if price_history is not None:
+            try:
+                budget.acquire(RequestKind.HISTORICAL, priority=Priority.DISCOVERY)
+            except DiscoveryPaced:
+                pass
+            else:
+                try:
+                    price_observations = tuple(price_history.price_history(symbol))
+                except Exception:  # noqa: BLE001 - adapter boundary
+                    price_observations = ()
+                if price_observations:
+                    if rv_store is not None:
+                        try:
+                            rv_store.write(symbol, list(price_observations), fetched_at=when)
+                        except Exception:  # noqa: BLE001 - cache write degrades, never aborts
+                            pass
+                    rv_metrics[symbol] = build_realized_vol(
+                        symbol,
+                        price_observations,
+                        current_iv=iv_metric.current_iv,
+                        calculated_at=when,
+                    )
 
     # -- phase 1d: event risk, regime, rank ---------------------------------
     ranked: list[tuple[Decimal, str, RegimeDecision]] = []
@@ -2086,11 +2345,15 @@ def run_universe_pass(
                 evaluated_at=when,
             )
             continue
+        rv_metric = rv_metrics.get(symbol)
         assessment = VolatilityAssessment(
             symbol=symbol,
             iv_rank=metric.iv_rank,
             iv_percentile=metric.iv_percentile,
             current_iv=metric.current_iv,
+            realized_vol_20=rv_metric.realized_vol_20 if rv_metric is not None else None,
+            realized_vol_60=rv_metric.realized_vol_60 if rv_metric is not None else None,
+            iv_rv_ratio=rv_metric.iv_rv_ratio if rv_metric is not None else None,
             event_risk=flag,
         )
         decision = classify(assessment, regime_policy)
@@ -2436,7 +2699,7 @@ def _phase_two(
 
     nomination = StructureNomination(
         underlying=symbol,
-        family=decision.permitted_families[0].value,
+        family=selection.strategy_type.value,
         direction=bias.value,
         expiration=selection.short.expiration,
         legs=(

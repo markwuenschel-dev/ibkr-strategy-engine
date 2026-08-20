@@ -45,6 +45,7 @@ from .options.adapters import (
     IBKRContractDataAdapter,
     IBKRLiveMarketDataAdapter,
     IBKRPortfolioStateAdapter,
+    IBKRPriceHistoryAdapter,
     IBKRVolatilityHistoryAdapter,
     read_open_orders,
 )
@@ -206,7 +207,7 @@ class _CycleRuntime:
     scanbook_store: ScanBookSnapshotStore
     scan_receipts: ScanReceiptStore
 
-    def _adapters(self, broker: Any, *, priority: Priority) -> tuple[Any, Any, Any]:
+    def _adapters(self, broker: Any, *, priority: Priority) -> tuple[Any, Any, Any, Any]:
         active_budget = self.budget
         contract_data = IBKRContractDataAdapter(
             broker.ib,
@@ -214,6 +215,12 @@ class _CycleRuntime:
             budget_priority=priority,
         )
         history = IBKRVolatilityHistoryAdapter(
+            broker.ib,
+            contract_data,
+            budget=active_budget,
+            budget_priority=Priority.DISCOVERY,
+        )
+        price_history = IBKRPriceHistoryAdapter(
             broker.ib,
             contract_data,
             budget=active_budget,
@@ -230,7 +237,7 @@ class _CycleRuntime:
             budget=active_budget,
             budget_priority=priority,
         )
-        return history, market, portfolio
+        return history, price_history, market, portfolio
 
     @staticmethod
     def _report(report: Any) -> dict[str, Any]:
@@ -241,7 +248,7 @@ class _CycleRuntime:
         return value if isinstance(value, dict) else {"outcome": str(value)}
 
     def management(self, context: PhaseContext) -> Mapping[str, Any]:
-        _history, market, portfolio = self._adapters(
+        _history, _price_history, market, portfolio = self._adapters(
             context.broker, priority=Priority.EXITS_MANAGEMENT
         )
         report = run_once(
@@ -422,7 +429,7 @@ class _CycleRuntime:
         ib = context.broker.ib
         ib.errorEvent += on_error
         try:
-            history, market, _portfolio = self._adapters(
+            history, price_history, market, _portfolio = self._adapters(
                 context.broker, priority=Priority.DISCOVERY
             )
             manifest = self._scan_manifest(scan_config)
@@ -445,6 +452,7 @@ class _CycleRuntime:
                     self.config.state_dir / "universe" / "metadata"
                 ),
                 volatility_history=history,
+                price_history=price_history,
                 contract_data=IBKRContractDataAdapter(
                     ib,
                     budget=self.budget,
@@ -500,7 +508,7 @@ class _CycleRuntime:
                 "transmissions": 0,
                 "new_openings": 0,
             }
-        _history, market, portfolio = self._adapters(
+        _history, _price_history, market, portfolio = self._adapters(
             context.broker, priority=Priority.AUTHORIZATION
         )
         from .options.positions import PositionStore

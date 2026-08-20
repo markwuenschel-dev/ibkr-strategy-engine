@@ -520,6 +520,11 @@ class TestReservationsVisibleToTheGovernor:
             # candidate's 500 (policy refuses incremental > total).
             max_total_bpr_fraction=D("0.0018"),
             max_incremental_bpr_fraction=D("0.0006"),
+            # This scenario is deliberately sized in flat dollars (the 500
+            # reservations the comment above describes) against a governor
+            # cap narrowed far below the equity-fraction sizing default --
+            # unrelated to what this test checks, so sizing stays flat.
+            risk_budget_fraction_of_equity=None,
             sectors=policy.sectors + (("QQQ", "BROAD_MARKET"),),
             correlation_groups=policy.correlation_groups + (("QQQ", "US_LARGE_CAP"),),
         )

@@ -50,6 +50,7 @@ from .marketdata import (
 )
 from .portfolio import PortfolioSnapshot, PositionExposure
 from .ports import UNDERLYING_GENERATION_KEY, StrategyQuoteSnapshot
+from .realized_vol import PriceObservation, observations_from_price_bars
 
 #: How the broker is asked what it is still working, in order of preference.
 #:
@@ -334,6 +335,68 @@ class IBKRVolatilityHistoryAdapter:
             formatDate=1,
         )
         return observations_from_bars(bars or [])
+
+
+class IBKRPriceHistoryAdapter:
+    """:class:`~engine.options.ports.PriceHistoryPort` over ``ib_async``.
+
+    Uses ``whatToShow="TRADES"`` against the underlying itself -- ordinary
+    daily close/high/low/volume bars, not an options entitlement at all, so
+    this is unaffected by the venue-level real-time-data blocker that
+    ``OPTIONS_REALTIME_DATA_REQUIRED`` names. Realized volatility is computed
+    from these closes by :mod:`engine.options.realized_vol`.
+    """
+
+    def __init__(
+        self,
+        ib: Any,
+        contract_data: IBKRContractDataAdapter,
+        *,
+        budget: Any = None,
+        budget_priority: Any = None,
+    ) -> None:
+        self.ib = ib
+        self.contract_data = contract_data
+        # Same request-budget shape as IBKRVolatilityHistoryAdapter, and for
+        # the same reason: historical pulls are hard-limited, and a scanner
+        # constructs this adapter with DISCOVERY priority so the held book's
+        # requests never queue behind breadth work.
+        self.budget = budget
+        self.budget_priority = budget_priority
+
+    def price_history(
+        self, symbol: str, *, duration: str = "4 M"
+    ) -> Sequence[PriceObservation]:
+        from ib_async import Stock  # noqa: PLC0415 - optional dependency
+
+        key = symbol.strip().upper()
+        if self.budget is not None:
+            from .pacing import Priority, RequestKind  # noqa: PLC0415
+
+            self.budget.acquire(
+                RequestKind.GENERAL,
+                priority=self.budget_priority or Priority.DISCOVERY,
+            )
+        qualified = self.ib.qualifyContracts(Stock(key, "SMART", "USD"))
+        if not qualified:
+            return []
+        if self.budget is not None:
+            from .pacing import Priority, RequestKind  # noqa: PLC0415
+
+            self.budget.acquire(
+                RequestKind.HISTORICAL,
+                priority=self.budget_priority or Priority.DISCOVERY,
+            )
+        bars = self.ib.reqHistoricalData(
+            qualified[0],
+            endDateTime="",
+            durationStr=duration,
+            barSizeSetting="1 day",
+            whatToShow="TRADES",
+            useRTH=True,
+            formatDate=1,
+        )
+        return observations_from_price_bars(bars or [])
 
 
 class IBKRWhatIfAdapter:

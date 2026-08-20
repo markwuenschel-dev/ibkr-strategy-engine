@@ -39,6 +39,7 @@ from .domain import OptionStrategyIntent
 from .execution import MarginAssessment
 from .executions import ExecutionRecord
 from .ivrank import IVObservation
+from .realized_vol import PriceObservation
 from .marketdata import OptionQuote, RefusalReason, UnderlyingQuote
 from .portfolio import PortfolioSnapshot
 
@@ -182,6 +183,26 @@ class VolatilityHistoryPort(Protocol):
         self, symbol: str, *, duration: str = "1 Y"
     ) -> Sequence[IVObservation]:
         """Daily implied-volatility observations, oldest first."""
+        ...
+
+
+@runtime_checkable
+class PriceHistoryPort(Protocol):
+    """Trailing daily closes for the underlying, for realized volatility.
+
+    Separate from :class:`VolatilityHistoryPort` because it is a different
+    ``reqHistoricalData`` series (``whatToShow="TRADES"`` against the
+    underlying, not ``OPTION_IMPLIED_VOLATILITY``) with its own entitlement
+    story and its own pacing cost -- collapsing the two would make one
+    series's outage look like the other's.
+    """
+
+    def price_history(
+        self, symbol: str, *, duration: str = "4 M"
+    ) -> Sequence[PriceObservation]:
+        """Daily closes, oldest first. Four calendar months comfortably
+        clears the 60-trading-day context window even across a holiday
+        cluster; three sits too close to the edge."""
         ...
 
 

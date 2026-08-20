@@ -1,0 +1,1386 @@
+{
+  "entries": [
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "US_LARGE_CAP",
+      "currency": "USD",
+      "entitlement": {
+        "entry_allowed": true,
+        "measured_at": "2026-08-18",
+        "method": "options-measure-entitlement bulk live-quote measurement: one reqMktData(type=LIVE) subscription per symbol against the underlying, marketDataType callback observed via CallbackRecorder, cancelled immediately after.",
+        "readiness": "VERIFIED",
+        "reason": "ARCA underlying served live type-1 data with no broker error, market_data_entitlement PASS"
+      },
+      "entry_eligible": true,
+      "listing_venue": "ARCA",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "BROAD_MARKET",
+      "security_type": "STK",
+      "symbol": "SPY"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_TECH",
+      "currency": "USD",
+      "entitlement": {
+        "entry_allowed": false,
+        "measured_at": "2026-08-13",
+        "readiness": "UNVERIFIED",
+        "reason": "NASDAQ.NMS live equity Level 1 data hard-refused (errors 10089/10091/10167: MARKET_DATA_TYPE_CALLBACK_MISSING); options legs are fine, the gap is the underlying equity feed. Fix is a NASDAQ Level 1 / TotalView-for-API subscription in Account Management, not a code or catalog change."
+      },
+      "entry_eligible": true,
+      "listing_venue": "NASDAQ",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "TECHNOLOGY",
+      "security_type": "STK",
+      "symbol": "QQQ"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "US_SMALL_CAP",
+      "currency": "USD",
+      "entitlement": {
+        "entry_allowed": true,
+        "measured_at": "2026-08-18",
+        "method": "options-measure-entitlement bulk live-quote measurement: one reqMktData(type=LIVE) subscription per symbol against the underlying, marketDataType callback observed via CallbackRecorder, cancelled immediately after.",
+        "readiness": "VERIFIED",
+        "reason": "ARCA underlying served live type-1 data with no broker error, market_data_entitlement PASS"
+      },
+      "entry_eligible": true,
+      "listing_venue": "ARCA",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "BROAD_MARKET",
+      "security_type": "STK",
+      "symbol": "IWM"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "US_LARGE_CAP",
+      "currency": "USD",
+      "entitlement": {
+        "entry_allowed": true,
+        "measured_at": "2026-08-18",
+        "method": "options-measure-entitlement bulk live-quote measurement: one reqMktData(type=LIVE) subscription per symbol against the underlying, marketDataType callback observed via CallbackRecorder, cancelled immediately after.",
+        "readiness": "VERIFIED",
+        "reason": "ARCA underlying served live type-1 data with no broker error, market_data_entitlement PASS"
+      },
+      "entry_eligible": true,
+      "listing_venue": "ARCA",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "BROAD_MARKET",
+      "security_type": "STK",
+      "symbol": "DIA"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "RATES",
+      "currency": "USD",
+      "entitlement": {
+        "entry_allowed": false,
+        "measured_at": "2026-08-13",
+        "readiness": "UNVERIFIED",
+        "reason": "NASDAQ.NMS live equity Level 1 data hard-refused (errors 10089/10091/10167: MARKET_DATA_TYPE_CALLBACK_MISSING); options legs are fine, the gap is the underlying equity feed. Fix is a NASDAQ Level 1 / TotalView-for-API subscription in Account Management, not a code or catalog change."
+      },
+      "entry_eligible": true,
+      "listing_venue": "NASDAQ",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "RATES",
+      "security_type": "STK",
+      "symbol": "TLT"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "CREDIT",
+      "currency": "USD",
+      "entitlement": {
+        "entry_allowed": true,
+        "measured_at": "2026-08-18",
+        "method": "options-measure-entitlement bulk live-quote measurement: one reqMktData(type=LIVE) subscription per symbol against the underlying, marketDataType callback observed via CallbackRecorder, cancelled immediately after.",
+        "readiness": "VERIFIED",
+        "reason": "ARCA underlying served live type-1 data with no broker error, market_data_entitlement PASS"
+      },
+      "entry_eligible": true,
+      "listing_venue": "ARCA",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "CREDIT",
+      "security_type": "STK",
+      "symbol": "HYG"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "GOLD",
+      "currency": "USD",
+      "entitlement": {
+        "entry_allowed": true,
+        "measured_at": "2026-08-18",
+        "method": "options-measure-entitlement bulk live-quote measurement: one reqMktData(type=LIVE) subscription per symbol against the underlying, marketDataType callback observed via CallbackRecorder, cancelled immediately after.",
+        "readiness": "VERIFIED",
+        "reason": "ARCA underlying served live type-1 data with no broker error, market_data_entitlement PASS"
+      },
+      "entry_eligible": true,
+      "listing_venue": "ARCA",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "GOLD",
+      "security_type": "STK",
+      "symbol": "GLD"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SILVER",
+      "currency": "USD",
+      "entitlement": {
+        "entry_allowed": true,
+        "measured_at": "2026-08-18",
+        "method": "options-measure-entitlement bulk live-quote measurement: one reqMktData(type=LIVE) subscription per symbol against the underlying, marketDataType callback observed via CallbackRecorder, cancelled immediately after.",
+        "readiness": "VERIFIED",
+        "reason": "ARCA underlying served live type-1 data with no broker error, market_data_entitlement PASS"
+      },
+      "entry_eligible": true,
+      "listing_venue": "ARCA",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "SILVER",
+      "security_type": "STK",
+      "symbol": "SLV"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "OIL",
+      "currency": "USD",
+      "entitlement": {
+        "entry_allowed": true,
+        "measured_at": "2026-08-18",
+        "method": "options-measure-entitlement bulk live-quote measurement: one reqMktData(type=LIVE) subscription per symbol against the underlying, marketDataType callback observed via CallbackRecorder, cancelled immediately after.",
+        "readiness": "VERIFIED",
+        "reason": "ARCA underlying served live type-1 data with no broker error, market_data_entitlement PASS"
+      },
+      "entry_eligible": true,
+      "listing_venue": "ARCA",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "OIL",
+      "security_type": "STK",
+      "symbol": "USO"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "EM_EQUITY",
+      "currency": "USD",
+      "entitlement": {
+        "entry_allowed": true,
+        "measured_at": "2026-08-18",
+        "method": "options-measure-entitlement bulk live-quote measurement: one reqMktData(type=LIVE) subscription per symbol against the underlying, marketDataType callback observed via CallbackRecorder, cancelled immediately after.",
+        "readiness": "VERIFIED",
+        "reason": "ARCA underlying served live type-1 data with no broker error, market_data_entitlement PASS"
+      },
+      "entry_eligible": true,
+      "listing_venue": "ARCA",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "EM_EQUITY",
+      "security_type": "STK",
+      "symbol": "EEM"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "CHINA_EQUITY",
+      "currency": "USD",
+      "entitlement": {
+        "entry_allowed": true,
+        "measured_at": "2026-08-18",
+        "method": "options-measure-entitlement bulk live-quote measurement: one reqMktData(type=LIVE) subscription per symbol against the underlying, marketDataType callback observed via CallbackRecorder, cancelled immediately after.",
+        "readiness": "VERIFIED",
+        "reason": "ARCA underlying served live type-1 data with no broker error, market_data_entitlement PASS"
+      },
+      "entry_eligible": true,
+      "listing_venue": "ARCA",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "CHINA_EQUITY",
+      "security_type": "STK",
+      "symbol": "FXI"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_ENERGY",
+      "currency": "USD",
+      "entitlement": {
+        "entry_allowed": true,
+        "measured_at": "2026-08-18",
+        "method": "options-measure-entitlement bulk live-quote measurement: one reqMktData(type=LIVE) subscription per symbol against the underlying, marketDataType callback observed via CallbackRecorder, cancelled immediately after.",
+        "readiness": "VERIFIED",
+        "reason": "ARCA underlying served live type-1 data with no broker error, market_data_entitlement PASS"
+      },
+      "entry_eligible": true,
+      "listing_venue": "ARCA",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "ENERGY",
+      "security_type": "STK",
+      "symbol": "XLE"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_FIN",
+      "currency": "USD",
+      "entitlement": {
+        "entry_allowed": true,
+        "measured_at": "2026-08-18",
+        "method": "options-measure-entitlement bulk live-quote measurement: one reqMktData(type=LIVE) subscription per symbol against the underlying, marketDataType callback observed via CallbackRecorder, cancelled immediately after.",
+        "readiness": "VERIFIED",
+        "reason": "ARCA underlying served live type-1 data with no broker error, market_data_entitlement PASS"
+      },
+      "entry_eligible": true,
+      "listing_venue": "ARCA",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "FINANCIALS",
+      "security_type": "STK",
+      "symbol": "XLF"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_TECH",
+      "currency": "USD",
+      "entitlement": {
+        "entry_allowed": true,
+        "measured_at": "2026-08-18",
+        "method": "options-measure-entitlement bulk live-quote measurement: one reqMktData(type=LIVE) subscription per symbol against the underlying, marketDataType callback observed via CallbackRecorder, cancelled immediately after.",
+        "readiness": "VERIFIED",
+        "reason": "ARCA underlying served live type-1 data with no broker error, market_data_entitlement PASS"
+      },
+      "entry_eligible": true,
+      "listing_venue": "ARCA",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "TECHNOLOGY",
+      "security_type": "STK",
+      "symbol": "XLK"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_HEALTH",
+      "currency": "USD",
+      "entitlement": {
+        "entry_allowed": true,
+        "measured_at": "2026-08-18",
+        "method": "options-measure-entitlement bulk live-quote measurement: one reqMktData(type=LIVE) subscription per symbol against the underlying, marketDataType callback observed via CallbackRecorder, cancelled immediately after.",
+        "readiness": "VERIFIED",
+        "reason": "ARCA underlying served live type-1 data with no broker error, market_data_entitlement PASS"
+      },
+      "entry_eligible": true,
+      "listing_venue": "ARCA",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "HEALTHCARE",
+      "security_type": "STK",
+      "symbol": "XLV"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_INDUSTRIAL",
+      "currency": "USD",
+      "entitlement": {
+        "entry_allowed": true,
+        "measured_at": "2026-08-18",
+        "method": "options-measure-entitlement bulk live-quote measurement: one reqMktData(type=LIVE) subscription per symbol against the underlying, marketDataType callback observed via CallbackRecorder, cancelled immediately after.",
+        "readiness": "VERIFIED",
+        "reason": "ARCA underlying served live type-1 data with no broker error, market_data_entitlement PASS"
+      },
+      "entry_eligible": true,
+      "listing_venue": "ARCA",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "INDUSTRIALS",
+      "security_type": "STK",
+      "symbol": "XLI"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_CONSUMER",
+      "currency": "USD",
+      "entitlement": {
+        "entry_allowed": true,
+        "measured_at": "2026-08-18",
+        "method": "options-measure-entitlement bulk live-quote measurement: one reqMktData(type=LIVE) subscription per symbol against the underlying, marketDataType callback observed via CallbackRecorder, cancelled immediately after.",
+        "readiness": "VERIFIED",
+        "reason": "ARCA underlying served live type-1 data with no broker error, market_data_entitlement PASS"
+      },
+      "entry_eligible": true,
+      "listing_venue": "ARCA",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "CONSUMER_STAPLES",
+      "security_type": "STK",
+      "symbol": "XLP"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_CONSUMER",
+      "currency": "USD",
+      "entitlement": {
+        "entry_allowed": true,
+        "measured_at": "2026-08-18",
+        "method": "options-measure-entitlement bulk live-quote measurement: one reqMktData(type=LIVE) subscription per symbol against the underlying, marketDataType callback observed via CallbackRecorder, cancelled immediately after.",
+        "readiness": "VERIFIED",
+        "reason": "ARCA underlying served live type-1 data with no broker error, market_data_entitlement PASS"
+      },
+      "entry_eligible": true,
+      "listing_venue": "ARCA",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "CONSUMER_DISCRETIONARY",
+      "security_type": "STK",
+      "symbol": "XLY"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_UTILITIES",
+      "currency": "USD",
+      "entitlement": {
+        "entry_allowed": true,
+        "measured_at": "2026-08-18",
+        "method": "options-measure-entitlement bulk live-quote measurement: one reqMktData(type=LIVE) subscription per symbol against the underlying, marketDataType callback observed via CallbackRecorder, cancelled immediately after.",
+        "readiness": "VERIFIED",
+        "reason": "ARCA underlying served live type-1 data with no broker error, market_data_entitlement PASS"
+      },
+      "entry_eligible": true,
+      "listing_venue": "ARCA",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "UTILITIES",
+      "security_type": "STK",
+      "symbol": "XLU"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_MATERIALS",
+      "currency": "USD",
+      "entitlement": {
+        "entry_allowed": true,
+        "measured_at": "2026-08-18",
+        "method": "options-measure-entitlement bulk live-quote measurement: one reqMktData(type=LIVE) subscription per symbol against the underlying, marketDataType callback observed via CallbackRecorder, cancelled immediately after.",
+        "readiness": "VERIFIED",
+        "reason": "ARCA underlying served live type-1 data with no broker error, market_data_entitlement PASS"
+      },
+      "entry_eligible": true,
+      "listing_venue": "ARCA",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "MATERIALS",
+      "security_type": "STK",
+      "symbol": "XLB"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_TECH",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "SEMICONDUCTORS",
+      "security_type": "STK",
+      "symbol": "SMH"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_HEALTH",
+      "currency": "USD",
+      "entitlement": {
+        "entry_allowed": true,
+        "measured_at": "2026-08-18",
+        "method": "options-measure-entitlement bulk live-quote measurement: one reqMktData(type=LIVE) subscription per symbol against the underlying, marketDataType callback observed via CallbackRecorder, cancelled immediately after.",
+        "readiness": "VERIFIED",
+        "reason": "ARCA underlying served live type-1 data with no broker error, market_data_entitlement PASS"
+      },
+      "entry_eligible": true,
+      "listing_venue": "ARCA",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "BIOTECH",
+      "security_type": "STK",
+      "symbol": "XBI"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_FIN",
+      "currency": "USD",
+      "entitlement": {
+        "entry_allowed": true,
+        "measured_at": "2026-08-18",
+        "method": "options-measure-entitlement bulk live-quote measurement: one reqMktData(type=LIVE) subscription per symbol against the underlying, marketDataType callback observed via CallbackRecorder, cancelled immediately after.",
+        "readiness": "VERIFIED",
+        "reason": "ARCA underlying served live type-1 data with no broker error, market_data_entitlement PASS"
+      },
+      "entry_eligible": true,
+      "listing_venue": "ARCA",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "REGIONAL_BANKS",
+      "security_type": "STK",
+      "symbol": "KRE"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_TECH",
+      "currency": "USD",
+      "entitlement": {
+        "entry_allowed": false,
+        "measured_at": "2026-08-13",
+        "readiness": "UNVERIFIED",
+        "reason": "NASDAQ.NMS live equity Level 1 data hard-refused (errors 10089/10091/10167: MARKET_DATA_TYPE_CALLBACK_MISSING); options legs are fine, the gap is the underlying equity feed. Fix is a NASDAQ Level 1 / TotalView-for-API subscription in Account Management, not a code or catalog change."
+      },
+      "entry_eligible": true,
+      "listing_venue": "NASDAQ",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "TECHNOLOGY",
+      "security_type": "STK",
+      "symbol": "AAPL"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_TECH",
+      "currency": "USD",
+      "entitlement": {
+        "entry_allowed": false,
+        "measured_at": "2026-08-13",
+        "readiness": "UNVERIFIED",
+        "reason": "NASDAQ.NMS live equity Level 1 data hard-refused (errors 10089/10091/10167: MARKET_DATA_TYPE_CALLBACK_MISSING); options legs are fine, the gap is the underlying equity feed. Fix is a NASDAQ Level 1 / TotalView-for-API subscription in Account Management, not a code or catalog change."
+      },
+      "entry_eligible": true,
+      "listing_venue": "NASDAQ",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "TECHNOLOGY",
+      "security_type": "STK",
+      "symbol": "MSFT"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_TECH",
+      "currency": "USD",
+      "entitlement": {
+        "entry_allowed": false,
+        "measured_at": "2026-08-13",
+        "readiness": "UNVERIFIED",
+        "reason": "NASDAQ.NMS live equity Level 1 data hard-refused (errors 10089/10091/10167: MARKET_DATA_TYPE_CALLBACK_MISSING); options legs are fine, the gap is the underlying equity feed. Fix is a NASDAQ Level 1 / TotalView-for-API subscription in Account Management, not a code or catalog change."
+      },
+      "entry_eligible": true,
+      "listing_venue": "NASDAQ",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "SEMICONDUCTORS",
+      "security_type": "STK",
+      "symbol": "NVDA"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_TECH",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "TECHNOLOGY",
+      "security_type": "STK",
+      "symbol": "AMZN"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_TECH",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "TECHNOLOGY",
+      "security_type": "STK",
+      "symbol": "META"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_TECH",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "TECHNOLOGY",
+      "security_type": "STK",
+      "symbol": "GOOGL"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_TECH",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "CONSUMER_DISCRETIONARY",
+      "security_type": "STK",
+      "symbol": "TSLA"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_TECH",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "SEMICONDUCTORS",
+      "security_type": "STK",
+      "symbol": "AMD"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_TECH",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "SEMICONDUCTORS",
+      "security_type": "STK",
+      "symbol": "AVGO"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_TECH",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "TECHNOLOGY",
+      "security_type": "STK",
+      "symbol": "NFLX"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_TECH",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "TECHNOLOGY",
+      "security_type": "STK",
+      "symbol": "CRM"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_TECH",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "TECHNOLOGY",
+      "security_type": "STK",
+      "symbol": "ORCL"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_TECH",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "SEMICONDUCTORS",
+      "security_type": "STK",
+      "symbol": "INTC"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_TECH",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "SEMICONDUCTORS",
+      "security_type": "STK",
+      "symbol": "MU"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_TECH",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "SEMICONDUCTORS",
+      "security_type": "STK",
+      "symbol": "QCOM"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_TECH",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "TECHNOLOGY",
+      "security_type": "STK",
+      "symbol": "PLTR"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_TECH",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "TECHNOLOGY",
+      "security_type": "STK",
+      "symbol": "IBM"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_FIN",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "FINANCIALS",
+      "security_type": "STK",
+      "symbol": "JPM"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_FIN",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "FINANCIALS",
+      "security_type": "STK",
+      "symbol": "BAC"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_FIN",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "FINANCIALS",
+      "security_type": "STK",
+      "symbol": "C"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_FIN",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "FINANCIALS",
+      "security_type": "STK",
+      "symbol": "GS"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_FIN",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "FINANCIALS",
+      "security_type": "STK",
+      "symbol": "MS"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_FIN",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "FINANCIALS",
+      "security_type": "STK",
+      "symbol": "WFC"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_FIN",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "FINANCIALS",
+      "security_type": "STK",
+      "symbol": "SCHW"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_ENERGY",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "ENERGY",
+      "security_type": "STK",
+      "symbol": "XOM"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_ENERGY",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "ENERGY",
+      "security_type": "STK",
+      "symbol": "CVX"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_ENERGY",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "ENERGY",
+      "security_type": "STK",
+      "symbol": "OXY"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_ENERGY",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "ENERGY",
+      "security_type": "STK",
+      "symbol": "COP"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_ENERGY",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "ENERGY",
+      "security_type": "STK",
+      "symbol": "SLB"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_CONSUMER",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "CONSUMER_STAPLES",
+      "security_type": "STK",
+      "symbol": "WMT"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_CONSUMER",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "CONSUMER_STAPLES",
+      "security_type": "STK",
+      "symbol": "COST"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_CONSUMER",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "CONSUMER_DISCRETIONARY",
+      "security_type": "STK",
+      "symbol": "TGT"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_CONSUMER",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "CONSUMER_DISCRETIONARY",
+      "security_type": "STK",
+      "symbol": "HD"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_CONSUMER",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "CONSUMER_DISCRETIONARY",
+      "security_type": "STK",
+      "symbol": "LOW"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_CONSUMER",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "CONSUMER_DISCRETIONARY",
+      "security_type": "STK",
+      "symbol": "NKE"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_CONSUMER",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "CONSUMER_DISCRETIONARY",
+      "security_type": "STK",
+      "symbol": "SBUX"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_CONSUMER",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "CONSUMER_DISCRETIONARY",
+      "security_type": "STK",
+      "symbol": "MCD"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_CONSUMER",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "CONSUMER_DISCRETIONARY",
+      "security_type": "STK",
+      "symbol": "DIS"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_CONSUMER",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "CONSUMER_DISCRETIONARY",
+      "security_type": "STK",
+      "symbol": "UBER"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_CONSUMER",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "CONSUMER_DISCRETIONARY",
+      "security_type": "STK",
+      "symbol": "ABNB"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_HEALTH",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "HEALTHCARE",
+      "security_type": "STK",
+      "symbol": "LLY"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_HEALTH",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "HEALTHCARE",
+      "security_type": "STK",
+      "symbol": "UNH"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_HEALTH",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "HEALTHCARE",
+      "security_type": "STK",
+      "symbol": "JNJ"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_HEALTH",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "HEALTHCARE",
+      "security_type": "STK",
+      "symbol": "PFE"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_HEALTH",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "HEALTHCARE",
+      "security_type": "STK",
+      "symbol": "MRK"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_HEALTH",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "HEALTHCARE",
+      "security_type": "STK",
+      "symbol": "ABBV"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_HEALTH",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "HEALTHCARE",
+      "security_type": "STK",
+      "symbol": "AMGN"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_INDUSTRIAL",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "INDUSTRIALS",
+      "security_type": "STK",
+      "symbol": "CAT"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_INDUSTRIAL",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "INDUSTRIALS",
+      "security_type": "STK",
+      "symbol": "BA"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_INDUSTRIAL",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "INDUSTRIALS",
+      "security_type": "STK",
+      "symbol": "GE"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_INDUSTRIAL",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "INDUSTRIALS",
+      "security_type": "STK",
+      "symbol": "RTX"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_INDUSTRIAL",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "INDUSTRIALS",
+      "security_type": "STK",
+      "symbol": "LMT"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_INDUSTRIAL",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "INDUSTRIALS",
+      "security_type": "STK",
+      "symbol": "DE"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_CONSUMER",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "CONSUMER_DISCRETIONARY",
+      "security_type": "STK",
+      "symbol": "F"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_CONSUMER",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "CONSUMER_DISCRETIONARY",
+      "security_type": "STK",
+      "symbol": "GM"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "CRYPTO",
+      "currency": "USD",
+      "entitlement": {
+        "readiness": "UNVERIFIED"
+      },
+      "entry_eligible": true,
+      "listing_venue": "UNKNOWN",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "CRYPTO",
+      "security_type": "STK",
+      "symbol": "COIN"
+    },
+    {
+      "active": true,
+      "broker_contract": null,
+      "correlation_group": "SECTOR_TECH",
+      "currency": "USD",
+      "entitlement": {
+        "entry_allowed": true,
+        "measured_at": "2026-08-18",
+        "method": "options-measure-entitlement bulk live-quote measurement: one reqMktData(type=LIVE) subscription per symbol against the underlying, marketDataType callback observed via CallbackRecorder, cancelled immediately after.",
+        "readiness": "VERIFIED",
+        "reason": "BATS underlying served live type-1 data with no broker error, market_data_entitlement PASS"
+      },
+      "entry_eligible": true,
+      "listing_venue": "BATS",
+      "optionability": true,
+      "scan_eligible": true,
+      "sector": "INNOVATION",
+      "security_type": "STK",
+      "symbol": "ARKK"
+    }
+  ],
+  "schema": "ibkr.universe-catalog/1",
+  "source": "C:\\Users\\Nalakram\\Documents\\GitHub\\ibkr-strategy-engine\\docs\\autotrader-catalog-operator-v1.json + options-measure-entitlement bulk pass (2026-08-18)",
+  "version": "operator-seed-80-v1+measured-2026-08-18"
+}
