@@ -1268,6 +1268,18 @@ def cmd_paperday_recover(args: argparse.Namespace, broker_factory: Any = Broker)
         out("")
         out("recovery_required cleared. entry_gate remains CLOSED -- a new, "
             "independently validated session must open it.")
+        if outcome.stale_records:
+            out("")
+            out("STALE SCHEDULER RECORDS")
+            for record in outcome.stale_records:
+                mark = "ok" if record.consumed else "--"
+                out(f"  {mark} {record.path.name:20s} {record.detail}")
+            if not any(record.consumed for record in outcome.stale_records):
+                note(
+                    "no scheduler record was consumed -- if one is still on "
+                    "disk naming a dead session, the next stop will re-latch "
+                    "recovery_required"
+                )
         return EXIT_OK
 
     return EXIT_ERROR

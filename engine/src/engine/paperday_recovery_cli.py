@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .archive import ArchiveError, archive_before_mutation
 from .config import EngineConfig
 from .journal import OrderJournal, utc_now
 from .paperday import PaperDayPaths, _acquire_lock_atomically, _read_json_or_corrupt
@@ -41,7 +42,7 @@ from .paperday_recovery import (
     SessionIdentity,
     evaluate_recovery_acceptance_bar,
 )
-from .scheduler import SchedulerPaths, find_unmatched_ticks
+from .scheduler import SchedulerPaths, find_unmatched_ticks, identity_from_record
 
 _SUPPORTED_SCHEMA_VERSIONS = frozenset({1})
 
@@ -269,6 +270,10 @@ class RecoveryOutcome:
     refused_reason: str | None
     acceptance: RecoveryAcceptanceResult | None
     applied: bool
+    #: Per-file result of consuming the stale scheduler records this recovery
+    #: resolved. Empty when the recovery did not apply (refused, failed, or a
+    #: dry run) -- consumption is never attempted in those cases.
+    stale_records: tuple[StaleRecordOutcome, ...] = ()
 
 
 def run_recovery(
@@ -338,7 +343,22 @@ def run_recovery(
         # and cannot accidentally release the winner's lock out from under
         # it.
         _release_lock_if_ours(_recovery_lock_path(paths), lock_token)
-    return RecoveryOutcome(refused_reason=None, acceptance=result, applied=applied)
+
+    # Only a recovery that actually APPLIED may consume the records that
+    # caused it. A refusal, a failed requirement, or a dry run must leave
+    # every file exactly as found -- so this is gated on `applied`, not on
+    # `result.all_passed`, which would let a dry run mutate state.
+    stale_records: tuple[StaleRecordOutcome, ...] = ()
+    if applied:
+        stale_records = consume_stale_scheduler_records(
+            paths=paths, process_port=port, now=now, reason=reason
+        )
+    return RecoveryOutcome(
+        refused_reason=None,
+        acceptance=result,
+        applied=applied,
+        stale_records=stale_records,
+    )
 
 
 def apply_recovery_result(paths: PaperDayPaths, result: RecoveryAcceptanceResult) -> bool:
@@ -391,3 +411,286 @@ def format_result(result: RecoveryAcceptanceResult) -> str:
     lines.append("")
     lines.append("ALL REQUIREMENTS PASSED" if result.all_passed else "REFUSED -- see failing requirement(s) above")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Consuming the stale scheduler records a completed recovery has resolved
+# ---------------------------------------------------------------------------
+#
+# Why this exists (2026-08-21, third dirty stop in eight days):
+#
+# ``scheduler.pid`` and ``scheduler.claim`` are the two durable statements
+# that a persistent scheduler was started. Neither is removed when the
+# scheduler dies without a clean terminal receipt:
+#
+#   * stop  -- ``scheduler.drain_and_stop`` returns STOP_DIRTY and pointedly
+#     does NOT unlink ``paths.pid`` (scheduler.py:1702-1707); only the
+#     proven-clean branch unlinks. ``paperday``'s stop then turns any failed
+#     "scheduler" step into ``recovery_required = True``
+#     (paperday.py:2085-2091).
+#   * start -- ``scheduler._claim_start`` refuses outright on a foreign claim
+#     and will not remove it without a clean terminal receipt
+#     (scheduler.py:879-886).
+#
+# Both are correct the FIRST time: a scheduler really did die mid-tick and its
+# final tick really is unaccounted for. The defect is that neither is
+# idempotent. The evidence that raised the alarm stays on disk after the alarm
+# has been answered, so it re-fires on every subsequent session forever. That
+# is what happened here: pid 240328 / session paperday-20260819-fa4081f5 died
+# on 2026-08-19 and was still latching STOP_DIRTY on 2026-08-21, across six
+# separate recovery attempts, because the recovery verb cleared the flag but
+# never touched the record that regenerates it.
+#
+# The fix is deliberately NOT "let stop age out old records". Teaching the
+# safety-critical stop path a new way to say "clean" is how this repo has
+# repeatedly ended up with guards that pin nothing. Instead the record is
+# consumed by the one operation that has already PROVEN it resolved: a
+# recovery attempt that passed all nine requirements. Every precondition below
+# is re-proven here rather than inherited, because the acceptance bar is
+# scoped to the session the operator named, which is not necessarily the
+# session named in the scheduler record.
+
+
+@dataclass(frozen=True)
+class StaleRecordOutcome:
+    """What consumption did to one scheduler record. ``consumed`` is True only
+    when the file was archived AND removed."""
+
+    path: Path
+    consumed: bool
+    detail: str
+    archive_path: Path | None = None
+
+
+def _refused(path: Path, detail: str) -> StaleRecordOutcome:
+    return StaleRecordOutcome(path=path, consumed=False, detail=detail)
+
+
+def consume_stale_scheduler_records(
+    *,
+    paths: PaperDayPaths,
+    process_port: Any,
+    now: dt.datetime,
+    reason: str,
+) -> tuple[StaleRecordOutcome, ...]:
+    """Archive-then-remove the scheduler records a passed recovery resolved.
+
+    Call ONLY after :func:`evaluate_recovery_acceptance_bar` reported
+    ``all_passed`` and the ``recovery_required`` write was applied. Refuses,
+    per file, on anything it cannot prove; a refusal leaves that file exactly
+    as found (decisions.md D4 -- state files are archived, never blind-deleted)
+    and never raises, because a failure to tidy up must not turn an otherwise
+    successful recovery into an error.
+
+    The five things re-proven here before ``scheduler.pid`` is touched:
+
+    1. the file exists (nothing to do is not a failure);
+    2. it is readable JSON -- a corrupt record is refused, not assumed empty,
+       exactly as BLOCKER-1 requirement 2 requires everywhere else;
+    3. it names a session AND a nonce (``identity_from_record``); an
+       unidentifiable record is a stranger's by default and is left alone;
+    4. its PID is proven dead through the same command-line-checking
+       ``process_port.alive`` the live-owner pre-check uses -- never bare PID
+       existence, since PID numbers get reused (2026-08-20: pid 64020 was
+       reused by an unrelated process four minutes after the controller exited);
+    5. the record's OWN session/nonce has zero unmatched ticks -- consuming a
+       record whose ticks were never checked would be precisely the "smooth
+       over unreconciled broker work" failure this project exists to prevent.
+
+    Through :func:`run_recovery` all five are already guaranteed before this
+    is ever called: :func:`build_recovery_attempt` derives the bar's
+    ``observed_identity`` from ``scheduler.pid`` itself, so requirement 2
+    refuses any record that is corrupt, nameless, or names a different
+    session/pid than the operator asserted, and requirements 2 and 4 then run
+    the liveness and unmatched-tick checks against that same identity. These
+    checks are therefore defence in depth on an operation that DELETES state,
+    not the primary gate -- they are stated and tested (by direct call, in
+    ``TestConsumptionRefusesWhatItCannotProve``) so that a future caller which
+    is not ``run_recovery`` cannot reach the delete without them.
+
+    ``scheduler.claim`` is consumed only when it names the exact identity just
+    proven dead and resolved above. A claim naming anything else is refused --
+    it may belong to a live supervisor this function knows nothing about.
+    """
+
+    scheduler_paths = SchedulerPaths(root=paths.root)
+    outcomes: list[StaleRecordOutcome] = []
+    pid_path = scheduler_paths.pid
+
+    if not pid_path.exists():
+        return (_refused(pid_path, "no scheduler.pid on disk -- nothing to consume"),)
+
+    record, corrupt = _read_json_or_corrupt(pid_path)
+    if corrupt or record is None:
+        return (
+            _refused(
+                pid_path,
+                "refused: scheduler.pid exists but is not readable JSON -- what "
+                "would be discarded cannot be named, so it is left untouched "
+                "for a human to resolve",
+            ),
+        )
+
+    identity = identity_from_record(record)
+    if identity is None:
+        return (
+            _refused(
+                pid_path,
+                "refused: scheduler.pid names no session/nonce -- an "
+                "unidentifiable record is a stranger's by default",
+            ),
+        )
+
+    pid = record.get("pid")
+    if type(pid) is not int or pid <= 0:
+        return (
+            _refused(pid_path, f"refused: scheduler.pid carries no usable pid ({pid!r})"),
+        )
+
+    if process_port.alive(pid):
+        return (
+            _refused(
+                pid_path,
+                f"refused: pid {pid} ({identity.session_id}) is still alive on "
+                "this machine -- this is a running scheduler, not a stale "
+                "record, and removing its record would strand it",
+            ),
+        )
+
+    unmatched = find_unmatched_ticks(
+        scheduler_paths,
+        session_id=identity.session_id,
+        lease_nonce=identity.nonce,
+    )
+    if unmatched:
+        return (
+            _refused(
+                pid_path,
+                f"refused: {len(unmatched)} unmatched tick(s) remain for "
+                f"{identity.session_id}:{identity.nonce} -- that session's "
+                "broker effects are still unaccounted for, so its record must "
+                "stay on disk and keep raising recovery",
+            ),
+        )
+
+    pid_reason = (
+        f"{now:%Y-%m-%d} recovery consumed the stale scheduler record for "
+        f"{identity.session_id}:{identity.nonce} (pid {pid}): the recovery "
+        f"acceptance bar passed in full, the pid is proven dead via the OS "
+        f"process table, and that session has zero unmatched ticks. Retaining "
+        f"it would re-latch STOP_DIRTY on every future stop. Recovery reason: "
+        f"{reason}"
+    )
+    try:
+        manifest = archive_before_mutation(
+            pid_path, archive_dir=_archive_dir(paths), reason=pid_reason, now=now
+        )
+    except ArchiveError as exc:
+        return (
+            _refused(
+                pid_path,
+                f"refused: could not archive scheduler.pid ({exc}) -- not "
+                "removed; nothing is discarded that was not first preserved",
+            ),
+        )
+
+    try:
+        pid_path.unlink()
+    except OSError as exc:
+        return (
+            _refused(
+                pid_path,
+                f"archived to {manifest.archive_path} but could not be removed "
+                f"({exc}) -- the latch is still armed",
+            ),
+        )
+
+    outcomes.append(
+        StaleRecordOutcome(
+            path=pid_path,
+            consumed=True,
+            detail=(
+                f"archived and cleared: {identity.session_id}:{identity.nonce} "
+                f"(pid {pid}), 0 unmatched ticks, proven dead"
+            ),
+            archive_path=manifest.archive_path,
+        )
+    )
+    outcomes.append(
+        _consume_matching_claim(
+            paths=paths,
+            scheduler_paths=scheduler_paths,
+            identity=identity,
+            now=now,
+            reason=pid_reason,
+        )
+    )
+    return tuple(outcomes)
+
+
+def _consume_matching_claim(
+    *,
+    paths: PaperDayPaths,
+    scheduler_paths: SchedulerPaths,
+    identity: Any,
+    now: dt.datetime,
+    reason: str,
+) -> StaleRecordOutcome:
+    """Consume ``scheduler.claim`` only when it names ``identity`` exactly.
+
+    The claim is the START-side half of the same latch: ``_claim_start``
+    refuses to spawn a scheduler while a foreign claim sits on disk
+    (scheduler.py:879-886). Clearing the pid record without clearing a
+    matching claim would fix stop and leave start blocked -- the manual
+    two-step an operator had to perform by hand on 2026-08-21.
+    """
+    claim_path = scheduler_paths.claim
+    if not claim_path.exists():
+        return _refused(claim_path, "no scheduler.claim on disk -- nothing to consume")
+
+    claim, corrupt = _read_json_or_corrupt(claim_path)
+    if corrupt or claim is None:
+        return _refused(
+            claim_path,
+            "refused: scheduler.claim exists but is not readable JSON -- left "
+            "untouched for a human to resolve",
+        )
+
+    if (
+        claim.get("session_id") != identity.session_id
+        or claim.get("nonce") != identity.nonce
+    ):
+        return _refused(
+            claim_path,
+            "refused: scheduler.claim names a different identity than the "
+            f"{identity.session_id}:{identity.nonce} record just consumed -- it "
+            "may belong to a supervisor this recovery knows nothing about",
+        )
+
+    try:
+        manifest = archive_before_mutation(
+            claim_path, archive_dir=_archive_dir(paths), reason=reason, now=now
+        )
+    except ArchiveError as exc:
+        return _refused(
+            claim_path,
+            f"refused: could not archive scheduler.claim ({exc}) -- not removed",
+        )
+
+    try:
+        claim_path.unlink()
+    except OSError as exc:
+        return _refused(
+            claim_path,
+            f"archived to {manifest.archive_path} but could not be removed ({exc})",
+        )
+
+    return StaleRecordOutcome(
+        path=claim_path,
+        consumed=True,
+        detail=(
+            f"archived and cleared: start claim for "
+            f"{identity.session_id}:{identity.nonce}"
+        ),
+        archive_path=manifest.archive_path,
+    )
