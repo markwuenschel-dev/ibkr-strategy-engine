@@ -25,6 +25,7 @@ import datetime as dt
 import json
 import os
 import tempfile
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -61,7 +62,7 @@ def _archive_dir(paths: PaperDayPaths) -> Path:
     return paths.root / "recovery-archive"
 
 
-def _make_lock_acquirer(lock_path: Path) -> Any:
+def _make_lock_acquirer(lock_path: Path, token: str) -> Any:
     """A zero-arg callable matching ``check_exclusive_recovery_lock``'s
     contract: return True on a clean exclusive acquire, False when another
     recovery attempt already holds it, never raise for ordinary contention.
@@ -71,13 +72,46 @@ def _make_lock_acquirer(lock_path: Path) -> Any:
     ``session.lock`` -- so this new lock inherits the same torn-write
     immunity rather than reintroducing the bug this whole project exists to
     fix.
+
+    ``token`` is written into the lock payload so a caller can later tell,
+    by reading the file back, whether THIS acquisition is still the one
+    holding it -- see :func:`_release_lock_if_ours`. Two ordinary Python
+    dicts loaded from the same on-disk JSON would compare equal on content
+    alone; the token exists specifically so "is this my lock" is decidable
+    without relying on that, since relying on it would make a same-process,
+    same-pid retry after a bug indistinguishable from a genuinely different
+    holder.
     """
 
     def acquire() -> bool:
-        payload = json.dumps({"pid": os.getpid(), "acquired_at": utc_now().isoformat()})
+        payload = json.dumps(
+            {"pid": os.getpid(), "token": token, "acquired_at": utc_now().isoformat()}
+        )
         return _acquire_lock_atomically(lock_path, payload)
 
     return acquire
+
+
+def _release_lock_if_ours(lock_path: Path, token: str) -> None:
+    """Release the recovery lock ONLY if it is still the exact acquisition
+    this call made -- never unconditionally.
+
+    An unconditional unlink in a ``finally`` would let a failed CONCURRENT
+    attempt delete a genuinely still-running attempt's lock the moment the
+    failed one exits -- exactly the split-brain scenario decisions.md's
+    requirement 1 (lock exclusively) and requirement 6 (fencing-token CAS)
+    exist to prevent. This only ever removes a lock this exact call is
+    still holding, identified by ``token``, not by pid (a pid can be
+    reused) and not by dict-equality of the whole payload (two acquisitions
+    from the same process could otherwise look identical).
+    """
+    current, corrupt = _read_json_or_corrupt(lock_path)
+    if corrupt or current is None:
+        return
+    if current.get("token") != token:
+        return  # not ours -- someone else's lock, or already released and re-acquired
+    with contextlib.suppress(FileNotFoundError):
+        lock_path.unlink()
 
 
 def _make_broker_reconciler(
@@ -137,6 +171,7 @@ def build_recovery_attempt(
     now: dt.datetime,
     config: EngineConfig,
     broker_factory: Any,
+    lock_token: str,
 ) -> RecoveryAttempt:
     """Assemble a :class:`RecoveryAttempt` from live on-disk and broker state.
 
@@ -184,7 +219,7 @@ def build_recovery_attempt(
     observed_fencing_token = None if gate_corrupt else (gate or {}).get("fencing_token")
 
     return RecoveryAttempt(
-        acquire_lock=_make_lock_acquirer(_recovery_lock_path(paths)),
+        acquire_lock=_make_lock_acquirer(_recovery_lock_path(paths), lock_token),
         expected_identity=expected_identity,
         observed_identity=observed_identity,
         state=state,
@@ -275,6 +310,7 @@ def run_recovery(
             applied=False,
         )
 
+    lock_token = uuid.uuid4().hex
     attempt = build_recovery_attempt(
         paths=paths,
         expected_session_id=expected_session_id,
@@ -285,9 +321,23 @@ def run_recovery(
         now=now,
         config=config,
         broker_factory=broker_factory,
+        lock_token=lock_token,
     )
-    result = evaluate_recovery_acceptance_bar(attempt)
-    applied = False if dry_run else apply_recovery_result(paths, result)
+    try:
+        result = evaluate_recovery_acceptance_bar(attempt)
+        applied = False if dry_run else apply_recovery_result(paths, result)
+    finally:
+        # The recovery lock exists to serialize CONCURRENT attempts, not to
+        # permanently block every attempt after the first. Release it once
+        # this attempt (successful, refused, or dry-run) is fully done -- in
+        # a finally, so a mid-evaluation exception can't leave it orphaned
+        # either. Only ever releases OUR OWN acquisition (matched by
+        # lock_token, see _release_lock_if_ours): a genuinely concurrent
+        # attempt that lost the acquire race above never held this lock in
+        # the first place, so it has nothing of its own to release here,
+        # and cannot accidentally release the winner's lock out from under
+        # it.
+        _release_lock_if_ours(_recovery_lock_path(paths), lock_token)
     return RecoveryOutcome(refused_reason=None, acceptance=result, applied=applied)
 
 
