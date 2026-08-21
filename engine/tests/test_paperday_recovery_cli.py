@@ -349,7 +349,8 @@ class TestConcurrentRecoveryAttemptsRefusesSecond:
 
         recovery_lock = paths.root / "recovery.lock"
         recovery_lock.parent.mkdir(parents=True, exist_ok=True)
-        recovery_lock.write_text(json.dumps({"pid": 99999}), encoding="utf-8")
+        foreign_lock_bytes = json.dumps({"pid": 99999, "token": "someone-elses-token"}).encode()
+        recovery_lock.write_bytes(foreign_lock_bytes)
 
         outcome = _run(
             tmp_path, broker=_FakeBroker(), process_port=_FakeProcessPort(frozenset())
@@ -359,6 +360,36 @@ class TestConcurrentRecoveryAttemptsRefusesSecond:
         lock_check = outcome.acceptance.check("1_exclusive_lock")
         assert lock_check is not None and lock_check.passed is False
         assert outcome.applied is False
+        # The failed attempt's own cleanup must NOT delete a lock it never
+        # acquired -- that would let a losing concurrent attempt release the
+        # winner's lock out from under it. This is the regression this fix
+        # was built for.
+        assert recovery_lock.exists()
+        assert recovery_lock.read_bytes() == foreign_lock_bytes
+
+
+class TestRecoveryLockIsReleasedBetweenSequentialAttempts:
+    def test_a_completed_attempt_does_not_permanently_block_the_next_one(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression test: the first implementation acquired the recovery
+        lock but never released it, so a completed (even a merely dry-run)
+        attempt left every SUBSEQUENT attempt refusing forever at
+        requirement 1 -- caught by actually running the real CLI command
+        twice in a row against the live 2026-08-21 recovery attempt."""
+        paths = _paths(tmp_path)
+        _write_gate(paths)
+        _write_scheduler_pid(paths)
+
+        first = _run(tmp_path, broker=_FakeBroker(positions=[]), process_port=_FakeProcessPort(frozenset()))
+        assert first.acceptance is not None
+        assert first.acceptance.check("1_exclusive_lock").passed is True
+        assert not (paths.root / "recovery.lock").exists(), "lock must be released after the attempt"
+
+        second = _run(tmp_path, broker=_FakeBroker(positions=[]), process_port=_FakeProcessPort(frozenset()))
+        assert second.acceptance is not None
+        assert second.acceptance.check("1_exclusive_lock").passed is True
+        assert second.acceptance.all_passed is True
 
 
 class TestIdentityMismatchRefuses:
