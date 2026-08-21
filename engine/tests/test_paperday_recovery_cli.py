@@ -24,6 +24,7 @@ from engine.paperday_recovery import BrokerReconciliationOutcome
 from engine.paperday_recovery_cli import (
     RecoveryOutcome,
     apply_recovery_result,
+    consume_stale_scheduler_records,
     build_recovery_attempt,
     run_recovery,
     target_process_is_still_alive,
@@ -388,8 +389,24 @@ class TestRecoveryLockIsReleasedBetweenSequentialAttempts:
 
         second = _run(tmp_path, broker=_FakeBroker(positions=[]), process_port=_FakeProcessPort(frozenset()))
         assert second.acceptance is not None
+        # The regression this test exists for: requirement 1 is reachable
+        # again, i.e. the first attempt's lock was genuinely released and does
+        # not permanently block anyone.
         assert second.acceptance.check("1_exclusive_lock").passed is True
-        assert second.acceptance.all_passed is True
+
+        # It does NOT pass in full any more, and that is deliberate. The first
+        # attempt consumed `scheduler.pid` (see
+        # TestStaleSchedulerRecordIsConsumed), and `observed_identity` is built
+        # from that record (paperday_recovery_cli.build_recovery_attempt), so
+        # requirement 2 now has nothing to match against -- the same refusal
+        # TestIdentityMismatchRefuses.test_no_scheduler_pid_file_at_all_refuses
+        # pins. There is no longer a stuck scheduler record to recover against,
+        # which is the correct answer to "recover this session again", even
+        # though the wording is about identity rather than about already being
+        # recovered.
+        assert second.acceptance.all_passed is False
+        assert second.acceptance.check("2_session_lease_process_identity").passed is False
+        assert second.applied is False
 
 
 class TestIdentityMismatchRefuses:
@@ -517,3 +534,331 @@ class TestApplyRecoveryResultDirectly:
         applied = apply_recovery_result(paths, passing)
 
         assert applied is False  # corrupt-at-write-time refuses, never overwritten blindly
+
+
+# ---------------------------------------------------------------------------
+# Consuming the stale scheduler record a passed recovery has resolved
+#
+# The 2026-08-21 defect: recovery cleared `recovery_required` but left
+# `scheduler.pid` on disk, so the next stop's own dirty-check re-latched it,
+# forever. These tests pin both halves -- that consumption HAPPENS on the
+# clean path, and that it REFUSES on every unproven one.
+# ---------------------------------------------------------------------------
+
+
+OTHER_SESSION = "paperday-20260814-c0ffee01"
+OTHER_NONCE = "beef1234"
+
+
+def _scheduler_pid_path(paths: PaperDayPaths) -> Path:
+    return paths.root / "scheduler.pid"
+
+
+def _scheduler_claim_path(paths: PaperDayPaths) -> Path:
+    return paths.root / "scheduler.claim"
+
+
+def _write_scheduler_claim(paths: PaperDayPaths, **overrides) -> None:
+    payload = {"v": 1, "session_id": SESSION_ID, "nonce": LEASE_NONCE}
+    payload.update(overrides)
+    claim = _scheduler_claim_path(paths)
+    claim.parent.mkdir(parents=True, exist_ok=True)
+    claim.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _write_tick_started(paths: PaperDayPaths, *, session_id: str, lease_nonce: str) -> None:
+    """One TICK_STARTED with no terminal event -- an unmatched tick.
+
+    Note the location: ``scheduler.read_tick_events`` globs
+    ``receipts/*-tick-events.jsonl``; it does NOT read the ``tick_events``
+    property at the paper-day root. Writing to the latter produces a file
+    nothing reads, and a test that silently proves nothing.
+    """
+    events = paths.root / "receipts" / "2026-08-21-tick-events.jsonl"
+    events.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "event": "TICK_STARTED",
+        "session_id": session_id,
+        "lease_nonce": lease_nonce,
+        "tick_id": "tick-0001",
+        "attempt_id": "attempt-0001",
+    }
+    with events.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record) + "\n")
+
+
+class TestStaleSchedulerRecordIsConsumed:
+    def test_clean_recovery_archives_then_removes_the_scheduler_pid(
+        self, tmp_path: Path
+    ) -> None:
+        paths = _paths(tmp_path)
+        _write_gate(paths)
+        _write_scheduler_pid(paths)
+        original = _scheduler_pid_path(paths).read_bytes()
+
+        outcome = _run(
+            tmp_path, broker=_FakeBroker(), process_port=_FakeProcessPort(frozenset())
+        )
+
+        assert outcome.applied is True
+        assert not _scheduler_pid_path(paths).exists(), (
+            "the record that re-latches STOP_DIRTY must not survive the "
+            "recovery that resolved it"
+        )
+
+        consumed = [r for r in outcome.stale_records if r.consumed]
+        assert any(r.path.name == "scheduler.pid" for r in consumed), outcome.stale_records
+
+        # Archived, byte-identical, with a manifest -- never blind-deleted.
+        archive = next(r for r in consumed if r.path.name == "scheduler.pid")
+        assert archive.archive_path is not None
+        assert archive.archive_path.read_bytes() == original
+        assert Path(str(archive.archive_path) + ".manifest.json").exists()
+
+    def test_the_consumed_record_no_longer_latches_a_dirty_stop(
+        self, tmp_path: Path
+    ) -> None:
+        """The regression test for the actual loop, driven at the defect site.
+
+        Before consumption ``drain_and_stop`` returns clean=False (STOP_DIRTY),
+        which is what ``paperday`` turns into ``recovery_required = True``.
+        After consumption the same call has nothing to report. Without the fix
+        the second assertion fails, because the pre-fix code path leaves
+        ``scheduler.pid`` exactly where it was.
+        """
+        from engine.scheduler import (
+            SchedulerIdentity,
+            SchedulerPaths,
+            drain_and_stop,
+        )
+
+        paths = _paths(tmp_path)
+        _write_gate(paths)
+        _write_scheduler_pid(paths)
+
+        scheduler_paths = SchedulerPaths(root=paths.root)
+        identity = SchedulerIdentity(session_id=SESSION_ID, nonce=LEASE_NONCE)
+
+        class _DeadProcesses:
+            def alive(self, pid: int) -> bool:
+                return False
+
+            def cmdline(self, pid: int) -> str:
+                return ""
+
+        def _stop() -> tuple[bool, str]:
+            return drain_and_stop(
+                processes=_DeadProcesses(),
+                paths=scheduler_paths,
+                identity=identity,
+                now=NOW,
+                drain_timeout=0.0,
+                sleep=lambda _seconds: None,
+                monotonic=lambda: 0.0,
+            )
+
+        clean_before, detail_before = _stop()
+        assert clean_before is False
+        assert "STOP_DIRTY" in detail_before
+
+        outcome = _run(
+            tmp_path, broker=_FakeBroker(), process_port=_FakeProcessPort(frozenset())
+        )
+        assert outcome.applied is True
+
+        clean_after, detail_after = _stop()
+        assert clean_after is True, (
+            f"stop still reports dirty after recovery consumed the record: "
+            f"{detail_after}"
+        )
+        assert "nothing to stop" in detail_after
+
+    def test_a_matching_start_claim_is_consumed_with_the_pid_record(
+        self, tmp_path: Path
+    ) -> None:
+        paths = _paths(tmp_path)
+        _write_gate(paths)
+        _write_scheduler_pid(paths)
+        _write_scheduler_claim(paths)
+
+        outcome = _run(
+            tmp_path, broker=_FakeBroker(), process_port=_FakeProcessPort(frozenset())
+        )
+
+        assert outcome.applied is True
+        assert not _scheduler_claim_path(paths).exists(), (
+            "clearing the stop-side latch without the start-side claim leaves "
+            "the next FULL start blocked"
+        )
+
+
+class TestConsumptionRefusesWhatItCannotProve:
+    """These call ``consume_stale_scheduler_records`` DIRECTLY, not through
+    ``run_recovery``. That is deliberate, and worth stating plainly.
+
+    None of these refusals is reachable through ``run_recovery``, because the
+    acceptance bar gets there first: ``build_recovery_attempt`` derives
+    ``observed_identity`` from ``scheduler.pid`` itself, so a record that is
+    corrupt, nameless, or names a different session/pid than the operator
+    asserted already fails requirement 2 and never reaches consumption (see
+    ``TestIdentityMismatchRefuses``). By the time ``applied`` is True the bar
+    has ALREADY proven the record names exactly the asserted session, that its
+    pid is dead, and that its ticks are resolved.
+
+    So these guards are defence in depth on a function that DELETES state, and
+    they are tested at the only layer where they can actually fire. Driving
+    them through ``run_recovery`` instead would have produced four tests that
+    pass green without executing a single line of the guard they claim to pin
+    -- this repo's documented recurring failure mode, and the reason each of
+    these was rewritten rather than deleted.
+    """
+
+    @staticmethod
+    def _consume(paths: PaperDayPaths, port: _FakeProcessPort):
+        return consume_stale_scheduler_records(
+            paths=paths, process_port=port, now=NOW, reason="direct-call guard test"
+        )
+
+    def test_a_live_scheduler_pid_is_never_consumed(self, tmp_path: Path) -> None:
+        """A running scheduler's record is not a stale record. Removing it
+        would strand a live process nothing could then find or stop."""
+        paths = _paths(tmp_path)
+        _write_scheduler_pid(paths, pid=999001)
+        before = _scheduler_pid_path(paths).read_bytes()
+
+        outcomes = self._consume(paths, _FakeProcessPort(alive_pids=frozenset({999001})))
+
+        assert _scheduler_pid_path(paths).read_bytes() == before
+        assert all(not record.consumed for record in outcomes)
+        assert any("still alive" in record.detail for record in outcomes)
+
+    def test_unmatched_ticks_for_the_records_own_session_refuse_consumption(
+        self, tmp_path: Path
+    ) -> None:
+        """An unresolved TICK_STARTED means that session's broker effects are
+        still unaccounted for. Its record is the durable evidence that recovery
+        is needed, so it must stay on disk and keep raising the alarm."""
+        paths = _paths(tmp_path)
+        _write_scheduler_pid(paths)
+        _write_tick_started(paths, session_id=SESSION_ID, lease_nonce=LEASE_NONCE)
+        before = _scheduler_pid_path(paths).read_bytes()
+
+        outcomes = self._consume(paths, _FakeProcessPort(frozenset()))
+
+        assert _scheduler_pid_path(paths).read_bytes() == before
+        assert any("unmatched tick" in record.detail for record in outcomes)
+
+    def test_corrupt_scheduler_pid_is_left_exactly_as_found(self, tmp_path: Path) -> None:
+        paths = _paths(tmp_path)
+        paths.root.mkdir(parents=True, exist_ok=True)
+        _scheduler_pid_path(paths).write_text('{"pid": 240328, trunc', encoding="utf-8")
+        before = _scheduler_pid_path(paths).read_bytes()
+
+        outcomes = self._consume(paths, _FakeProcessPort(frozenset()))
+
+        assert _scheduler_pid_path(paths).read_bytes() == before
+        assert any("not readable JSON" in record.detail for record in outcomes)
+
+    def test_record_naming_no_session_or_nonce_is_left_alone(self, tmp_path: Path) -> None:
+        paths = _paths(tmp_path)
+        paths.root.mkdir(parents=True, exist_ok=True)
+        _scheduler_pid_path(paths).write_text(json.dumps({"pid": 240328}), encoding="utf-8")
+        before = _scheduler_pid_path(paths).read_bytes()
+
+        outcomes = self._consume(paths, _FakeProcessPort(frozenset()))
+
+        assert _scheduler_pid_path(paths).read_bytes() == before
+        assert any("no session/nonce" in record.detail for record in outcomes)
+
+    def test_a_missing_record_is_reported_not_treated_as_an_error(
+        self, tmp_path: Path
+    ) -> None:
+        paths = _paths(tmp_path)
+        paths.root.mkdir(parents=True, exist_ok=True)
+
+        outcomes = self._consume(paths, _FakeProcessPort(frozenset()))
+
+        assert all(not record.consumed for record in outcomes)
+        assert any("nothing to consume" in record.detail for record in outcomes)
+
+    def test_a_foreign_start_claim_is_refused_even_when_the_pid_is_consumed(
+        self, tmp_path: Path
+    ) -> None:
+        paths = _paths(tmp_path)
+        _write_gate(paths)
+        _write_scheduler_pid(paths)
+        _write_scheduler_claim(paths, session_id=OTHER_SESSION, nonce=OTHER_NONCE)
+        before = _scheduler_claim_path(paths).read_bytes()
+
+        outcome = _run(
+            tmp_path, broker=_FakeBroker(), process_port=_FakeProcessPort(frozenset())
+        )
+
+        assert not _scheduler_pid_path(paths).exists()  # the pid record still goes
+        assert _scheduler_claim_path(paths).read_bytes() == before
+        assert any(
+            r.path.name == "scheduler.claim" and not r.consumed
+            for r in outcome.stale_records
+        )
+
+    def test_dry_run_consumes_nothing(self, tmp_path: Path) -> None:
+        paths = _paths(tmp_path)
+        _write_gate(paths)
+        _write_scheduler_pid(paths)
+        _write_scheduler_claim(paths)
+        before = _scheduler_pid_path(paths).read_bytes()
+
+        outcome = run_recovery(
+            paths=paths,
+            expected_session_id=SESSION_ID,
+            expected_lease_nonce=LEASE_NONCE,
+            expected_process_id=PROCESS_ID,
+            expected_fencing_token=FENCING_TOKEN,
+            reason="dry run must not mutate anything",
+            now=NOW,
+            config=_config(tmp_path),
+            broker_factory=_fake_broker_factory(_FakeBroker()),
+            process_port=_FakeProcessPort(frozenset()),
+            dry_run=True,
+        )
+
+        assert outcome.applied is False
+        assert outcome.stale_records == ()
+        assert _scheduler_pid_path(paths).read_bytes() == before
+        assert _scheduler_claim_path(paths).exists()
+
+    def test_a_refused_recovery_consumes_nothing(self, tmp_path: Path) -> None:
+        """Target process still alive -> refused before the bar even runs."""
+        paths = _paths(tmp_path)
+        _write_gate(paths)
+        _write_scheduler_pid(paths)
+        before = _scheduler_pid_path(paths).read_bytes()
+
+        outcome = _run(
+            tmp_path,
+            broker=_FakeBroker(),
+            process_port=_FakeProcessPort(alive_pids=frozenset({PROCESS_ID})),
+        )
+
+        assert outcome.refused_reason is not None
+        assert outcome.applied is False
+        assert outcome.stale_records == ()
+        assert _scheduler_pid_path(paths).read_bytes() == before
+
+    def test_a_failed_acceptance_bar_consumes_nothing(self, tmp_path: Path) -> None:
+        """Fencing token changed under the operator -> requirement 6 fails."""
+        paths = _paths(tmp_path)
+        _write_gate(paths)
+        _write_scheduler_pid(paths)
+        before = _scheduler_pid_path(paths).read_bytes()
+
+        outcome = _run(
+            tmp_path,
+            broker=_FakeBroker(),
+            process_port=_FakeProcessPort(frozenset()),
+            expected_fencing_token="a-token-nobody-ever-observed",
+        )
+
+        assert outcome.applied is False
+        assert outcome.stale_records == ()
+        assert _scheduler_pid_path(paths).read_bytes() == before
