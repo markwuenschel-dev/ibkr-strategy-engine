@@ -700,3 +700,62 @@ class TestScanTransmitsNothing:
         assert report.selection_method is SelectionMethod.SHADOW_STRIKE_OFFSET
         assert "OPTIONS_NO_MARKET_DATA_SNAPSHOT" in report.refusal_codes
         assert "GOVERNOR_PORTFOLIO_STATE_UNAVAILABLE" in report.refusal_codes
+
+
+# ===========================================================================
+# Extension: the orchestration layer outside engine/options (D14 / N4)
+# ===========================================================================
+
+
+class TestOrchestrationLayerDoesNotTransmit:
+    """The AST walk above (``options_modules``) is scoped to
+    ``engine/options/`` (``PACKAGE_DIR``). ``engine/cycle_adapter.py`` and
+    ``engine/autocycle.py`` sit just outside that package and are exactly
+    where a mode-routing bug would put a second, unaudited ``placeOrder`` --
+    cycle_adapter.py's ``entry()`` is the one place a cycle decides whether to
+    call the strategy runner at all and with what ``armed`` value (see
+    ``test_paperday_mode_matrix.py``), so it gets the same static check here.
+
+    This is a deliberately narrow extension -- two named files, not a second
+    recursive walk of ``engine/`` -- because ``docs/paper-day-recovery/design.md``'s
+    "Verification surface" section notes the walker also does not reach
+    ``paperday.py``, and generalizing it to cover that file's control flow is
+    called out there as its own, larger undertaking, left for the PR that
+    adds the P2 recovery verb.
+    """
+
+    _FILES = ("cycle_adapter.py", "autocycle.py")
+
+    @staticmethod
+    def _path(name: str) -> Path:
+        import engine as engine_package
+
+        path = Path(engine_package.__file__).resolve().parent / name
+        assert path.is_file(), f"{path} does not exist -- the pinned filename moved"
+        return path
+
+    @pytest.mark.parametrize("name", _FILES)
+    def test_no_mutating_call_site(self, name: str) -> None:
+        offenders: list[str] = []
+        for node in ast.walk(parse(self._path(name))):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr in MUTATING_ATTRIBUTES:
+                offenders.append(f"{name}:{node.lineno} .{func.attr}()")
+            elif isinstance(func, ast.Name) and func.id in MUTATING_ATTRIBUTES:
+                offenders.append(f"{name}:{node.lineno} {func.id}()")
+        assert offenders == [], f"orchestration file can transmit: {offenders}"
+
+    @pytest.mark.parametrize("name", _FILES)
+    def test_no_transmitting_name_bound_anywhere(self, name: str) -> None:
+        """Same 'not just in call position' guard as the options-package
+        check: a name stashed in a variable, dict value, or partial and called
+        elsewhere would satisfy the check above alone."""
+        offenders: list[str] = []
+        for node in ast.walk(parse(self._path(name))):
+            if isinstance(node, ast.Attribute) and node.attr in MUTATING_ATTRIBUTES:
+                offenders.append(f"{name}:{node.lineno} .{node.attr}")
+            elif isinstance(node, ast.Name) and node.id in MUTATING_ATTRIBUTES:
+                offenders.append(f"{name}:{node.lineno} {node.id}")
+        assert offenders == [], f"a transmitting name is bound in {name}: {offenders}"
