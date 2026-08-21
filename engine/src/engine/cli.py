@@ -302,6 +302,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     positions.add_argument("--no-connect", action="store_true", help="read the store only")
 
+    recover = subs.add_parser(
+        "paperday-recover",
+        help=(
+            "explicit operator recovery verb for a stuck paper-day session "
+            "(docs/paper-day-recovery/decisions.md's nine-point acceptance bar). "
+            "Refuses and mutates nothing unless every requirement passes; on a "
+            "full pass, clears recovery_required only -- entry_gate stays CLOSED."
+        ),
+    )
+    recover.add_argument(
+        "--session-id", required=True, help="the stuck session's session_id, exactly as recorded"
+    )
+    recover.add_argument(
+        "--lease-nonce", required=True, help="the stuck session's scheduler lease nonce"
+    )
+    recover.add_argument(
+        "--process-id", type=int, required=True, help="the stuck session's scheduler process id"
+    )
+    recover.add_argument(
+        "--fencing-token",
+        required=True,
+        help="the fencing token you observed earlier -- compared against a fresh "
+        "read at CAS time, never re-derived from the same read",
+    )
+    recover.add_argument(
+        "--reason", required=True, help="why this recovery is authorized (persisted verbatim)"
+    )
+    recover.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="evaluate every requirement and print the result, but never write gate.json",
+    )
+
     # Read-only by construction: no broker connection, no --arm, no code path
     # that could use one. The operator's window into the M4 logical-entry
     # store: what is claimed, awaiting review, approved, cooling or executing.
@@ -1192,6 +1225,54 @@ def cmd_options_cancel(args: argparse.Namespace, broker_factory: Any = Broker) -
     return EXIT_OK
 
 
+def cmd_paperday_recover(args: argparse.Namespace, broker_factory: Any = Broker) -> int:
+    """The operator recovery verb -- see docs/paper-day-recovery/decisions.md's
+    nine-point acceptance bar and engine.paperday_recovery_cli for the
+    implementation. Prints every requirement's pass/fail, and mutates
+    gate.json (clearing recovery_required only, never entry_gate) if and
+    only if every requirement passed and --dry-run was not given."""
+    from .paperday import PaperDayPaths
+    from .paperday_recovery_cli import format_result, run_recovery
+
+    config = config_from(args)
+    paths = PaperDayPaths(state_dir=config.state_dir)
+
+    outcome = run_recovery(
+        paths=paths,
+        expected_session_id=args.session_id,
+        expected_lease_nonce=args.lease_nonce,
+        expected_process_id=args.process_id,
+        expected_fencing_token=args.fencing_token,
+        reason=args.reason,
+        now=utc_now(),
+        config=config,
+        broker_factory=broker_factory,
+        dry_run=args.dry_run,
+    )
+
+    if outcome.refused_reason is not None:
+        out("PAPER DAY RECOVERY")
+        out("")
+        out(f"  !! {outcome.refused_reason}")
+        return EXIT_ERROR
+
+    assert outcome.acceptance is not None
+    out(format_result(outcome.acceptance))
+
+    if args.dry_run:
+        out("")
+        note("--dry-run: no state was written, regardless of the result above")
+        return EXIT_OK if outcome.acceptance.all_passed else EXIT_ERROR
+
+    if outcome.applied:
+        out("")
+        out("recovery_required cleared. entry_gate remains CLOSED -- a new, "
+            "independently validated session must open it.")
+        return EXIT_OK
+
+    return EXIT_ERROR
+
+
 def cmd_options_positions(args: argparse.Namespace, broker_factory: Any = Broker) -> int:
     """List what the engine believes it holds, and check it against the broker."""
     from .options.positions import PositionStore
@@ -1920,6 +2001,7 @@ COMMANDS = {
     "options-cycle": cmd_options_cycle,
     "options-run": cmd_options_run,
     "options-positions": cmd_options_positions,
+    "paperday-recover": cmd_paperday_recover,
     "logical-entries": cmd_logical_entries,
     "options-mark": cmd_options_mark,
     "options-cancel": cmd_options_cancel,
